@@ -1,0 +1,18 @@
+{
+  "claude-code-workflows": {
+    "source": {
+      "source": "github",
+      "repo": "wshobson/agents"
+    },
+    "installLocation": "/Users/vnazarenko/.claude/plugins/marketplaces/claude-code-workflows",
+    "lastUpdated": "2025-11-13T11:01:35.669Z"
+  },
+  "superpowers-marketplace": {
+    "source": {
+      "source": "github",
+      "repo": "obra/superpowers-marketplace"
+    },
+    "installLocation": "/Users/vnazarenko/.claude/plugins/marketplaces/superpowers-marketplace",
+    "lastUpdated": "2025-11-23T14:26:22.104Z"
+  }
+}

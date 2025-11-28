@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "plugins": {
+    "code-documentation@claude-code-workflows": {
+      "version": "unknown",
+      "installedAt": "2025-11-13T17:04:12.782Z",
+      "lastUpdated": "2025-11-13T17:04:12.782Z",
+      "installPath": "/Users/vnazarenko/.claude/plugins/marketplaces/claude-code-workflows/plugins/code-documentation",
+      "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831",
+      "isLocal": true
+    },
+    "frontend-mobile-development@claude-code-workflows": {
+      "version": "unknown",
+      "installedAt": "2025-11-13T17:04:12.782Z",
+      "lastUpdated": "2025-11-13T17:04:12.782Z",
+      "installPath": "/Users/vnazarenko/.claude/plugins/marketplaces/claude-code-workflows/plugins/frontend-mobile-development",
+      "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831",
+      "isLocal": true
+    },
+    "seo-content-creation@claude-code-workflows": {
+      "version": "unknown",
+      "installedAt": "2025-11-13T17:04:12.782Z",
+      "lastUpdated": "2025-11-13T17:04:12.782Z",
+      "installPath": "/Users/vnazarenko/.claude/plugins/marketplaces/claude-code-workflows/plugins/seo-content-creation",
+      "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831",
+      "isLocal": true
+    },
+    "seo-technical-optimization@claude-code-workflows": {
+      "version": "unknown",
+      "installedAt": "2025-11-13T17:04:12.782Z",
+      "lastUpdated": "2025-11-13T17:04:12.782Z",
+      "installPath": "/Users/vnazarenko/.claude/plugins/marketplaces/claude-code-workflows/plugins/seo-technical-optimization",
+      "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831",
+      "isLocal": true
+    },
+    "content-marketing@claude-code-workflows": {
+      "version": "unknown",
+      "installedAt": "2025-11-13T17:04:12.782Z",
+      "lastUpdated": "2025-11-13T17:04:12.782Z",
+      "installPath": "/Users/vnazarenko/.claude/plugins/marketplaces/claude-code-workflows/plugins/content-marketing",
+      "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831",
+      "isLocal": true
+    },
+    "web-scripting@claude-code-workflows": {
+      "version": "unknown",
+      "installedAt": "2025-11-13T17:04:12.782Z",
+      "lastUpdated": "2025-11-13T17:04:12.782Z",
+      "installPath": "/Users/vnazarenko/.claude/plugins/marketplaces/claude-code-workflows/plugins/web-scripting",
+      "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831",
+      "isLocal": true
+    },
+    "backend-development@claude-code-workflows": {
+      "version": "unknown",
+      "installedAt": "2025-11-13T18:24:47.367Z",
+      "lastUpdated": "2025-11-13T18:24:47.367Z",
+      "installPath": "/Users/vnazarenko/.claude/plugins/marketplaces/claude-code-workflows/plugins/backend-development",
+      "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831",
+      "isLocal": true
+    },
+    "full-stack-orchestration@claude-code-workflows": {
+      "version": "unknown",
+      "installedAt": "2025-11-13T18:24:47.367Z",
+      "lastUpdated": "2025-11-13T18:24:47.367Z",
+      "installPath": "/Users/vnazarenko/.claude/plugins/marketplaces/claude-code-workflows/plugins/full-stack-orchestration",
+      "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831",
+      "isLocal": true
+    },
+    "unit-testing@claude-code-workflows": {
+      "version": "unknown",
+      "installedAt": "2025-11-13T18:24:47.367Z",
+      "lastUpdated": "2025-11-13T18:24:47.367Z",
+      "installPath": "/Users/vnazarenko/.claude/plugins/marketplaces/claude-code-workflows/plugins/unit-testing",
+      "gitCommitSha": "75811421044c96883ec6fdca2aa7c18c92373831",
+      "isLocal": true
+    },
+    "superpowers@superpowers-marketplace": {
+      "version": "3.4.1",
+      "installedAt": "2025-11-23T14:26:27.154Z",
+      "lastUpdated": "2025-11-23T14:26:27.154Z",
+      "installPath": "/Users/vnazarenko/.claude/plugins/cache/superpowers",
+      "gitCommitSha": "84283dfc058f61b8985e07d20eb6838a6e7388fe",
+      "isLocal": false
+    }
+  }
+}

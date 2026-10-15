@@ -1,0 +1,164 @@
+<!doctype html>
+<!-- html-ask template: edit only the blocks marked EDIT. Instructions are in SKILL.md. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Question</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    background: var(--agterm-background, Canvas); color: var(--agterm-foreground, CanvasText);
+    --fg: var(--agterm-foreground, CanvasText);
+    --accent: var(--agterm-color-4, #3b82f6);
+    --ok: var(--agterm-color-2, #16a34a);
+    --warn: var(--agterm-color-3, #ca8a04);
+    --muted: color-mix(in srgb, var(--fg) 60%, transparent);
+    --line: color-mix(in srgb, var(--fg) 16%, transparent);
+    --panel: color-mix(in srgb, var(--fg) 5%, transparent);
+    --panel2: color-mix(in srgb, var(--fg) 10%, transparent);
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 22px 26px 28px; }
+  .kicker { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-size: 21px; margin: 4px 0 6px; }
+  .context { color: var(--muted); max-width: 900px; margin: 0 0 18px; }
+  .context ul { margin: 6px 0 0; padding-left: 18px; }
+  .opts { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .opt { border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
+         padding: 14px; display: flex; flex-direction: column; gap: 10px; cursor: pointer; }
+  .opt:hover { border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+  .opt.sel { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
+  .opt h2 { font-size: 15px; margin: 0; display: flex; gap: 8px; align-items: center; }
+  .badge { font-size: 10.5px; font-weight: 600; padding: 2px 7px; border-radius: 99px;
+           background: color-mix(in srgb, var(--ok) 20%, transparent); color: var(--ok); }
+  .opt p { margin: 0; color: var(--muted); }
+  .pc { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 12.5px; }
+  .pc ul { margin: 2px 0 0; padding-left: 16px; }
+  .pc b { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .pc .pro b { color: var(--ok); } .pc .con b { color: var(--warn); }
+  .opt .go { margin-top: auto; }
+  button { font: inherit; border-radius: 8px; padding: 7px 14px; cursor: pointer;
+           border: 1px solid var(--line); background: var(--panel2); color: var(--fg); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .foot { margin-top: 18px; display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: end; }
+  textarea { width: 100%; box-sizing: border-box; min-height: 54px; resize: vertical; font: inherit;
+             border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); padding: 8px; }
+  .foot .btns { display: flex; gap: 8px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  body[data-mode="single"] .multi-only { display: none; }
+  body[data-mode="multi"] .single-only { display: none; }
+
+  /* ── wireframe kit: build mocks from these, at small scale ─────────────────────────── */
+  .mock { border: 1px solid var(--line); border-radius: 8px; background: var(--agterm-background, Canvas);
+          padding: 8px; font-size: 11px; line-height: 1.3; overflow: hidden; }
+  .mock.big { font-size: 12px; padding: 12px; }
+  .w-row { display: flex; gap: 6px; align-items: stretch; }
+  .w-col { display: flex; flex-direction: column; gap: 6px; }
+  .w-grow { flex: 1; min-width: 0; }
+  .w-bar { height: 18px; border-radius: 4px; background: var(--panel2); display: flex; align-items: center; padding: 0 6px; gap: 6px; font-size: 10px; color: var(--muted); }
+  .w-side { width: 44px; border-radius: 4px; background: var(--panel2); padding: 4px; display: flex; flex-direction: column; gap: 4px; }
+  .w-side i { display: block; height: 6px; border-radius: 2px; background: var(--line); }
+  .w-side i.on { background: var(--accent); }
+  .w-h { font-weight: 700; font-size: 1.15em; }
+  .w-sub { color: var(--muted); }
+  .w-card { border: 1px solid var(--line); border-radius: 6px; padding: 6px; background: var(--panel); }
+  .w-card.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .w-card.off { opacity: .45; }
+  .w-btn { display: inline-block; border-radius: 4px; padding: 2px 7px; background: var(--accent); color: #fff; font-weight: 600; }
+  .w-btn.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+  .w-chip { display: inline-block; border-radius: 99px; padding: 1px 7px; border: 1px solid var(--line); }
+  .w-chip.on { border-color: var(--accent); color: var(--accent); }
+  .w-input { border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px; color: var(--muted); background: var(--panel); }
+  .w-line { height: 6px; border-radius: 3px; background: var(--line); }
+  .w-line.s { width: 40%; } .w-line.m { width: 65%; }
+  .w-img { border-radius: 4px; background: repeating-linear-gradient(45deg, var(--panel2) 0 6px, var(--panel) 6px 12px); min-height: 40px; }
+  .w-steps { display: flex; gap: 4px; } .w-steps i { flex: 1; height: 4px; border-radius: 2px; background: var(--line); }
+  .w-steps i.on { background: var(--accent); }
+  .w-grid { display: grid; gap: 6px; grid-template-columns: repeat(var(--n, 3), 1fr); }
+  .w-note { font-size: 10px; color: var(--warn); }
+</style>
+</head>
+<!-- EDIT: data-mode="single" or "multi" -->
+<body data-mode="single">
+<div class="wrap">
+  <!-- EDIT: header -->
+  <div class="kicker">Brainstorm · question 1</div>
+  <h1>Which approach for the flows?</h1>
+  <div class="context">
+    One or two short lines of context. Plain English, short sentences.
+  </div>
+
+  <div class="opts">
+    <!-- EDIT: one section per option; recommended first -->
+    <section class="opt" data-id="a">
+      <h2>Option A <span class="badge">Recommended</span></h2>
+      <p>What it does, in one line.</p>
+      <div class="mock">
+        <div class="w-row">
+          <div class="w-side"><i class="on"></i><i></i><i></i></div>
+          <div class="w-grow w-col">
+            <div class="w-h">Page title</div>
+            <div class="w-grid" style="--n:3"><div class="w-card on">One</div><div class="w-card">Two</div><div class="w-card off">Three</div></div>
+          </div>
+        </div>
+      </div>
+      <div class="pc"><div class="pro"><b>Pros</b><ul><li>…</li></ul></div><div class="con"><b>Cons</b><ul><li>…</li></ul></div></div>
+      <div class="go"><button type="button" class="primary single-only pick">Choose A</button></div>
+    </section>
+
+    <section class="opt" data-id="b">
+      <h2>Option B</h2>
+      <p>What it does, in one line.</p>
+      <div class="pc"><div class="pro"><b>Pros</b><ul><li>…</li></ul></div><div class="con"><b>Cons</b><ul><li>…</li></ul></div></div>
+      <div class="go"><button type="button" class="primary single-only pick">Choose B</button></div>
+    </section>
+  </div>
+
+  <div class="foot">
+    <div>
+      <textarea id="notes" placeholder="Notes, or your own answer (sent alone if nothing is selected)"></textarea>
+      <div class="hint single-only">Click a card's button to answer. Notes go with it.</div>
+      <div class="hint multi-only">Click cards to select several, then Submit.</div>
+    </div>
+    <div class="btns">
+      <button type="button" data-agterm="session.overlay.close">Cancel</button>
+      <button type="button" id="other">Send notes only</button>
+      <button type="button" class="primary multi-only" id="submit">Submit</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const multi = document.body.dataset.mode === "multi";
+  const notes = document.getElementById("notes");
+  const opts = [...document.querySelectorAll(".opt")];
+  function send(value) {
+    const v = JSON.stringify(value);
+    if (window.agterm && agterm.request) {
+      agterm.request("session.overlay.submit", { args: { value: v } });
+    }
+  }
+  function selected() { return opts.filter(o => o.classList.contains("sel")).map(o => o.dataset.id); }
+  opts.forEach(o => {
+    o.addEventListener("click", e => {
+      if (multi) { o.classList.toggle("sel"); return; }
+      opts.forEach(x => x.classList.toggle("sel", x === o));
+      if (e.target.closest(".pick")) send({ choice: [o.dataset.id], notes: notes.value.trim() });
+    });
+  });
+  document.getElementById("submit").addEventListener("click", () => {
+    const c = selected();
+    if (c.length) send({ choice: c, notes: notes.value.trim() });
+    else if (notes.value.trim()) send({ other: notes.value.trim() });
+  });
+  document.getElementById("other").addEventListener("click", () => {
+    const t = notes.value.trim();
+    if (!t) { notes.focus(); return; }
+    const c = selected();
+    send(c.length ? { choice: c, notes: t } : { other: t });
+  });
+})();
+</script>
+</body>
+</html>

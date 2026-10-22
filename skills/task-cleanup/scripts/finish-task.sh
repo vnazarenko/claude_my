@@ -93,5 +93,5 @@ python3 "$JIRA_PY" comment "$key" --body "$body" >/dev/null && echo "jira commen
 
 mkdir -p "$briefs/done"
 mv "$reg" "$briefs/done/" 2>/dev/null
-for ext in procs md; do [ -f "$briefs/$key.$ext" ] && mv "$briefs/$key.$ext" "$briefs/done/"; done
+for ext in procs retro md; do [ -f "$briefs/$key.$ext" ] && mv "$briefs/$key.$ext" "$briefs/done/"; done
 echo "=== done"

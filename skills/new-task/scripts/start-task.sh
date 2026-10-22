@@ -109,6 +109,7 @@ AGTERM_SESSION_ID=$sid
 SESSION_NAME="$name"
 BRIEF=$brief
 PROCS=$briefs/$key.procs
+RETRO=$briefs/$key.retro
 STARTED="$(date '+%F %T')"
 EOF
 : > "$briefs/$key.procs"

@@ -67,12 +67,30 @@ prod screen|ssh investviews screen -ls | grep kan297|ssh investviews screen -S k
 
 Prefer `run_in_background` for servers and watchers, so they stay children of this session.
 
-## 4. Before the PR merges
+## 4. Record what tripped you up, when it happens
+
+`task-cleanup` ends with a retro: what went wrong becomes a rule, so the next task does not hit
+it again. Recalling it at the end never works — write it down as it happens. Append one line to
+`~/.claude/task-briefs/{{KEY}}.retro` whenever:
+
+- the user corrects you ("no, use X", "do not do Y");
+- a command fails on a wrong assumption — wrong path, host, table, env var, test command;
+- you find a fact that was written somewhere you did not look;
+- a skill's step is wrong or missing.
+
+```
+2026-10-22|wrong test command|CLAUDE.md says `rake test`, the repo uses `bundle exec rspec`
+2026-10-22|user correction|reports must read raw ads, never the aggregate tables
+```
+
+One line, facts only. Do not judge it or fix the docs now — cleanup decides what becomes a rule.
+
+## 5. Before the PR merges
 
 Add this session's line to `.claude/SESSIONS.md` in the worktree and commit it on the branch
 (the global rule), so it lands with the PR.
 
-## 5. When the work is merged and deployed
+## 6. When the work is merged and deployed
 
 Tell the user, in one line, that the task is ready for `/task-cleanup`. Do not clean up on your
 own: cleanup closes this session.

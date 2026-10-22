@@ -1,12 +1,13 @@
 ---
 name: task-cleanup
-description: Finish a Jira task that was started with new-task, and leave a clean machine. Checks the PR is merged (and deployed), stops every process the task started (servers, specs, watchers, background jobs, containers, recorded remote screens and test databases), posts the final Jira comment and moves the ticket to Done, removes the worktree and branch, and at the very end closes the agterm session and the Claude session. Use whenever the user says "task cleanup", "/task-cleanup", "clean up this task", "close the task", "finish KAN-123", "we are done with this ticket", "close this session", or after a task's PR is merged and deployed — even if they do not say "Jira".
+description: Wrap up a Jira task that was started with new-task, and leave a clean machine plus a better set of rules. Checks every PR (merged, CI, review, Deploy steps), updates the ticket and every related ticket, runs a short retro that turns what went wrong into one concrete change in CLAUDE.md, a skill or the docs, stops every process the task started (servers, specs, watchers, background jobs, containers, recorded remote screens and test databases), removes the worktree and branch, and at the very end closes the agterm session and the Claude session. Use whenever the user says "task cleanup", "/task-cleanup", "wrap up", "wrap up the task", "clean up this task", "close the task", "finish KAN-123", "retro this task", "we are done with this ticket", "close this session", or after a task's PR is merged and deployed — even if they do not say "Jira".
 ---
 
-# task-cleanup — close a task completely
+# task-cleanup — wrap up a task completely
 
-The end of the `new-task` flow. When this skill finishes, nothing of the task is left running:
-no session, no worktree, no process, and Jira says what happened.
+The end of the `new-task` flow. When this skill finishes, nothing of the task is left running —
+no session, no worktree, no process — Jira says what happened, and anything that went wrong has
+become a rule, so the next task does not hit it again.
 
 Everything about the task is in its registry: `~/.claude/task-briefs/<KEY>.env` (key, repo,
 worktree, branch, Claude session id, agterm session id). Read it first.
@@ -41,6 +42,9 @@ Cleanup removes things, so check first. Report each failing gate in one line and
 A CLOSED (not merged) PR is fine when the user confirms the work is dropped: then the Jira status
 is `closed`, not `Done`.
 
+Red CI on an already-merged PR and a PR body with no `Deploy steps` are **not** gates — they are
+retro findings. Step 3 handles them.
+
 When the merge is proven, add `MERGE_PROVEN=1` to the registry, so the finisher may delete the
 local branch:
 
@@ -48,7 +52,91 @@ local branch:
 echo "MERGE_PROVEN=1" >> ~/.claude/task-briefs/$KEY.env
 ```
 
-## 2. Stop the processes
+## 2. Evidence — one run, read it before anything else
+
+```bash
+bash $S/task-evidence.sh $KEY | tee "$SCRATCHPAD/$KEY-evidence.txt"
+```
+
+Read-only. It prints facts and judges nothing:
+
+| section | what it tells you |
+|---|---|
+| `PRS` | every PR for the branch, its state and merge commit |
+| `CI` | checks that were not green when it merged |
+| `REVIEW` | what a reviewer had to catch — each line is a candidate finding |
+| `PRBODY` | whether each PR body really carries `## Deploy steps` and `## After deploy` |
+| `COMMITS` | the branch's commits, and how many of them were rework ("fix the fix") |
+| `PLAN` | lines the plan marked ➕ (discovered) or ⚠️ (blocked), and boxes never ticked |
+| `JIRA` | status, and comments mentioning blocked / scope / wrong / again |
+| `RELATED` | linked tickets, plus every key named in the commits or PR bodies |
+| `RETRO NOTES` | what the task session wrote down as it worked — the best evidence there is |
+| `SESSIONLOG` | whether this session's `SESSIONS.md` line reached `origin/main` |
+
+## 3. Retro — turn what went wrong into one rule change
+
+Run it here, while the worktree, the branch and the logs still exist. This is the step that makes
+cleanup worth running: the machine gets clean either way, but only this step stops the same
+mistake happening in the next task.
+
+Start from the `RETRO NOTES` section — the task session wrote those lines as the problems
+happened. Then add what neither the notes nor the script caught, from this session:
+
+- every time the user corrected you ("no, use X", "do not do Y", "switch to English");
+- every command that failed on a wrong assumption about the project — wrong path, wrong host,
+  wrong table, wrong env var, wrong test command;
+- a fact you had to discover that was already written somewhere you did not look;
+- a step a skill told you to do that was wrong, or a step the skill was missing;
+- a permission prompt the user denied.
+
+### Where a fix goes
+
+| what happened | fix it here |
+|---|---|
+| a project fact was wrong or missing (path, host, command, table, env var) | that repo's `CLAUDE.md`, or `docs/services/<name>.md` when it is service detail |
+| the fact was written already, but not where you looked | move it, or add one pointer line — never write it twice |
+| the same process mistake has now happened in more than one task (uncommitted work in the main checkout, missing PR sections, worktree in the wrong place) | `~/.claude/CLAUDE.md` |
+| a skill's steps were wrong, incomplete, or sent you to the wrong place | that skill's `SKILL.md` or its `references/` file |
+| a preference about how to work, not about the code | a memory file, type `feedback` |
+| the tool or the harness itself failed | `SendFeedback`, not a doc edit |
+| one-off, and no rule would have prevented it | nothing — say "nothing to change" |
+
+### Rules for the rule change
+
+- **At most two changes per task.** "Nothing to change" is the normal answer for a task that
+  went well. A retro that always finds something stops being read.
+- A change earns its place only when it **would have changed what happened this task** and
+  **will change the next one**. "Good to know" is not enough.
+- **Edit an existing rule before adding a new one.** Deleting a rule that proved wrong counts as
+  a change, and is often the best one.
+- **Three lines maximum**, written as an instruction ("Edit only `investviews/infra/`"), not as a
+  story.
+- Give it one line of evidence in the file's own style: `**Why this exists:** 2026-10-22, …` and
+  what actually happened.
+- Project facts never go in the global file. Process rules never go in a project file.
+- Never add a rule that already exists elsewhere. If it existed and was still missed, that is a
+  placement problem — fix the placement instead.
+
+### Make the change
+
+- `~/.claude/CLAUDE.md`, a skill under `~/.claude/skills/`, or a memory file: edit in place —
+  they only work from that path — then commit it:
+  ```bash
+  git -C ~/.claude add -A <paths> && git -C ~/.claude commit -m "retro($KEY): <what changed>"
+  ```
+- A file inside a project repo: it needs its own worktree and PR, because the task's branch is
+  merged and the main checkout is read-only.
+  ```bash
+  git -C $REPO worktree add .claude/worktrees/$KEY-retro -b $KEY-retro origin/main
+  # edit → commit → push → gh pr create   (Deploy steps: "Nothing — docs only, merging is enough")
+  ```
+  That PR is the one thing cleanup leaves open. Name it in the report, and delete its worktree
+  when it merges.
+
+Write the finding and the change into the Jira comment in step 5, in one line each. If there is
+nothing to change, say that too — it is a result.
+
+## 4. Stop the processes
 
 ```bash
 bash $S/task-processes.sh $KEY            # list
@@ -67,17 +155,28 @@ its stop command. **On a production host, show the user what you will stop and a
 Also stop what this session itself runs in the background: `TaskStop` every background task and
 Monitor you started, and `CronDelete` any cron you created.
 
-## 3. Jira
+## 5. Jira — this ticket and every related one
 
 1. Post the final comment (`$JIRA comment $KEY --body-file …`), in plain English:
    - what was done, in 1–3 lines;
    - the PR links with their merge commits;
    - the deploy state and the check that proves it;
+   - the retro: the finding and the rule that changed, one line each, or "nothing to change";
    - anything left open, as a follow-up ticket key (create it with `jira-tickets`) or "nothing".
 2. Move the status: `$JIRA transition $KEY --to "Done"` (deployed), `"ready for deploy"`
    (merged, not deployed), or `"closed"` (dropped).
+3. Then every ticket from the evidence's `RELATED` section:
 
-## 4. Report to the user — before the session closes
+   | the related ticket | do this |
+   |---|---|
+   | was fixed by this work too | comment what landed with the PR link, then move its status |
+   | was only touched | one comment naming this ticket and the PR. No status change |
+   | is the same bug as this one | close it as a duplicate and link it |
+   | is work this task found and left | it must exist as a follow-up ticket — create it now if it does not |
+
+   Never move a related ticket to Done without naming the PR that did it.
+
+## 6. Report to the user — before the session closes
 
 The user reads this message in the session just before it closes, so it is the last thing they see
 here. Keep it to the result table:
@@ -85,11 +184,13 @@ here. Keep it to the result table:
 | | |
 |---|---|
 | PR | #N merged (`sha`) |
-| Jira | KAN-297 → Done |
+| Jira | KAN-297 → Done; KAN-310 commented |
+| retro | `~/.claude/CLAUDE.md`: test command for parsalytics specs — or "nothing to change" |
+| left open | retro PR #N (doc change), or "nothing" |
 | processes | 3 stopped, 0 left |
 | worktree + branch | removed after the session closes |
 
-## 5. Close everything — the last step
+## 7. Close everything — the last step
 
 ```bash
 bash $S/finish-task.sh $KEY --detach
@@ -107,7 +208,7 @@ few seconds it:
 
 Its log is `~/.claude/task-briefs/<KEY>.cleanup.log`. Run it last: after it starts, nothing else in
 this session will run. When you run cleanup from another session, the finisher closes the task's
-session, not yours.
+session, not yours. It never touches a `<KEY>-retro` worktree.
 
 ## Why the finisher runs detached
 

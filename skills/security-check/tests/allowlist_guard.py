@@ -3,6 +3,7 @@
 checks that it runs only allowed external commands, and nothing that can write or start things.
 It also refuses here-strings ("<<<": bash before 5.1 writes them to a temp file) and "< $file"
 (a file named by a variable is read only through read_plain: no symlink, no FIFO wait).
+From /proc it allows only /proc/<pid>/exe and /proc/self/cwd (the script's own folder).
 
 Usage:
   allowlist_guard.py <script> "<allowed commands, space separated>" [--list]
@@ -15,7 +16,7 @@ import re, shlex, sys
 path, allowed = sys.argv[1], set(sys.argv[2].split())
 BUILTINS = {"echo", "printf", "read", "local", "declare", "set", "shift", "return", "exit",
             "test", "[", "true", "false", "mapfile", "readarray", "unset", "export",
-            "break", "continue", "command"}
+            "break", "continue", "command", "cd"}
 FORBIDDEN = {"pm2", "nvm", "npm", "npx", "systemctl", "service", "rm", "apt", "sudo",
              "eval", "source", ".", "exec", "bash", "sh", "xargs", "env", "tee", "curl", "wget"}
 PREFIX_KW = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time"}
@@ -269,8 +270,8 @@ for no, line in enumerate(lines, 1):
         if word in low:
             err(no, f"reads '{word}'")
     for p in re.findall(r"/proc/[^\s\"')]*", line):
-        if not re.fullmatch(r"/proc/(\[0-9\]\*|\$[A-Za-z_]+)(/exe)?", p):
-            err(no, f"reads {p} (only /proc/<pid>/exe is allowed)")
+        if not re.fullmatch(r"/proc/(\[0-9\]\*|\$[A-Za-z_]+)(/exe)?|/proc/self/cwd", p):
+            err(no, f"reads {p} (only /proc/<pid>/exe and /proc/self/cwd are allowed)")
     norm = line
     while True:
         new = re.sub(r"\$\{[^{}]*\}", VAR, norm)

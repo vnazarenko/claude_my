@@ -125,7 +125,7 @@ What you get (one JSON object):
 | `ruby`, `python3` | rvm rubies; the newest `python3.x` dpkg version |
 | `docker_images[]` | images of running containers: `image`, `id`, `created` (`2026-01-02T10:00:00+0000`) |
 | `running_deleted_exe` | binaries replaced on disk but still running: old code until a restart |
-| `revisions` | `{<revision_file>: <git sha or null>}` |
+| `revisions` | `{<revision_file>: <git sha or null>}`. `null` also when a folder on the way is a link: root reads no file through a link a user may have put there. The one link it follows is Capistrano's `<deploy>/current` → `<deploy>/releases/<name>`. The same rule holds for `pm2.pid` and the nvm `default` alias |
 | `filtered` | `truncated` (a list was over its cap), `dropped` (`{<field>: <count>}`: values left out for a wrong shape or the cap) and `other_paths` (`{<field>: <count>}`: binary paths left out because a user may have named them: `/tmp`, a home folder, a folder others can write, a container path outside `/usr/bin` and `/usr/local/bin`, a deleted binary with no file at its path now) |
 
 A missing tool gives `null` or `[]`, not an error. A tool that fails gives `null` (or
@@ -154,22 +154,38 @@ python3 $SKILL/scripts/advisories.py usn  "$OUT/inventory.json" --since-days N >
 - The cache is `~/.cache/security-check` (or `$SECURITY_CHECK_CACHE`). A repeat within 6 hours
   uses it.
 
-Apps we own — audit the **deployed** revision, not `main`. For each `ours[]` with `lockfile`:
+Apps we own — audit the **deployed** revision, not `main`. For each `ours[]` with `lockfile`,
+first check that the deployed commit is known:
 
 ```bash
-sha=<inventory .revisions[<revision_file>]>        # null → "Not checked: revision unknown"
-[[ $sha =~ ^[0-9a-f]{7,40}$ ]] || sha=""   # check it again: anything else → treat as null, never pass it to git
-git -C <repo> cat-file -e "${sha}^{commit}" || git -C <repo> fetch origin
-mkdir -p "$OUT/<name>"
-# Node (pnpm): the lockfile's folder needs package.json, pnpm-lock.yaml, pnpm-workspace.yaml (if any)
-git -C <repo> show "${sha}:<dir>/package.json"   > "$OUT/<name>/package.json"
-git -C <repo> show "${sha}:<dir>/pnpm-lock.yaml" > "$OUT/<name>/pnpm-lock.yaml"
-(cd "$OUT/<name>" && pnpm audit --prod --json > ../audit-<name>.json)
-# Ruby: the Gemfile.lock for the audit; the Gemfile tells which gems are dev/test only
-git -C <repo> show "${sha}:Gemfile.lock" > "$OUT/<name>/Gemfile.lock"
-git -C <repo> show "${sha}:Gemfile"      > "$OUT/<name>/Gemfile"
-bundle-audit update --quiet     # not "check --update": it prints the update lines into the JSON
-bundle-audit check --format json "$OUT/<name>" > "$OUT/audit-<name>.json"
+sha=<inventory .revisions[<revision_file>]>
+[[ $sha =~ ^[0-9a-f]{7,40}$ ]] || sha=""   # check it again: null or anything else → empty
+[ -n "$sha" ] && { git -C <repo> cat-file -e "${sha}^{commit}" 2>/dev/null \
+  || { git -C <repo> fetch -q origin && git -C <repo> cat-file -e "${sha}^{commit}"; }; } \
+  && echo "audit $sha" || echo "not checked: deployed commit unknown"
+```
+
+- `not checked: deployed commit unknown` (no sha, or the repo does not have that commit):
+  **skip the audit of this app.** Put it under "Not checked" with that reason. Never run
+  `git show` with an empty `sha`: `git show ":<path>"` reads the local index, not the deployed
+  code, so the audit would check the wrong files.
+- `audit <sha>`: audit that commit. The block checks `sha` again and stops when it is not a sha:
+
+```bash
+(
+  sha=<the sha from "audit <sha>">
+  [[ $sha =~ ^[0-9a-f]{7,40}$ ]] || { echo "not checked: deployed commit unknown"; exit 1; }
+  mkdir -p "$OUT/<name>"
+  # Node (pnpm): the lockfile's folder needs package.json, pnpm-lock.yaml, pnpm-workspace.yaml (if any)
+  git -C <repo> show "${sha}:<dir>/package.json"   > "$OUT/<name>/package.json"
+  git -C <repo> show "${sha}:<dir>/pnpm-lock.yaml" > "$OUT/<name>/pnpm-lock.yaml"
+  (cd "$OUT/<name>" && pnpm audit --prod --json > ../audit-<name>.json)
+  # Ruby: the Gemfile.lock for the audit; the Gemfile tells which gems are dev/test only
+  git -C <repo> show "${sha}:Gemfile.lock" > "$OUT/<name>/Gemfile.lock"
+  git -C <repo> show "${sha}:Gemfile"      > "$OUT/<name>/Gemfile"
+  bundle-audit update --quiet     # not "check --update": it prints the update lines into the JSON
+  bundle-audit check --format json "$OUT/<name>" > "$OUT/audit-<name>.json"
+)
 ```
 
 - Write `${sha}:…` with braces: in zsh `$sha:w…` is a modifier, not a path.

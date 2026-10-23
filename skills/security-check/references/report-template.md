@@ -114,7 +114,7 @@ Versions only. No file contents.
 | ruby | `<versions>` | rvm |
 | images | `<image>` (built `<created>`) | docker images |
 | <app> | deployed `<sha>` | REVISION |
-| still running after an update | `<running_deleted_exe>`, or none | /proc |
+| still running after an update | `<running_deleted_exe>`, or none (executables only, not libraries) | /proc |
 
 ---
 

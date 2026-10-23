@@ -6,18 +6,21 @@
 #
 # 1. guard: every command in remote-inventory.sh is on ALLOWED, and the guard catches
 #    forbidden ones (pm2, nvm, npm, docker inspect, apt update, systemctl, rm, writes, dd with
-#    of= or without nofollow, here-strings, "< $file", /proc/<pid>/environ, cmdline, .env, ...)
+#    of= or without nofollow, here-strings, "< $file", /proc/<pid>/environ, cmdline, .env,
+#    /proc other than <pid>/exe and self/cwd, ...)
 # 2. inventory.sh with a stub ssh: argument checks and the ssh options (no network); a hostile
 #    answer: free text, spaces, long strings, 500 entries, paths it did not ask for, too many
 #    bytes, an apt list without status "ok"; text on ssh's stderr never shown
 # 3. remote-inventory.sh in docker (default image ubuntu:24.04): bare, then with fake
 #    nvm / pm2 / reboot / apt / docker data (also hostile files: symlinks, a FIFO, odd names,
 #    a process in its own mount namespace, like a container's; binaries in /tmp, in a folder a
-#    user owns or all can write, a pm2.pid naming one of them: their paths are only counted),
-#    then hostile names and 500
-#    entries on the server; read_plain on a symlink, a FIFO and a file swapped with a symlink;
-#    apt-get and docker that fail, 600 running containers; then on real apt lists: no file may
-#    change. Skipped with a warning when docker is not running.
+#    user owns or all can write, a pm2.pid naming one of them: their paths are only counted;
+#    a folder on the way that links to a root-only folder: nothing in it is read), then hostile
+#    names and 500 entries on the server; read_plain on a symlink, a FIFO, a file swapped with a
+#    symlink, a linked folder on the way (also one swapped in while reading) and Capistrano's
+#    current -> releases/<name>; apt-get and docker that fail, 600 running containers; 1200 nvm
+#    installs and rubies (at most 1000 go to sort; no file changed); then on real apt lists: no
+#    file may change. Skipped with a warning when docker is not running.
 #
 # All data is synthetic. Nothing here connects to a real server.
 set -uo pipefail
@@ -109,6 +112,9 @@ bad_lines=(
   'while read -r l; do true; done < "$file"'
   'read -r x <<< "$y"'
   'read -r x <<< hello'
+  'readlink /proc/self/root'
+  'read -r x < /proc/self/cwd/x'
+  'cd /proc/1 && readlink cwd'
 )
 for line in "${bad_lines[@]}"; do
   { cat "$remote"; printf '%s\n' "$line"; } > "$tmp/mutant.sh"
@@ -449,6 +455,22 @@ echo 0123456789abcdef0123456789abcdef01234567 > /srv/app/releases/1/REVISION
 ln -s /srv/app/releases/1 /srv/app/current
 echo 'not a sha; DB_PASSWORD=secret' > /srv/bad/current/REVISION
 ln -s /srv/app/releases/1/REVISION /srv/link/current/REVISION
+# A relative "current" link, as some deploy tools make it: read too.
+mkdir -p /srv/relapp/releases/2
+echo 89abcdef0123456789abcdef0123456789abcdef > /srv/relapp/releases/2/REVISION
+ln -s releases/2 /srv/relapp/current
+# A folder on the way that links to a root-only folder: nothing in it is read (REVISION, pm2.pid,
+# the nvm alias). The deploy folder belongs to a user, so any link in it may be theirs.
+mkdir -p /root/rev /root/rel/1 /root/pm2 /srv/plink /srv/rel /home/plink/.nvm/versions/node
+chmod 700 /root/rev /root/rel /root/pm2
+echo abcdefabcdefabcdefabcdefabcdefabcdefabcd > /root/rev/REVISION
+echo abcdefabcdefabcdefabcdefabcdefabcdefabcd > /root/rel/1/REVISION
+ln -s /root/rev /srv/plink/current
+ln -s /root/rel /srv/rel/releases
+ln -s /srv/rel/releases/1 /srv/rel/current
+echo "$daemon" > /root/pm2/pm2.pid
+ln -s /root/pm2 "$u/.pm2-link"
+ln -s /root/.nvm/alias /home/plink/.nvm/alias
 mkdir -p /var/lib/apt/lists /var/lib/apt/periodic
 touch -d '30 hours ago' /var/lib/apt/lists/example.invalid_dists_noble-security_InRelease
 touch -d '3 hours ago' /var/lib/apt/periodic/update-success-stamp
@@ -489,7 +511,7 @@ EOF
 # SYS_ADMIN (test only): unshare + mount for the namespace process. timeout: a FIFO must not hang it.
 out="$(docker run --rm -i --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
   -v "$scripts:/t:ro" -v "$tmp/setup.sh:/setup.sh:ro" "$IMAGE" bash -c \
-  'bash /setup.sh && timeout 60 bash /t/remote-inventory.sh --pm2-home /home/tester/.pm2-app --pm2-home /home/tester/.pm2-old --pm2-home /home/evil/.pm2 --pm2-home /home/tester/.pm2-evil --revision-file /srv/app/current/REVISION --revision-file /srv/bad/current/REVISION --revision-file /srv/link/current/REVISION' 2>"$tmp/err")"
+  'bash /setup.sh && timeout 60 bash /t/remote-inventory.sh --pm2-home /home/tester/.pm2-app --pm2-home /home/tester/.pm2-old --pm2-home /home/evil/.pm2 --pm2-home /home/tester/.pm2-evil --pm2-home /home/tester/.pm2-link --revision-file /srv/app/current/REVISION --revision-file /srv/bad/current/REVISION --revision-file /srv/link/current/REVISION --revision-file /srv/relapp/current/REVISION --revision-file /srv/plink/current/REVISION --revision-file /srv/rel/current/REVISION' 2>"$tmp/err")"
 check "fake: valid JSON" 'type == "object"' "$out"
 check "fake: newest kernel by version order" '.os.kernel_newest_installed == "6.8.0-48-generic"' "$out"
 check "fake: reboot required + packages once each" '.os.reboot_required == true and .os.reboot_required_pkgs == ["linux-base","linux-image-6.8.0-48-generic"]' "$out"
@@ -516,12 +538,15 @@ check "fake: nvm aliases as written; a symlink, a FIFO or an odd value -> null" 
   {"nvm_dir":"/home/evil/.nvm","default_alias":null},
   {"nvm_dir":"/home/fifo/.nvm","default_alias":null},
   {"nvm_dir":"/home/odd/.nvm","default_alias":null},
+  {"nvm_dir":"/home/plink/.nvm","default_alias":null},
   {"nvm_dir":"/home/tester/.nvm","default_alias":"22"}]' "$out"
 check "fake: pm2.pid that is a symlink -> not read" '.pm2[2] | .pm2_home == "/home/evil/.pm2" and (.pid_file | not) and (.daemon_running | not)' "$out"
 check "fake: pm2 daemon Node and version from files" '.pm2[0] | .pid_file and .daemon_running and .daemon_node == "v24.21.0" and .pm2_version == "6.0.5"' "$out"
 check "fake: stale pm2 pid -> not running, nulls" '.pm2[1] | .pid_file and (.daemon_running | not) and .daemon_node == null and .pm2_version == null' "$out"
 check "fake: pm2.pid of a binary in /tmp -> running, but no path, counted" \
   '.pm2[3] == {"pm2_home":"/home/tester/.pm2-evil","pid_file":true,"daemon_running":true,"daemon_node_path":null,"daemon_node":null,"pm2_version":null}' "$out"
+check "fake: pm2 home that links to a root-only folder -> its pm2.pid is not read" \
+  '.pm2[4] == {"pm2_home":"/home/tester/.pm2-link","pid_file":false,"daemon_running":false,"daemon_node_path":null,"daemon_node":null,"pm2_version":null}' "$out"
 check "fake: services from dpkg (Ubuntu docker.io, containerd), removed package -> null" '.services == {"nginx":"1.24.0-2ubuntu7.1","postgresql":"16.4-1","redis":null,"clickhouse":"25.10.1.3832","docker":"24.0.7-0ubuntu4.1","containerd":"1.7.12-0ubuntu4.1","openssh":"1:9.6p1-3ubuntu13.5","openssl":"3.0.13-0ubuntu3.4"}' "$out"
 check "fake: python3 from dpkg" '.python3 == "3.12.3-1ubuntu0.8"' "$out"
 check "fake: rvm rubies (system, multi-user, per-user), sorted, once each" '.ruby == ["3.2.2","3.3.6","3.4.7"]' "$out"
@@ -530,13 +555,14 @@ check "fake: docker id kept, date as 2026-01-02T10:00:00+0000" '.docker_images[]
 check "fake: the odd alias is counted; paths root did not name are only counted (odd nvm folder, /opt/app, /usr/local/lib/w, /tmp, /srv, a container path; pm2.pid; 3 /tmp + 1 gone deleted binaries)" \
   '.filtered == {"truncated":false,"dropped":{"nvm":1},"other_paths":{"node":6,"pm2":1,"running_deleted_exe":4}}' "$out"
 check "fake: deleted binary still running, with a new file at its path" '.running_deleted_exe == ["/usr/local/bin/oldsvc"]' "$out"
-check "fake: revision is a sha or null; a symlinked REVISION is not read" '.revisions == {"/srv/app/current/REVISION":"0123456789abcdef0123456789abcdef01234567","/srv/bad/current/REVISION":null,"/srv/link/current/REVISION":null}' "$out"
+check "fake: revision is a sha or null; a symlinked REVISION is not read" '.revisions == {"/srv/app/current/REVISION":"0123456789abcdef0123456789abcdef01234567","/srv/bad/current/REVISION":null,"/srv/link/current/REVISION":null,"/srv/relapp/current/REVISION":"89abcdef0123456789abcdef0123456789abcdef","/srv/plink/current/REVISION":null,"/srv/rel/current/REVISION":null}' "$out"
+if grep -q abcdefabcdef <<< "$out"; then bad "fake: a linked folder on the way -> no root-only REVISION read"; else ok "fake: a linked folder on the way -> no root-only REVISION read"; fi
 if grep -q secret <<< "$out"; then bad "fake: no file content in the output"; else ok "fake: no file content in the output"; fi
 if grep -q 'root:' <<< "$out"; then bad "fake: no line of /etc/shadow in the output"; else ok "fake: no line of /etc/shadow in the output"; fi
 if grep -q -e IGNORE -e SYSTEM -e run-it-now -e msg1 -e /opt/app -e /lib/w <<< "$out"; then bad "fake: no path a user named"; else ok "fake: no path a user named"; fi
 printf '%s' "$out" > "$tmp/fake_out.json"
 out="$(STUB_OUT_FILE="$tmp/fake_out.json" run_inv example-host --pm2-home /home/tester/.pm2-app --pm2-home /home/tester/.pm2-old \
-  --pm2-home /home/evil/.pm2 --pm2-home /home/tester/.pm2-evil 2>/dev/null)"
+  --pm2-home /home/evil/.pm2 --pm2-home /home/tester/.pm2-evil --pm2-home /home/tester/.pm2-link 2>/dev/null)"
 check "fake, then inventory.sh: same Node list, the server counts kept" \
   '([.node[].path] | length) == 11 and .pm2[3].daemon_node_path == null
    and .filtered.other_paths == {"node":6,"pm2":1,"running_deleted_exe":4} and .running_deleted_exe == ["/usr/local/bin/oldsvc"]' "$out"
@@ -597,11 +623,13 @@ check "server side, then inventory.sh: the server counts are kept" \
    and .filtered.other_paths == {"node":3,"running_deleted_exe":1}' "$out"
 
 # 3f. read_plain, the one read of a file in a folder other users can write: a symlink is not
-# followed (also one swapped in while reading), a FIFO gives nothing at once. The function is
-# taken from the script as it is.
+# followed (also one swapped in while reading), a FIFO gives nothing at once, a linked folder on
+# the way gives nothing (also one swapped in while reading); only Capistrano's
+# current -> releases/<name> is followed. The function is taken from the script as it is.
 cat > "$tmp/readplain.sh" <<'EOF'
 set -u
-eval "$(grep -E '^read_plain\(\) ' /t/remote-inventory.sh)"
+eval "$(sed -n '/^read_plain() {$/,/^}$/p' /t/remote-inventory.sh)"
+declare -F read_plain >/dev/null || { echo "no read_plain in the script"; exit 1; }
 secret=0123456789abcdef0123456789abcdef01234567   # root-only, the shape of a git sha
 mine=fedcba9876543210fedcba9876543210fedcba98
 mkdir -p /home/u
@@ -630,6 +658,45 @@ for i in $(seq 1 300); do
 done
 kill "$loop"
 echo "swap_reads=$reads swap_leaks=$leaks"
+# A folder on the way that links to a root-only folder holding a file of the same name.
+mkdir -p /root/sec /root/rel/7
+chmod 700 /root/sec /root/rel
+printf '%s\n' "$secret" > /root/sec/REVISION
+printf '%s\n' "$secret" > /root/rel/7/REVISION
+ln -s /root/sec /home/u/plink
+echo "plink=$(read_plain /home/u/plink/REVISION)"
+# Capistrano: current -> releases/<name> of the same deploy folder is read, by a relative or an
+# absolute link. current -> a folder elsewhere, or a "releases" that is a link: nothing.
+mkdir -p /home/u/app/releases/7 /home/u/abs/releases/7 /home/u/out /home/u/rl
+printf '%s\n' "$mine" > /home/u/app/releases/7/REVISION
+printf '%s\n' "$mine" > /home/u/abs/releases/7/REVISION
+ln -s releases/7 /home/u/app/current
+ln -s /home/u/abs/releases/7 /home/u/abs/current
+ln -s /root/sec /home/u/out/current
+ln -s /root/rel /home/u/rl/releases
+ln -s /home/u/rl/releases/7 /home/u/rl/current
+echo "cur_rel=$(read_plain /home/u/app/current/REVISION)"
+echo "cur_abs=$(read_plain /home/u/abs/current/REVISION)"
+echo "cur_out=$(read_plain /home/u/out/current/REVISION)"
+echo "cur_rl=$(read_plain /home/u/rl/current/REVISION)"
+# Another user swaps a folder on the way: a real folder, then a link to the root-only folder.
+mkdir -p /home/u/race.d
+printf '%s\n' "$mine" > /home/u/race.d/REVISION
+( while :; do
+    mv -T /home/u/race.d /home/u/race 2>/dev/null
+    mv -T /home/u/race /home/u/race.d 2>/dev/null
+    ln -s /root/sec /home/u/race 2>/dev/null
+    rm -f /home/u/race
+  done ) &
+loop=$!
+reads=0 leaks=0
+for i in $(seq 1 300); do
+  v=$(read_plain /home/u/race/REVISION)
+  [ -n "$v" ] && reads=$((reads + 1))
+  [ "${v%%$'\n'*}" = "$secret" ] && leaks=$((leaks + 1))
+done
+kill "$loop"
+echo "pswap_reads=$reads pswap_leaks=$leaks"
 EOF
 out="$(docker run --rm -i -v "$scripts:/t:ro" -v "$tmp/readplain.sh:/readplain.sh:ro" "$IMAGE" \
   timeout 60 bash /readplain.sh 2>"$tmp/err")"
@@ -640,6 +707,16 @@ if [[ $out =~ swap_reads=([0-9]+)\ swap_leaks=0 ]] && [ "${BASH_REMATCH[1]}" -gt
   ok "read_plain: a file swapped with a symlink while reading never gives the root-only file"
 else
   bad "read_plain: a file swapped with a symlink while reading never gives the root-only file (got: $(grep swap_ <<< "$out"))"
+fi
+expect_eq "read_plain: a folder on the way that links to a root-only folder gives nothing" "plink=" "$(grep '^plink=' <<< "$out")"
+expect_has "read_plain: current -> releases/<name>, relative link, is read" "cur_rel=fedcba9876543210fedcba9876543210fedcba98" "$out"
+expect_has "read_plain: current -> releases/<name>, absolute link, is read" "cur_abs=fedcba9876543210fedcba9876543210fedcba98" "$out"
+expect_eq "read_plain: current -> a folder outside the deploy folder gives nothing" "cur_out=" "$(grep '^cur_out=' <<< "$out")"
+expect_eq "read_plain: current -> releases/<name> where releases is a link gives nothing" "cur_rl=" "$(grep '^cur_rl=' <<< "$out")"
+if [[ $out =~ pswap_reads=([0-9]+)\ pswap_leaks=0 ]] && [ "${BASH_REMATCH[1]}" -gt 0 ]; then
+  ok "read_plain: a folder on the way swapped with a link while reading never gives the root-only file"
+else
+  bad "read_plain: a folder on the way swapped with a link while reading never gives the root-only file (got: $(grep pswap_ <<< "$out"))"
 fi
 
 # 3g. Tools that fail: apt-get exits 100 after an Inst line → status "error", no list (not
@@ -667,6 +744,27 @@ out="$(docker run --rm -i -v "$scripts:/t:ro" -v "$tmp/failing.sh:/failing.sh:ro
   'bash /failing.sh many && timeout 60 bash /t/remote-inventory.sh' 2>"$tmp/err")"
 check "600 running containers: 500 lines read, 50 images passed on, the rest counted" \
   '(.docker_images | length) == 50 and .filtered.truncated == true and .filtered.dropped.docker_images == 550' "$out"
+
+# 3h. Lists that other users can fill: 1200 nvm installs and 1200 rubies in a home folder. At
+# most MAX_SORT (1000) entries go to "sort", 50 are passed on, the rest is counted. No file
+# changes: sort keeps such a short input in memory (a long one would go to temp files).
+cat > "$tmp/many.sh" <<'EOF'
+set -e
+mkdir -p $(printf '/home/many/.nvm/versions/node/v1.0.%d/bin ' $(seq 1 1200))
+touch $(printf '/home/many/.nvm/versions/node/v1.0.%d/bin/node ' $(seq 1 1200))
+for i in $(seq 1 1200); do printf '/home/many/.rvm/rubies/ruby-3.%d.%d\n' $((i / 100)) $((i % 100)); done | xargs mkdir -p
+EOF
+out="$(docker run --rm -i -v "$scripts:/t:ro" -v "$tmp/many.sh:/many.sh:ro" "$IMAGE" bash -c '
+  bash /many.sh || exit 1
+  sleep 1; touch /dev/shm/marker; sleep 1
+  timeout 120 bash /t/remote-inventory.sh > /dev/shm/out.json || echo "CHANGED: the script failed"
+  find / -xdev -newer /dev/shm/marker -not -path "/proc/*" 2>/dev/null | sed "s/^/CHANGED: /"
+  cat /dev/shm/out.json' 2>"$tmp/err")"
+expect_eq "1200 nvm installs and rubies: no file changed" "" "$(grep '^CHANGED: ' <<< "$out")"
+out="$(grep -v '^CHANGED: ' <<< "$out")"
+check "1200 nvm installs: 1000 sorted, 50 passed on, the rest counted" \
+  '(.node | length) == 50 and .filtered.dropped.node == 1150 and .filtered.truncated == true and .filtered.other_paths == {}' "$out"
+check "1200 rubies: 1000 sorted, 50 passed on, the rest counted" '(.ruby | length) == 50 and .filtered.dropped.ruby == 1150' "$out"
 
 # 3d. Real apt lists (needs the network in docker): after the script runs, no file has changed.
 # apt-get --simulate rewrote /var/log/apt/eipp.log.xz before Dir::Log::Planner was emptied.

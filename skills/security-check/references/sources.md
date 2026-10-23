@@ -116,15 +116,18 @@ A distro Node (`/usr/bin/node`, a dpkg version such as `18.19.1+dfsg-…`):
   inventory (in `$OUT`) whose `apt.upgradable` lists their packages with `candidate` =
   `installed` and `origin` `Ubuntu`: any CVE it prints is a fix apt does not offer.
 - A library (libssl, libc, zlib, …) affects every process linked to it. After the update, those
-  processes run old code until they restart; `running_deleted_exe` in the next inventory shows
-  what was missed.
+  processes run old code until they restart. `running_deleted_exe` does **not** show them: it
+  sees only replaced executables (`/proc/<pid>/exe`), not libraries. So the proposal names the
+  services to restart, and its check (a step for the user, after the update) is
+  `needrestart -b -r l` on the server: it lists the processes that still use an old library and
+  changes nothing. Without needrestart: restart every service that uses the library.
 - Update proposal: `apt-get install --only-upgrade <binary packages>` (the `binaries` of the
   source package), or `unattended-upgrade` for all security updates.
 
 | component | restart after the update |
 |---|---|
-| a library | every process that uses it; `needrestart -r l` lists them |
-| nginx | `nginx -t && systemctl restart nginx` (open connections drop; a second or two). A reload is **not** enough: it only re-reads the config, and the new workers still run the old binary and libraries. With no outage allowed: nginx's binary upgrade (`USR2`, then `QUIT` to the old master), see `https://nginx.org/en/docs/control.html#upgrade`. Check: `running_deleted_exe` in the next inventory no longer lists nginx |
+| a library | every process that uses it. Check after the update: `needrestart -b -r l` lists the ones still on the old library (`running_deleted_exe` does not see libraries) |
+| nginx | `nginx -t && systemctl restart nginx` (open connections drop; a second or two). A reload is **not** enough: it only re-reads the config, and the new workers still run the old binary and libraries. With no outage allowed: nginx's binary upgrade (`USR2`, then `QUIT` to the old master), see `https://nginx.org/en/docs/control.html#upgrade`. Check: `running_deleted_exe` in the next inventory no longer lists nginx, and `needrestart -b -r l` lists no nginx process |
 | OpenSSH | `systemctl restart ssh`; keep a second session open while you do it |
 | PostgreSQL | `systemctl restart postgresql` (short outage; plan it) |
 | Redis | `systemctl restart redis-server` (short outage; data comes back from disk) |

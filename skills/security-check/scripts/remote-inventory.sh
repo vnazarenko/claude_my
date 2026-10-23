@@ -13,11 +13,14 @@
 #   iflag=nofollow,nonblock, no of=); nothing writes a file
 # - pm2, nvm, npm and systemctl are never run: they can start daemons or write files
 # - process facts come only from the /proc/<pid>/exe link: no process arguments,
-#   no process environment, no app config files
+#   no process environment, no app config files. /proc/self/cwd is read too: the script's own
+#   folder (read_plain)
 # - a file under a folder other users can write (nvm, pm2, deploys) is read only through
-#   read_plain: one open by dd with O_NOFOLLOW and O_NONBLOCK, under timeout. So root never
-#   follows a link put there (also not one swapped in after a check) and never waits on a FIFO.
-#   Only a value of the expected shape is passed on (a version, a pid, a git sha)
+#   read_plain: it goes into the folder and checks with the kernel that it is the folder named
+#   (no link on the way), then dd opens the file there once, with O_NOFOLLOW and O_NONBLOCK,
+#   under timeout. So root never follows a link put there (in the folders or the file, also not
+#   one swapped in after a check) and never waits on a FIFO. Only a value of the expected shape
+#   is passed on (a version, a pid, a git sha)
 # - a missing tool or file gives null or [], never an error. A tool that fails gives null or
 #   "error", never an empty list: "apt.status" says whether the upgrade list is complete
 # - a value leaves the server only in the shape it should have (a version, a package name, a
@@ -25,6 +28,8 @@
 #   no free text gets out. A value of the wrong shape is dropped and counted; each list has a cap,
 #   and entries over it are dropped and counted too ("filtered" in the output). inventory.sh
 #   checks all of this again on the user's side.
+# - a list that other users can fill (nvm folders, rubies, their binaries) is cut to MAX_SORT
+#   short entries before "sort": a long input would make sort write temp files
 # - the path of a binary leaves the server only when root chose every part of it: a file in a
 #   system folder (/usr, /bin, /sbin, /lib*, /opt, /snap) whose folders only root can write, or an
 #   nvm Node path of the strict form (.../versions/node/vX.Y.Z/bin/node). Any other path is only
@@ -46,6 +51,7 @@ MAX_APT=2000    # pending upgrades
 MAX_ARCH=8      # archives per upgrade
 MAX_PATH=128    # characters in a path
 MAX_PS=500      # lines of "docker ps" (one per running container)
+MAX_SORT=1000   # entries of a list other users can fill, before "sort" (see bounded)
 # The shapes. inventory.sh has the same ones.
 VER_RE='^v?([0-9]{1,5}:)?[0-9][A-Za-z0-9.+~-]{0,63}$'
 RUBY_RE='^[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,3}(-[a-z]{1,8}[0-9]{0,4})?$'
@@ -121,15 +127,39 @@ named() {
   root_tree "$1"
 }
 
-# A file root may read in a folder that other users can write: a regular file, not a symlink.
-# Only a first look: the file can change after it. read_plain is the read itself.
-plain_file() { [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ]; }
+# bounded <list> <value ...>: sets "batch" to the values that are plain paths (safe_path), at most
+# MAX_SORT of them; the rest is counted. A list that other users can fill goes through it before
+# "sort": then sort gets at most MAX_SORT short lines and sorts them in memory, with no temp file.
+bounded() {
+  local list=$1 v
+  shift
+  batch=()
+  for v in "$@"; do
+    if ! safe_path "$v"; then unnamed "$list"; continue; fi
+    room "$list" ${#batch[@]} $MAX_SORT || continue
+    batch+=("$v")
+  done
+}
 
-# read_plain <file>: the first 64 KiB of such a file, on stdout. dd opens it once, with O_NOFOLLOW
-# (a symlink there is not followed, also not one swapped in after plain_file) and O_NONBLOCK (a
-# FIFO gives nothing at once instead of waiting); timeout bounds the rest. Use it as
-# "read ... < <(read_plain FILE)": a pipe, no temp file.
-read_plain() { timeout 5 dd if="$1" iflag=nofollow,nonblock bs=65536 count=1 status=none 2>/dev/null; }
+# read_plain <file>: the first 64 KiB of a file in a folder other users can write, on stdout.
+# Nothing when the folder is not the one named, or the file is not a regular file.
+# - The folder: a subshell goes into it, then asks the kernel where it is (/proc/self/cwd: a path
+#   with no link in it). Another place (a link on the way) gives nothing. A link swapped in later
+#   changes nothing: the subshell stays in the folder it checked. One link is allowed: Capistrano's
+#   "<deploy>/current" to "<deploy>/releases/<name>".
+# - The file: dd opens it once, in that folder, with O_NOFOLLOW (a symlink is not followed, also
+#   not one swapped in) and O_NONBLOCK (a FIFO gives nothing at once instead of waiting); timeout
+#   bounds the rest.
+# Use it as "read ... < <(read_plain FILE)": a pipe, no temp file.
+read_plain() {
+  local dir=${1%/*} leaf=${1##*/}
+  (
+    cd -P -- "$dir" 2>/dev/null || exit 0
+    real=$(readlink /proc/self/cwd)
+    if [ "$real" != "$dir" ] && [[ $dir != */current || ${real%/*} != "${dir%/current}/releases" ]]; then exit 0; fi
+    timeout 5 dd if="./$leaf" iflag=nofollow,nonblock bs=65536 count=1 status=none 2>/dev/null
+  )
+}
 
 pm2_homes=()
 rev_files=()
@@ -344,12 +374,13 @@ done < <(find /proc/[0-9]*/exe -maxdepth 0 -printf '%h\t%l\n' 2>/dev/null)
 # "named" wants a file at that path now (the update put a new one there): so the path is the
 # host's, not one inside a container or another mount namespace.
 deleted_json=()
+bounded running_deleted_exe "${!deleted[@]}"
 while IFS= read -r p; do
   [ -n "$p" ] || continue
   if ! named "$p"; then unnamed running_deleted_exe; continue; fi
   room running_deleted_exe ${#deleted_json[@]} $MAX_LIST || continue
   deleted_json+=("$(js "$p")")
-done < <(printf '%s\n' "${!deleted[@]}" | sort)
+done < <(printf '%s\n' ${batch[@]+"${batch[@]}"} | sort)
 
 # ---- Node.js: nvm trees and every running "node" binary ----------------------------------------
 
@@ -370,7 +401,7 @@ for nvm in /root/.nvm /home/*/.nvm /usr/local/nvm /opt/nvm; do
   room nvm ${#nvm_json[@]} $MAX_LIST || continue
   # The "default" alias as written ("22", "lts/*", ...). nvm resolves it; Claude does too.
   dflt=""
-  if plain_file "$nvm/alias/default"; then read -r dflt < <(read_plain "$nvm/alias/default"); fi
+  read -r dflt < <(read_plain "$nvm/alias/default")
   shaped nvm "$ALIAS_RE" "$dflt" || dflt=""
   nvm_json+=("{\"nvm_dir\":$(js "$nvm"),\"default_alias\":$(js "$dflt")}")
   for bin in "$nvm"/versions/node/*/bin/node; do
@@ -385,26 +416,27 @@ for exe in "${!in_container[@]}"; do
 done
 
 node_json=()
+bounded node "${!node_paths[@]}"
 while IFS= read -r p; do
   [ -n "$p" ] || continue
   if ! named "$p"; then unnamed node; continue; fi
   room node ${#node_json[@]} $MAX_LIST || continue
   node_json+=("{\"path\":$(js "$p"),\"version\":$(js "$(node_version "$p")"),\"running\":${running[$p]:-0},\"container\":false}")
-done < <(printf '%s\n' "${!node_paths[@]}" | sort)
+done < <(printf '%s\n' ${batch[@]+"${batch[@]}"} | sort)
 # A container's Node: its version is the image's, not the host package's.
+bounded node "${!node_in_container[@]}"
 while IFS= read -r p; do
   [ -n "$p" ] || continue
   if ! [[ $p =~ $CT_NODE_RE ]]; then unnamed node; continue; fi
   room node ${#node_json[@]} $MAX_LIST || continue
   node_json+=("{\"path\":$(js "$p"),\"version\":null,\"running\":${in_container[$p]},\"container\":true}")
-done < <(printf '%s\n' "${!node_in_container[@]}" | sort)
+done < <(printf '%s\n' ${batch[@]+"${batch[@]}"} | sort)
 
 # ---- pm2: the daemon's Node and the pm2 version, read from files -------------------------------
 
 # The top "version" of a package.json, when it is a plain X.Y.Z.
 json_version() {
   local line re='^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([0-9]{1,3}\.[0-9]{1,4}\.[0-9]{1,4})"'
-  plain_file "$1" || return 0
   while IFS= read -r line; do
     if [[ $line =~ $re ]]; then printf '%s' "${BASH_REMATCH[1]}"; return 0; fi
   done < <(read_plain "$1")
@@ -413,10 +445,8 @@ json_version() {
 pm2_json=()
 for home in ${pm2_homes[@]+"${pm2_homes[@]}"}; do
   pid="" exe="" nver="" pver="" pidfile=false up=false
-  if plain_file "$home/pm2.pid"; then
-    pidfile=true
-    read -r pid < <(read_plain "$home/pm2.pid")
-  fi
+  read -r pid < <(read_plain "$home/pm2.pid")
+  [ -n "$pid" ] && pidfile=true
   [[ $pid =~ $PID_RE ]] || pid=""
   # The pid file is the user's: it can name any process. Its binary is passed on only when it is
   # the host file at that path (or, when replaced, a file is there now) and root named it.
@@ -457,14 +487,18 @@ python_ver=$(newest_pkg '^python3\.[0-9]+$')
 
 rubies=()
 # /usr/share/rvm: the Ubuntu rvm package and the common Ansible rvm role; /usr/local/rvm: the
-# rvm installer run as root; ~/.rvm: a per-user install.
+# rvm installer run as root; ~/.rvm: a per-user install. Users can make these folders: only
+# versions of the right shape, and at most MAX_SORT of them, go to "sort".
 for d in /usr/share/rvm/rubies/ruby-* /usr/local/rvm/rubies/ruby-* /root/.rvm/rubies/ruby-* /home/*/.rvm/rubies/ruby-*; do
-  [ -d "$d" ] && rubies+=("${d##*/ruby-}")
+  [ -d "$d" ] || continue
+  v=${d##*/ruby-}
+  shaped ruby "$RUBY_RE" "$v" || continue
+  room ruby ${#rubies[@]} $MAX_SORT || continue
+  rubies+=("$v")
 done
 ruby_json=()
 while IFS= read -r v; do
   [ -n "$v" ] || continue
-  shaped ruby "$RUBY_RE" "$v" || continue
   room ruby ${#ruby_json[@]} $MAX_LIST || continue
   ruby_json+=("$(js "$v")")
 done < <(printf '%s\n' ${rubies[@]+"${rubies[@]}"} | sort -uV)
@@ -524,7 +558,7 @@ fi
 revs=()
 for f in ${rev_files[@]+"${rev_files[@]}"}; do
   sha=""
-  if plain_file "$f"; then read -r sha < <(read_plain "$f"); fi
+  read -r sha < <(read_plain "$f")
   [[ $sha =~ $SHA_RE ]] || sha=""
   revs+=("$(js "$f"):$(js "$sha")")
 done

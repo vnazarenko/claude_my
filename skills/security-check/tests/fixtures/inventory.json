@@ -4,7 +4,7 @@
   "os": {"id": "ubuntu", "version_id": "24.04", "codename": "noble",
          "kernel_running": "6.8.0-40-generic", "kernel_newest_installed": "6.8.0-45-generic",
          "reboot_required": true, "reboot_required_pkgs": ["linux-image-6.8.0-45-generic"]},
-  "apt": {"lists_age_hours": 20, "upgradable": [
+  "apt": {"status": "ok", "lists_age_hours": 20, "upgradable": [
     {"package": "libssl3t64", "source": "openssl", "installed": "3.0.13-0ubuntu3.4", "candidate": "3.0.13-0ubuntu3.5",
      "origin": "Ubuntu", "archives": ["noble-updates", "noble-security"]},
     {"package": "openssl", "source": "openssl", "installed": "3.0.13-0ubuntu3.5", "candidate": "3.0.13-0ubuntu3.6",

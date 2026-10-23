@@ -24,9 +24,10 @@
 #   8. errors before the ticket (no start-task.sh, no brief, no profile on origin, no jira.py, bad
 #      arguments, broken state) and Jira errors → no ticket or no session
 #   9. the whole chain with the real new-task start-task.sh: the typed /security-check command;
-#      a launchd-like environment (env -i)
+#      Claude never starts → no LAST_RUN, PENDING_KEY kept; a launchd-like environment (env -i)
 # install-launchd.sh:
-#  10. writes a plist that passes plutil -lint, with the right values; launchctl bootout + bootstrap
+#  10. writes a plist that passes plutil -lint, with the right values (no AGTERM_SOCKET: the
+#      default socket); launchctl bootout + bootstrap
 #  11. a bootstrap that fails once is retried; bad names, a worktree, no installed script → refused
 set -uo pipefail
 shopt -u patsub_replacement 2>/dev/null || true   # bash 5.2+: keep '&' literal in ${v//p/r}
@@ -65,13 +66,20 @@ mkdir -p "$tmp/bin"
 
 cat > "$tmp/bin/agtermctl" <<'EOF'
 #!/usr/bin/env bash
-# tree: STUB_AGTERM_DOWN=1 → fail; else an empty tree. The session calls are for start-task.sh.
+# tree: STUB_AGTERM_DOWN=1 → fail; else an empty tree, and once the claude command is typed, a
+# tree with session SID-1 and claude in front (not with STUB_NO_CLAUDE=1). The session calls
+# are for start-task.sh.
 printf '%s\n' "$*" >> "$STUB_LOG/agtermctl.calls"
 case "$1 ${2:-}" in
   "tree --json")  [ "${STUB_AGTERM_DOWN:-}" = 1 ] && exit 1
-                  echo '{"result":{"tree":{"workspaces":[]}}}' ;;
+                  if [ -e "$STUB_LOG/claude.typed" ] && [ "${STUB_NO_CLAUDE:-}" != 1 ]; then
+                    echo '{"result":{"tree":{"workspaces":[{"sessions":[{"id":"SID-1","cwd":"/w","foreground":["claude"]}]}]}}}'
+                  else
+                    echo '{"result":{"tree":{"workspaces":[]}}}'
+                  fi ;;
   "session new")  echo '{"result":{"id":"SID-1"}}' ;;
-  "session type") printf '%s\n' "${!#}" >> "$STUB_LOG/typed" ;;
+  "session type") printf '%s\n' "${!#}" >> "$STUB_LOG/typed"
+                  case "${!#}" in "claude "*) : > "$STUB_LOG/claude.typed" ;; esac ;;
 esac
 exit 0
 EOF
@@ -231,7 +239,7 @@ run_due() {
 # due_cmd [VAR=value ...]: the same, output not captured.
 due_cmd() {
   env -u DRY_RUN -u SECURITY_CHECK_INTERVAL_DAYS -u AGTERM_ENABLED -u AGTERM_SOCKET -u AGTERM_SESSION_ID \
-    -u TASK_SEED -u TASK_BRIEF_EXTRA -u TASK_NEXT -u NEW_WT \
+    -u TASK_SEED -u TASK_BRIEF_EXTRA -u TASK_NEXT -u NEW_WT -u STUB_NO_CLAUDE \
     HOME="$home" PATH="$tmp/bin:$PATH" STUB_LOG="$log" STUB_TODAY="$today" JIRA_PY="$tmp/jira_stub.py" \
     "$@" "$BASH_BIN" "$due" "$arg_repo" "$arg_server" "$arg_project"
 }
@@ -338,10 +346,9 @@ expect_eq "due: TASK_BRIEF_EXTRA = installed run brief" \
   "$home/.claude/skills/security-check/references/run-brief.md" "$(start_env TASK_BRIEF_EXTRA)"
 expect_eq "due: TASK_NEXT" "$next_text" "$(start_env TASK_NEXT)"
 expect_eq "due: AGTERM_ENABLED=1 for start-task.sh" "1" "$(start_env AGTERM_ENABLED)"
-expect_eq "due: AGTERM_SOCKET default" "$home/Library/Application Support/agterm/agterm.sock" "$(start_env AGTERM_SOCKET)"
+expect_eq "due: no AGTERM_SOCKET set (start-task.sh uses the default socket too)" "" "$(start_env AGTERM_SOCKET)"
 expect_eq "due: JIRA_PY passed on" "$tmp/jira_stub.py" "$(start_env JIRA_PY)"
-expect_eq "due: agterm alive check on the socket" \
-  "tree --json --socket $home/Library/Application Support/agterm/agterm.sock" "$(calls agtermctl)"
+expect_eq "due: agterm alive check on the default socket" "tree --json" "$(calls agtermctl)"
 expect_started "due"
 expect_has "due: notification names the ticket" "started: $key" "$(calls notify)"
 
@@ -638,6 +645,21 @@ if [ -f "$real_start_task" ] && grep -q TASK_BRIEF_EXTRA "$real_start_task"; the
   expect_not_has "chain: every brief placeholder filled" "{{" "$(cat "$brief" 2>/dev/null)"
   expect_eq "chain: Jira Next line" "- Next: $next_text" "$(grep '^- Next: ' "$log/comment.txt" 2>/dev/null)"
   expect_started "chain"
+
+  # Typing worked, but Claude never runs in the session: not started, the ticket kept.
+  new_case chainnoclaude
+  cp "$real_start_task" "$home/.claude/skills/new-task/scripts/start-task.sh"
+  mkdir -p "$home/.claude/skills/new-task/references"
+  cp "$real_task_brief" "$home/.claude/skills/new-task/references/brief-template.md"
+  set_state "LAST_RUN=$(ago 50)" "LAST_KEY=PROJ-100"
+  run_due NEW_WT="$tmp/new-worktree.sh" STUB_NO_CLAUDE=1
+  expect_eq "chain, Claude does not start: exit 1" 1 "$rc"
+  expect_has "chain, Claude does not start: start-task.sh says why" "ERROR: Claude did not start" "$out"
+  expect_eq "chain, Claude does not start: PENDING_KEY kept" "$key" "$(state_val PENDING_KEY)"
+  expect_eq "chain, Claude does not start: LAST_RUN unchanged" "$(ago 50)" "$(state_val LAST_RUN)"
+  expect_has "chain, Claude does not start: notification" "did not start" "$(calls notify)"
+  expect_eq "chain, Claude does not start: Jira create and get only" \
+    "$(printf 'create\nget')" "$(calls jira | cut -d'|' -f1)"
 else
   echo "WARN: no start-task.sh with TASK_BRIEF_EXTRA at $real_start_task; chain test skipped"
 fi
@@ -677,7 +699,7 @@ plist=""
 uid="$(id -u)"
 if command -v plutil >/dev/null 2>&1; then
   new_install_case install
-  run_install "$repo" "$server" "$project"
+  run_install "$repo" "$server" "$project" AGTERM_SOCKET="$tmp/other.sock"
   expect_eq "install: exit 0" 0 "$rc"
   if plutil -lint "$plist" >/dev/null 2>&1; then ok "install: plist passes plutil -lint"; else bad "install: plist passes plutil -lint"; fi
   expect_eq "install: Label" "local.security-check.$server" "$(pl Label)"
@@ -689,7 +711,7 @@ if command -v plutil >/dev/null 2>&1; then
   expect_eq "install: not at load" "false" "$(pl RunAtLoad)"
   expect_eq "install: PATH" "$plist_path" "$(pl EnvironmentVariables.PATH)"
   expect_eq "install: AGTERM_ENABLED" "1" "$(pl EnvironmentVariables.AGTERM_ENABLED)"
-  expect_eq "install: AGTERM_SOCKET" "$home/Library/Application Support/agterm/agterm.sock" "$(pl EnvironmentVariables.AGTERM_SOCKET)"
+  expect_eq "install: no AGTERM_SOCKET, even when set (agterm's default socket)" "" "$(pl EnvironmentVariables.AGTERM_SOCKET)"
   expect_eq "install: log path" "$home/Library/Logs/security-check-$server.log|$home/Library/Logs/security-check-$server.log" \
     "$(pl StandardOutPath)|$(pl StandardErrorPath)"
   expect_eq "install: launchctl bootout, then bootstrap" \

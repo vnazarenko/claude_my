@@ -72,6 +72,7 @@ the pm2 restart, the boot unit, the check, the rollback.>
 | component | version | why not | how to check by hand |
 |---|---|---|---|
 | <Go binary / image base OS / a source that was down> | <version> | <reason> | <page or command> |
+| <apt packages, when `apt.status` is not `ok`> | — | <apt-get failed on the server (`error`) or is missing (`null`): pending upgrades unknown> | for the user: `apt-get --simulate dist-upgrade` on the server |
 | <inventory field from `filtered.dropped`> | — | <N values left out: wrong shape, or over the cap (`filtered.truncated`)> | for the user, not this skill: look at that field on the server |
 | <inventory field from `filtered.other_paths`> | — | <N binaries in a folder a user may name (for example `/tmp` or a home folder), or a container's: the path is not shown> | for the user, not this skill: `ps -eo user,pid,exe` on the server |
 | <running image without a tag, when `filtered.dropped.docker_images` > 0> | — | <docker lists it as `<none>:<none>`: the inventory cannot name it> | for the user: `docker ps`, then `docker image inspect <id>` |

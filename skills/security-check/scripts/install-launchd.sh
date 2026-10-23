@@ -12,15 +12,13 @@
 #   - every day at 10:00 (a missed time runs at wake), not at load
 #   - runs /bin/bash ~/.claude/skills/security-check/scripts/security-check-due.sh <repo> <server> <jira_project>
 #     (the installed copy; that script decides whether a run is due)
-#   - env: PATH with /usr/local/bin and /opt/homebrew/bin, AGTERM_ENABLED=1, AGTERM_SOCKET
+#   - env: PATH with /usr/local/bin and /opt/homebrew/bin, AGTERM_ENABLED=1 (agterm is reached
+#     on its default socket)
 #   - log: ~/Library/Logs/security-check-<server>.log
 # Checks it with plutil -lint, then reloads it: launchctl bootout (an error is fine: not loaded)
 # and launchctl bootstrap gui/<uid>. Running it again replaces the job.
 # The first run starts 14 days after the newest report of <server> on origin's default branch
 # (or at once when there is none): the due script decides.
-#
-# Environment (optional):
-#   AGTERM_SOCKET  default ~/Library/Application Support/agterm/agterm.sock
 #
 # Exit: 0 installed, 1 failed, 2 bad usage.
 set -uo pipefail
@@ -31,7 +29,6 @@ server="${2:-}"
 project="${3:-}"
 
 plist_dir="$HOME/Library/LaunchAgents"
-AGTERM_SOCKET="${AGTERM_SOCKET:-$HOME/Library/Application Support/agterm/agterm.sock}"
 due="$HOME/.claude/skills/security-check/scripts/security-check-due.sh"
 logs="$HOME/Library/Logs"
 path="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -100,8 +97,6 @@ cat > "$tmp" <<EOF || die "cannot write $tmp"
     <string>$path</string>
     <key>AGTERM_ENABLED</key>
     <string>1</string>
-    <key>AGTERM_SOCKET</key>
-    <string>$(xml "$AGTERM_SOCKET")</string>
   </dict>
   <key>StandardOutPath</key>
   <string>$(xml "$log_file")</string>

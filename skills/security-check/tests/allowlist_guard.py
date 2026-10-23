@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """The allowlist guard of tests/inventory_test.sh: reads remote-inventory.sh line by line and
 checks that it runs only allowed external commands, and nothing that can write or start things.
+It also refuses here-strings ("<<<": bash before 5.1 writes them to a temp file) and "< $file"
+(a file named by a variable is read only through read_plain: no symlink, no FIFO wait).
 
 Usage:
   allowlist_guard.py <script> "<allowed commands, space separated>" [--list]
@@ -20,9 +22,9 @@ PREFIX_KW = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "ti
 END_KW = {"fi", "done", "}"}
 OUT_REDIR = {">", ">>", "&>", "&>>", ">|"}
 DUP_REDIR = {">&", "<&"}
-IN_REDIR = {"<", "<<<"}
 PUNCT = set(";&|()<>")
 VAR = "__VAR__"
+PSUB = "__PSUB__"   # a process substitution <( ): a pipe, fine after "<"
 errors = []
 FOUND = set()
 
@@ -62,7 +64,8 @@ def find_close(s, k, lineno):
     return n
 
 def scan(s, lineno):
-    """Cut the comment; replace each $( ), <( ) with VAR. Returns (outer text, inner texts)."""
+    """Cut the comment; replace each $( ) with VAR and each <( ) with PSUB.
+    Returns (outer text, inner texts)."""
     out, inners, i, n, quote = [], [], 0, len(s), None
     while i < n:
         c = s[i]
@@ -95,7 +98,7 @@ def scan(s, lineno):
                 inners.extend(scan(s[i + 3:j - 1], lineno)[1])
             else:
                 inners.append(s[i + 2:j])
-            out.append(VAR)
+            out.append(VAR if c == "$" else PSUB)
             i = j + 1
             continue
         out.append(c)
@@ -115,7 +118,12 @@ def strip_redirections(toks, lineno):
             if not re.fullmatch(r"[0-9]+|-", nxt):
                 err(lineno, f"redirection to a file: {t} {nxt}")
             i += 2
-        elif t in IN_REDIR:
+        elif t == "<":
+            if VAR in nxt:
+                err(lineno, f"reads a file named by a variable: < {nxt} (use read_plain)")
+            i += 2
+        elif t == "<<<":
+            err(lineno, "here-strings are not allowed (bash before 5.1 writes them to a temp file)")
             i += 2
         elif t == "<<" or t == "<<-":
             err(lineno, "heredocs are not allowed")
@@ -173,6 +181,12 @@ def check_command(cmd, args, lineno):
     elif cmd == "date":
         if any(re.match(r"-[A-Za-z]*s|--set", a) for a in args):
             err(lineno, "date may not set the clock (-s)")
+    elif cmd == "dd":
+        flags = [set(a[len("iflag="):].split(",")) for a in args if a.startswith("iflag=")]
+        if any(a.startswith(("of=", "oflag=", "seek=", "conv=")) for a in args):
+            err(lineno, "dd may only read: no of=, oflag=, seek= or conv=")
+        elif not any({"nofollow", "nonblock"} <= f for f in flags):
+            err(lineno, "dd reads only with iflag=nofollow,nonblock")
 
 def check_line(text, lineno):
     outer, inners = scan(text, lineno)

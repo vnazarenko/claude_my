@@ -51,7 +51,7 @@ In this file, `$SKILL` means `~/.claude/skills/security-check`.
 |---|---|
 | `scripts/inventory.sh` | runs `remote-inventory.sh` on the server over SSH. No agent forwarding, no port forwards, no shared connection. Prints one JSON. |
 | `scripts/inventory-clean.jq` | the filter `inventory.sh` runs on the server's answer: known fields only, each in its shape. |
-| `scripts/remote-inventory.sh` | the read-only script that runs on the server. A test allows only 9 commands in it. |
+| `scripts/remote-inventory.sh` | the read-only script that runs on the server. A test allows only 10 commands in it. |
 | `scripts/advisories.py` | `node`, `usn`, `kev`: finds the fixes for the inventory. Stdlib Python, disk cache. |
 | `scripts/security-check-due.sh` | the daily call of the schedule: when a run is due, it creates (or reuses) the Jira ticket and starts the run's session. See "Schedule". |
 | `scripts/install-launchd.sh` | installs the daily launchd job for one server (macOS). See "Schedule". |
@@ -103,7 +103,9 @@ bash $SKILL/scripts/inventory.sh <ssh_host> \
 - Claude Code asks before this runs, unless the user has an allow rule for it. Do not work around
   the prompt. In a scheduled run, set the ticket to `Blocked` and wait
   (see `references/run-brief.md`).
-- It fails (`ERROR: …`, exit 1) → stop. Report the error. Do not try another way in.
+- It fails (`ERROR: …`, exit 1) → stop. Report the error. Do not try another way in. The
+  message is fixed text with an exit code: ssh's own error output is never shown, because the
+  server can write there too.
 - Paths must be absolute and plain (`[A-Za-z0-9_./@+-]`, no `..`). The script refuses others.
 - The answer is filtered on this side too (see the hard rule above): known fields only, each in
   its shape; a value of another shape is `null` or left out, and counted in `filtered`.
@@ -113,6 +115,7 @@ What you get (one JSON object):
 | field | what |
 |---|---|
 | `os` | `id`, `version_id`, `codename`, `kernel_running`, `kernel_newest_installed`, `reboot_required`, `reboot_required_pkgs` |
+| `apt.status` | `ok`: `upgradable` is the full list. `error` (apt-get failed) or `null` (no apt-get): `upgradable` is `null` and pending upgrades are **not checked**. Put that under "Not checked"; never write "nothing pending". |
 | `apt.lists_age_hours` | how old the server's package lists are. No `apt update` is run. Over 48 → say so in the report. |
 | `apt.upgradable[]` | `package`, `source`, `installed`, `candidate`, `origin` (repo label, a space as `_`: `Ubuntu`, `Docker_CE`, or `null`), `archives` |
 | `node[]` | every Node binary: nvm installs and running ones; `version`, `running` (process count), `container` (true: processes whose binary is not the host file at that path, so a container's; `version` is then `null`: check the image) |
@@ -125,7 +128,8 @@ What you get (one JSON object):
 | `revisions` | `{<revision_file>: <git sha or null>}` |
 | `filtered` | `truncated` (a list was over its cap), `dropped` (`{<field>: <count>}`: values left out for a wrong shape or the cap) and `other_paths` (`{<field>: <count>}`: binary paths left out because a user may have named them: `/tmp`, a home folder, a folder others can write, a container path outside `/usr/bin` and `/usr/local/bin`, a deleted binary with no file at its path now) |
 
-A missing tool gives `null` or `[]`, not an error.
+A missing tool gives `null` or `[]`, not an error. A tool that fails gives `null` (or
+`apt.status: error`), never `[]`: `null` means "not checked".
 
 ## Step 2 — find the fixes
 
@@ -281,6 +285,9 @@ bash $SKILL/scripts/install-launchd.sh <repo> <server> <jira_project>
   - A failed start keeps the ticket (`PENDING_KEY`) for the next call, so a failure never makes
     a second ticket. To give up on that ticket, delete the `PENDING_KEY=` line from the state
     file.
+  - A start counts only when Claude runs in the new session (`start-task.sh` checks it). When
+    it does not, that session stays open, marked blocked: close it, or the next call stops at
+    "an agterm session for <KEY> already exists".
 - It needs: agterm, `jq`, `python3`, `git`, the `jira-tickets` skill's `jira.py` and the
   `new-task` skill with the `TASK_SEED`, `TASK_BRIEF_EXTRA` and `TASK_NEXT` overrides.
 
@@ -295,4 +302,5 @@ bash $SKILL/scripts/install-launchd.sh <repo> <server> <jira_project>
 | run now, before the 14 days | `SECURITY_CHECK_INTERVAL_DAYS=0 bash $SKILL/scripts/security-check-due.sh <repo> <server> <jira_project>` |
 | test the two scripts (stubs only) | `bash $SKILL/tests/due_test.sh` |
 
-`JIRA_PY` and `AGTERM_SOCKET` can also be set; the top of the script lists them.
+`JIRA_PY` can also be set; the top of the script lists it. agterm is reached on its default
+socket, by the due script and by `start-task.sh` alike.

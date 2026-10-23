@@ -748,10 +748,21 @@ class TestUsn(Base):
 
     def test_no_apt(self):
         inv = inventory()
-        inv["apt"] = {"lists_age_hours": None, "upgradable": None}
+        inv["apt"] = {"status": None, "lists_age_hours": None, "upgradable": None}
         web = FakeWeb()
         data = self.run_report("usn", inv, web)
-        self.assertTrue(any("apt-get missing" in n for n in data["notes"]))
+        self.assertTrue(any("apt-get missing" in n and "not checked" in n for n in data["notes"]))
+        self.assertEqual(web.calls, [])
+
+    def test_apt_failed(self):
+        # apt-get failed on the server: "not checked", never an empty result.
+        inv = inventory()
+        inv["apt"] = {"status": "error", "lists_age_hours": 20, "upgradable": None}
+        web = FakeWeb()
+        data = self.run_report("usn", inv, web)
+        self.assertEqual(data["apt_status"], "error")
+        self.assertTrue(any("apt-get failed" in n and "not checked" in n for n in data["notes"]))
+        self.assertEqual((data["packages"], data["kernel"], data["vendor"]), ([], [], []))
         self.assertEqual(web.calls, [])
 
     def test_not_ubuntu(self):

@@ -16,6 +16,8 @@
 # 5. TASK_SEED with a character the typed shell would expand → clear error; nothing started
 # 6. an open agterm session of the same ticket blocks the start; one of PROJ-1234 does not
 # 7. macOS /bin/bash (3.2), no caller session (AGTERM_SESSION_ID unset): the way launchd starts it
+# 8. Claude never shows up in the session → exit 1, no TASK_STARTED, no Jira update, session
+#    marked blocked; Claude shows up late → one more Enter, then started
 #
 # The Jira summary holds " $ ! and a {{BRIEF}}: they must be dropped, or stay literal.
 set -uo pipefail
@@ -49,12 +51,23 @@ mkdir -p "$tmp/bin"
 cat > "$tmp/bin/agtermctl" <<'EOF'
 #!/usr/bin/env bash
 # Logs every call; "session type" also logs the typed text (the last argument).
+# "tree --json": $STUB_TREE (default: empty). Once the claude command is typed, the tree shows
+# session SID-1 with claude in front, from the $STUB_CLAUDE_AFTER-th call on (default 1);
+# STUB_NO_CLAUDE=1: never (Claude does not start).
 printf '%s\n' "$*" >> "$STUB_LOG/agtermctl.calls"
 case "$1 ${2:-}" in
   "tree --json")  empty='{"result":{"tree":{"workspaces":[]}}}'
+                  if [ -e "$STUB_LOG/claude.typed" ] && [ "${STUB_NO_CLAUDE:-}" != 1 ]; then
+                    echo x >> "$STUB_LOG/claude.typed"
+                    if [ "$(wc -l < "$STUB_LOG/claude.typed")" -ge "${STUB_CLAUDE_AFTER:-1}" ]; then
+                      echo '{"result":{"tree":{"workspaces":[{"sessions":[{"id":"SID-1","cwd":"/w","foreground":["claude","--session-id","x"]}]}]}}}'
+                      exit 0
+                    fi
+                  fi
                   printf '%s\n' "${STUB_TREE:-$empty}" ;;
   "session new")  echo '{"result":{"id":"SID-1"}}' ;;
-  "session type") printf '%s\n' "${!#}" >> "$STUB_LOG/typed" ;;
+  "session type") printf '%s\n' "${!#}" >> "$STUB_LOG/typed"
+                  case "${!#}" in "claude "*) : > "$STUB_LOG/claude.typed" ;; esac ;;
 esac
 exit 0
 EOF
@@ -113,6 +126,7 @@ run_case() {
   mkdir -p "$home" "$log"
   rm -rf "$repo/.claude"
   out="$(env -u TASK_SEED -u TASK_BRIEF_EXTRA -u TASK_NEXT -u AGTERM_SESSION_ID -u AGTERM_SOCKET -u STUB_TREE \
+    -u STUB_NO_CLAUDE -u STUB_CLAUDE_AFTER \
     HOME="$home" PATH="$tmp/bin:$PATH" STUB_LOG="$log" AGTERM_ENABLED=1 \
     JIRA_PY="$tmp/jira_stub.py" NEW_WT="$tmp/new-worktree.sh" \
     STUB_SUMMARY="$summary" STUB_STATUS="$status" STUB_URL="$url" STUB_DESCRIPTION="$description" \
@@ -135,8 +149,14 @@ expect_has() {
   case "$3" in *"$2"*) ok "$1" ;; *) bad "$1"; printf '     missing: %s\n' "$2" ;; esac
 }
 
+# expect_not_has <label> <needle> <text>
+expect_not_has() {
+  case "$3" in *"$2"*) bad "$1"; printf '     found: %s\n' "$2" ;; *) ok "$1" ;; esac
+}
+
 # The first typed text is the claude command; the next ones are Enter keys.
 typed_command() { head -n 1 "$log/typed" 2>/dev/null; }
+typed_count() { wc -l < "$log/typed" 2>/dev/null | tr -d ' '; }
 next_line() { grep '^- Next: ' "$log/comment.txt" 2>/dev/null; }
 
 # expected_brief [extra]: the default template, then the extra file after a blank line, each
@@ -192,6 +212,8 @@ expect_eq "defaults: Jira calls get, transition, comment" \
   "$(printf 'get %s\ntransition %s\ncomment %s' "$key" "$key" "$key")" "$(cat "$log/jira.calls")"
 expect_has "defaults: session opened in the worktree" \
   "session new --cwd $wt --name $name --json" "$(cat "$log/agtermctl.calls")"
+expect_eq "defaults: Claude runs at once, so no extra Enter" 2 "$(typed_count)"
+expect_has "defaults: session marked active" "session status active --target SID-1" "$(cat "$log/agtermctl.calls")"
 
 # ---- 2. all three overrides -------------------------------------------------------------------
 
@@ -266,6 +288,23 @@ if [ -x /bin/bash ]; then
 else
   echo "WARN: no /bin/bash - skipped the system bash case"
 fi
+
+# ---- 8. Claude must run in the session before the task counts as started ----------------------
+
+run_case noclaude STUB_NO_CLAUDE=1
+expect_eq "Claude does not start: exit 1" 1 "$rc"
+expect_has "Claude does not start: says so" "ERROR: Claude did not start in the agterm session '$name' (sid=SID-1)" "$out"
+expect_not_has "Claude does not start: no TASK_STARTED line" "TASK_STARTED" "$out"
+expect_eq "Claude does not start: Jira only read, no transition, no comment" "get $key" "$(cat "$log/jira.calls")"
+expect_has "Claude does not start: session marked blocked" "session status blocked --target SID-1" "$(cat "$log/agtermctl.calls")"
+expect_eq "Claude does not start: one extra Enter, not more" 3 "$(typed_count)"
+
+run_case lateclaude STUB_CLAUDE_AFTER=3
+expect_eq "Claude starts late: exit 0" 0 "$rc"
+if [ -n "$uuid" ]; then ok "Claude starts late: TASK_STARTED line"; else bad "Claude starts late: TASK_STARTED line"; echo "$out"; fi
+expect_eq "Claude starts late: one extra Enter" 3 "$(typed_count)"
+expect_eq "Claude starts late: Jira get, transition, comment" \
+  "$(printf 'get %s\ntransition %s\ncomment %s' "$key" "$key" "$key")" "$(cat "$log/jira.calls")"
 
 echo
 if [ "$fails" -eq 0 ]; then

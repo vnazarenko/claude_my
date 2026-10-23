@@ -15,6 +15,7 @@ node  For each Node.js version on the server: the security releases of the same 
       Data: the nodejs.org release index and the Node.js release schedule.
 usn   For each upgradable package from an Ubuntu repo: the CVEs that are fixed after the
       installed version, with Ubuntu's priority, the fixed version and the USN ids.
+      No upgrade list (apt.status "error", or no apt-get) → a note "not checked".
       Data: the Ubuntu CVE tracker, one paged query per source package.
       Kernel packages and vendor repos (Docker, ClickHouse, ...) are listed, not looked up.
 kev   Which CVE ids are in the CISA Known Exploited Vulnerabilities catalog.
@@ -530,7 +531,8 @@ def usn_report(inv, fetcher, today, since_days):
     os_info = inv.get("os") or {}
     apt = inv.get("apt") or {}
     codename = os_info.get("codename")
-    out.update(codename=codename, apt_lists_age_hours=apt.get("lists_age_hours"), packages=[],
+    out.update(codename=codename, apt_status=apt.get("status"),
+               apt_lists_age_hours=apt.get("lists_age_hours"), packages=[],
                no_security_fix=[], kernel=[], vendor=[], notes=[],
                counts={"packages_with_fixes": 0, "cves": {}})
     if os_info.get("id") != "ubuntu" or not codename:
@@ -538,7 +540,12 @@ def usn_report(inv, fetcher, today, since_days):
         return out
     upgradable = apt.get("upgradable")
     if upgradable is None:
-        out["notes"].append("no apt upgrade list in the inventory (apt-get missing on the server)")
+        # Not checked. Never report this as "nothing pending".
+        if apt.get("status") == "error":
+            out["notes"].append("apt-get failed on the server: pending upgrades not checked")
+        else:
+            out["notes"].append("no apt upgrade list in the inventory (apt-get missing on the server): "
+                                "pending upgrades not checked")
         return out
 
     groups, kernel, vendor = group_upgrades(upgradable)

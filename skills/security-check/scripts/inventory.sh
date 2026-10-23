@@ -16,6 +16,8 @@
 # - stops a connection that hangs (ServerAlive: about 1 minute without an answer)
 # - treats the answer as untrusted data: other users on the server can name folders and run
 #   their own binaries, and the server itself can lie. So no free text from the server gets out:
+#   - ssh's stderr (where the server can write too) is dropped. A failure prints only a fixed
+#     message with ssh's exit code
 #   - the answer must be one JSON object, at most MAX_BYTES; else it fails
 #   - only the known fields are kept, each in its expected shape (a version, a package name, a git
 #     sha, a number, a date, a plain path without spaces, ...); a value of another shape is left
@@ -65,14 +67,18 @@ while [ $# -gt 0 ]; do
 done
 
 # head -c: never hold more than MAX_BYTES + 1 of the answer. ssh's own exit code is kept.
+# 2>/dev/null: the server writes to ssh's stderr too, so none of it is shown.
 out=$(ssh -a -x -T \
   -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes \
   -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
   -o ControlMaster=no -o ControlPath=none -o PermitLocalCommand=no \
-  -- "$host" bash -s -- ${args[@]+"${args[@]}"} < "$remote" | head -c $((MAX_BYTES + 1)); exit "${PIPESTATUS[0]}")
+  -- "$host" bash -s -- ${args[@]+"${args[@]}"} < "$remote" 2>/dev/null | head -c $((MAX_BYTES + 1)); exit "${PIPESTATUS[0]}")
 rc=$?
 [ ${#out} -le $MAX_BYTES ] || die "$host returned more than $MAX_BYTES bytes: refused"
-[ "$rc" -eq 0 ] || die "inventory on $host failed (ssh exit $rc)"
+if [ "$rc" -eq 255 ]; then
+  die "ssh to $host failed (exit 255: connection, key or host key). The user can see why with: ssh $host true"
+fi
+[ "$rc" -eq 0 ] || die "inventory on $host failed (exit $rc)"
 
 jq -e -s --arg host "$host" --arg homes "$homes" --arg rev_files "$rev_files" -f "$filter" <<< "$out" 2>/dev/null \
   || die "$host did not return a valid inventory (one JSON object)"

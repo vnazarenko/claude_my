@@ -13,6 +13,7 @@ def IMAGE_ID: "^(sha256:)?[0-9a-f]{12,64}$";
 def NVM: "^(/root/\\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\\.nvm|/usr/local/nvm|/opt/nvm)$";
 def NVM_NODE: "^(/root/\\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\\.nvm|/usr/local/nvm|/opt/nvm)/versions/node/v[0-9]{1,3}\\.[0-9]{1,4}\\.[0-9]{1,4}/bin/node$";
 def SHA: "^[0-9a-f]{7,40}$";
+def APT_STATUS: "^(ok|error)$";
 def DATE: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{4})$";
 def SYS: "^/(usr|bin|sbin|lib|lib32|lib64|libx32|opt|snap)/";
 def NVM_TREE: "/versions/node/|^/(usr/local|opt)/nvm/";
@@ -81,7 +82,9 @@ if length != 1 or (.[0] | type) != "object" then error("not one JSON object") el
                 kernel_newest_installed: VER, reboot_required: "bool"})) as $os
 | ($r.os | o | .reboot_required_pkgs | list(50; chk(PKG))) as $rpk
 | ($r.apt | o | .lists_age_hours | chk("num")) as $age
-| ($r.apt | o | .upgradable | if . == null then {v: null, b: 0, t: false} else list(2000; apt_e) end) as $upg
+| ($r.apt | o | .status | chk(APT_STATUS)) as $ast
+# The upgrade list counts only when apt-get worked ("ok"). Else null: not checked, never [].
+| ($r.apt | o | .upgradable | if . == null or $ast.v != "ok" then {v: null, b: 0, t: false} else list(2000; apt_e) end) as $upg
 | ($r.node | arr | map(select(node_unnamed | not))
    | list(50; node_t as $t | entry({path: $t, version: VER, running: "num", container: "bool"}; "path"))) as $node
 | ($r.nvm | list(50; entry({nvm_dir: NVM, default_alias: ALIAS}; "nvm_dir"))) as $nvm
@@ -97,7 +100,7 @@ if length != 1 or (.[0] | type) != "object" then error("not one JSON object") el
                       else list(50; entry({image: IMAGE, id: IMAGE_ID, created: DATE}; "image")) end) as $img
 | ($r.running_deleted_exe | arr | map(select(unnamed("named") | not)) | list(50; chk("named"))) as $del
 | ($r.revisions | revs($R)) as $rev
-| ({collected_at: $ca.b, os: $os.b, reboot_required_pkgs: $rpk.b, apt: ($age.b + $upg.b),
+| ({collected_at: $ca.b, os: $os.b, reboot_required_pkgs: $rpk.b, apt: ($age.b + $ast.b + $upg.b),
     node: $node.b, nvm: $nvm.b, pm2: $pm2.b, services: $svc.b, ruby: $ruby.b, python3: $py.b,
     docker_images: $img.b, running_deleted_exe: $del.b, revisions: $rev.b, dpkg: 0}) as $here
 | ({node: ($r.node | arr | map(select(node_unnamed)) | length),
@@ -106,7 +109,7 @@ if length != 1 or (.[0] | type) != "object" then error("not one JSON object") el
 | ($r.filtered | o) as $rf
 | {collected_at: $ca.v, host: $host,
    os: ($os.v + {reboot_required_pkgs: $rpk.v}),
-   apt: {lists_age_hours: $age.v, upgradable: $upg.v},
+   apt: {status: $ast.v, lists_age_hours: $age.v, upgradable: $upg.v},
    node: $node.v, nvm: $nvm.v, pm2: $pm2.v, services: $svc.v, ruby: $ruby.v, python3: $py.v,
    docker_images: $img.v, running_deleted_exe: $del.v, revisions: $rev.v,
    filtered: {

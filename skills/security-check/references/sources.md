@@ -30,7 +30,8 @@ A binary that is installed but does not run is still listed when it is used by a
 
 **Risk** of the update — `low`, `medium`, `high`, plus a few words:
 
-- `low`: a patch release in the same line, a reload, no outage.
+- `low`: a patch release in the same line, no outage (for example a config reload; a new
+  binary or library needs a restart).
 - `medium`: a restart with a short outage, or a minor version jump.
 - `high`: a major version jump, a reboot, a database restart, or no easy rollback.
 
@@ -49,8 +50,16 @@ A binary that is installed but does not run is still listed when it is used by a
   rollback steps from it: it knows how this server boots the app. The steps below are the
   generic case, for apps without one.
 - Update proposal (as the app's user, never as root):
-  1. `nvm install <fixed_in>` — this does **not** move the `default` alias. Do not move it when
-     other apps use it.
+  1. `nvm install <fixed_in>`. It does not change the `default` alias text, but it can change
+     what the alias **resolves to**. An alias that is not a full version (`22`, `lts/*`, `node`;
+     see `nvm[].default_alias`) means the newest install that matches it. So a new `22.x`
+     install moves a `22` default to it, and every login shell, cron job and deploy without its
+     own pin switches at its next start. The safeguard, in the proposal:
+     - before the install: `nvm version default`, and note the version it prints;
+     - the new version matches the alias and other apps use the default → pin it first:
+       `nvm alias default <the noted version>`;
+     - after the install: `nvm version default` must print the noted version;
+     - moving the alias back (`nvm alias default 22`) is a later step, for the owners of those apps.
   2. change the project's Node pins (`ours[].node_pin`, for example `.nvmrc` and the deploy
      config), then deploy.
   3. pm2 in cluster mode runs workers on the **daemon's** Node. `pm2 reload` cannot change it.
@@ -115,7 +124,7 @@ A distro Node (`/usr/bin/node`, a dpkg version such as `18.19.1+dfsg-…`):
 | component | restart after the update |
 |---|---|
 | a library | every process that uses it; `needrestart -r l` lists them |
-| nginx | `nginx -t && systemctl reload nginx` (no outage) |
+| nginx | `nginx -t && systemctl restart nginx` (open connections drop; a second or two). A reload is **not** enough: it only re-reads the config, and the new workers still run the old binary and libraries. With no outage allowed: nginx's binary upgrade (`USR2`, then `QUIT` to the old master), see `https://nginx.org/en/docs/control.html#upgrade`. Check: `running_deleted_exe` in the next inventory no longer lists nginx |
 | OpenSSH | `systemctl restart ssh`; keep a second session open while you do it |
 | PostgreSQL | `systemctl restart postgresql` (short outage; plan it) |
 | Redis | `systemctl restart redis-server` (short outage; data comes back from disk) |

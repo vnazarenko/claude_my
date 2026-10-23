@@ -14,7 +14,9 @@
 #
 # Writes the task registry ~/.claude/task-briefs/<KEY>.env (read by task-cleanup) and the
 # brief ~/.claude/task-briefs/<KEY>.md (the new session's instructions).
-# Prints `TASK_STARTED <KEY> agterm=<sid> claude=<uuid> worktree=<path>`.
+# Prints `TASK_STARTED <KEY> agterm=<sid> claude=<uuid> worktree=<path>` only when Claude runs in
+# the new session (agterm shows it in front, within about 20 s). Else: ERROR, exit 1, the session
+# is marked blocked and Jira is not touched.
 #
 # Optional overrides (for skills that reuse this flow, e.g. security-check). Unset or empty =
 # the default (default_seed, no extra, default_next below), so a plain new-task run does not change:
@@ -150,9 +152,24 @@ seed="${seed//'{{SUMMARY}}'/$clean}"
 sleep 1
 agtermctl session type --target "$sid" "claude --session-id ${uuid} -n \"${name}\" \"${seed}\"" >/dev/null 2>&1
 agtermctl session type --target "$sid" $'\r' >/dev/null 2>&1
-sleep 2
-if ! agtermctl tree --json 2>/dev/null | jq -e --arg id "$sid" '.. | objects | select(.id? == $id) | .foreground[0]? == "claude"' >/dev/null 2>&1; then
-  agtermctl session type --target "$sid" $'\r' >/dev/null 2>&1
+
+# claude_runs: agterm's tree shows claude as the new session's foreground process.
+claude_runs() {
+  agtermctl tree --json 2>/dev/null \
+    | jq -e --arg id "$sid" '[.. | objects | select(.id? == $id) | .foreground[0]?] | any(. == "claude")' >/dev/null 2>&1
+}
+# Wait for Claude, about 20 s. One more Enter after the first miss: a shell that was still
+# starting can lose the first one. Typing can fail without an error, so only this check says
+# that the task started.
+started=0
+for try in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 2
+  if claude_runs; then started=1; break; fi
+  [ "$try" != 1 ] || agtermctl session type --target "$sid" $'\r' >/dev/null 2>&1
+done
+if [ "$started" != 1 ]; then
+  agtermctl session status blocked --target "$sid" >/dev/null 2>&1 || true
+  die "Claude did not start in the agterm session '$name' (sid=$sid). Nothing was posted to Jira. Look at that session, close it, then start again."
 fi
 agtermctl session status active --target "$sid" >/dev/null 2>&1 || true
 

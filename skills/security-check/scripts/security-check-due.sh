@@ -19,14 +19,16 @@
 #      and the profile security-check/<server>.yml on origin's default branch (the run's
 #      worktree starts from it)
 #   4. agterm is not running → desktop notification, exit 0, state unchanged
-#      (the next daily call tries again)
+#      (the next daily call tries again). agterm is reached on its default socket, as
+#      start-task.sh reaches it (agtermctl without --socket)
 #   5. a ticket from a failed try (PENDING_KEY) → reuse it. Else create one and save it as
 #      PENDING_KEY before anything else:
 #      jira.py create --project <p> --type Task --label security --summary "Security check: <server> <date>"
 #   6. start-task.sh <repo> <KEY> (the new-task skill), with TASK_SEED, TASK_BRIEF_EXTRA and
 #      TASK_NEXT set: a worktree, an agterm session and a Claude that runs
 #      /security-check <server> --ticket <KEY>
-#   7. success → LAST_RUN=<today>, LAST_KEY=<KEY>, PENDING_KEY cleared.
+#   7. success (start-task.sh exit 0 and its TASK_STARTED line: it prints that only when Claude
+#      runs in the new session) → LAST_RUN=<today>, LAST_KEY=<KEY>, PENDING_KEY cleared.
 #      failure → notification, exit 1, PENDING_KEY kept for the next call.
 #
 # State: ~/.local/state/security-check/<server>.state, lines KEY=value: LAST_RUN (YYYY-MM-DD),
@@ -38,7 +40,6 @@
 #   SECURITY_CHECK_INTERVAL_DAYS  days between runs. Default 14; 0 = due on every call
 #   JIRA_PY                       default: jira-tickets/scripts/jira.py in <repo>/.claude/skills,
 #                                 in a parent folder's .claude/skills, then in ~/.claude/skills
-#   AGTERM_SOCKET                 default ~/Library/Application Support/agterm/agterm.sock
 #
 # Exit: 0 started or nothing to do, 1 failed (a notification says why), 2 bad usage.
 set -uo pipefail
@@ -50,7 +51,6 @@ project="${3:-}"
 skills="$HOME/.claude/skills"
 start_task="$skills/new-task/scripts/start-task.sh"
 brief="$skills/security-check/references/run-brief.md"
-AGTERM_SOCKET="${AGTERM_SOCKET:-$HOME/Library/Application Support/agterm/agterm.sock}"
 state_dir="$HOME/.local/state/security-check"
 interval="${SECURITY_CHECK_INTERVAL_DAYS:-14}"
 case "${DRY_RUN:-}" in "" | 0) dry=0 ;; *) dry=1 ;; esac
@@ -143,7 +143,6 @@ for c in agtermctl jq python3 git; do
   command -v "$c" >/dev/null 2>&1 || die "$c not on PATH"
 done
 today="$(date +%F)"
-export AGTERM_SOCKET
 
 state="$state_dir/$server.state"
 lock="$state_dir/$server.lock"
@@ -244,7 +243,7 @@ export JIRA_PY
 
 # ---- 4. agterm --------------------------------------------------------------------------------
 
-if ! tree="$(agtermctl tree --json --socket "$AGTERM_SOCKET" 2>/dev/null)" || [ -z "$tree" ]; then
+if ! tree="$(agtermctl tree --json 2>/dev/null)" || [ -z "$tree" ]; then
   log "agterm is not running: no run started; the next daily call tries again"
   notify "Security check of $server is due, but agterm is not running. The next daily call tries again."
   exit 0

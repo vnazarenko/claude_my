@@ -49,8 +49,13 @@ The script:
 4. opens an agterm session named `<KEY> <summary>` in the worktree and starts
    `claude --session-id <uuid> -n "<name>" "/planning:make <KEY> … read the brief …"`
    (another skill can change the prompt and add to the brief: see "Overrides");
-5. moves the ticket to **In Progress** and posts a "work started" comment: session name, Claude
-   session id with the resume command, repo, branch, worktree.
+5. waits until Claude runs in that session (about 20 s). When it does not, the script stops with
+   `ERROR: Claude did not start …`, exit 1: no `TASK_STARTED` line, no Jira change, the session
+   is marked blocked. Look at the session, close it, then run the script again (it reuses the
+   worktree);
+6. moves the ticket to **In Progress** and posts a "work started" comment: session name, Claude
+   session id with the resume command, repo, branch, worktree. Last line:
+   `TASK_STARTED <KEY> agterm=<sid> claude=<uuid> worktree=<path> branch=<branch>`.
 
 It must run inside agterm. Outside agterm, stop and tell the user. Do not fall back to a subagent,
 because the point is a visible, named session.

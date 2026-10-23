@@ -9,15 +9,17 @@
 #
 # Read-only by construction. tests/inventory_test.sh checks these rules on every run:
 # - external commands come only from the allowlist in the test
-# - apt-get runs only with --simulate, docker only "ps" and "images"; nothing writes a file
+# - apt-get runs only with --simulate, docker only "ps" and "images", dd only reads (with
+#   iflag=nofollow,nonblock, no of=); nothing writes a file
 # - pm2, nvm, npm and systemctl are never run: they can start daemons or write files
 # - process facts come only from the /proc/<pid>/exe link: no process arguments,
 #   no process environment, no app config files
-# - a file under a folder other users can write (nvm, pm2, deploys) is read only when it is a
-#   regular file and not a symlink, and only a value of the expected shape is passed on
-#   (a version, a pid, a git sha): root never follows a link to another file, and never
-#   waits on a FIFO
-# - a missing tool or file gives null or [], never an error
+# - a file under a folder other users can write (nvm, pm2, deploys) is read only through
+#   read_plain: one open by dd with O_NOFOLLOW and O_NONBLOCK, under timeout. So root never
+#   follows a link put there (also not one swapped in after a check) and never waits on a FIFO.
+#   Only a value of the expected shape is passed on (a version, a pid, a git sha)
+# - a missing tool or file gives null or [], never an error. A tool that fails gives null or
+#   "error", never an empty list: "apt.status" says whether the upgrade list is complete
 # - a value leaves the server only in the shape it should have (a version, a package name, a
 #   plain path without spaces, ...): other users can name folders and run their own binaries, so
 #   no free text gets out. A value of the wrong shape is dropped and counted; each list has a cap,
@@ -30,7 +32,8 @@
 # The test also runs this script in a container and checks that no file changed.
 #
 # Keep the style simple, the test reads this file line by line: one command per line,
-# no heredocs, no backticks, no "case", no multi-line $( ... ).
+# no heredocs, no backticks, no "case", no multi-line $( ... ). No here-strings ("<<<"): bash
+# before 5.1 writes them to a temp file. No "< $file": read such a file with read_plain.
 set -uo pipefail
 export LC_ALL=C
 
@@ -42,6 +45,7 @@ MAX_LIST=50     # entries per list
 MAX_APT=2000    # pending upgrades
 MAX_ARCH=8      # archives per upgrade
 MAX_PATH=128    # characters in a path
+MAX_PS=500      # lines of "docker ps" (one per running container)
 # The shapes. inventory.sh has the same ones.
 VER_RE='^v?([0-9]{1,5}:)?[0-9][A-Za-z0-9.+~-]{0,63}$'
 RUBY_RE='^[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,3}(-[a-z]{1,8}[0-9]{0,4})?$'
@@ -62,6 +66,9 @@ SYS_RE='^/(usr|bin|sbin|lib|lib32|lib64|libx32|opt|snap)/'
 NVM_TREE_RE='/versions/node/|^/(usr/local|opt)/nvm/'
 # A Node in a container: the path inside the image. Only the usual places are passed on.
 CT_NODE_RE='^/usr/(local/)?bin/node(js)?$'
+# The last line of a stream when its command worked ("cmd && printf ..."). No line of apt-get or
+# "docker ps" is this text, so a stream without it means the command failed.
+END_MARK='== end of the list =='
 
 declare -A dropped=() others=()
 truncated=false
@@ -115,7 +122,14 @@ named() {
 }
 
 # A file root may read in a folder that other users can write: a regular file, not a symlink.
+# Only a first look: the file can change after it. read_plain is the read itself.
 plain_file() { [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ]; }
+
+# read_plain <file>: the first 64 KiB of such a file, on stdout. dd opens it once, with O_NOFOLLOW
+# (a symlink there is not followed, also not one swapped in after plain_file) and O_NONBLOCK (a
+# FIFO gives nothing at once instead of waiting); timeout bounds the rest. Use it as
+# "read ... < <(read_plain FILE)": a pipe, no temp file.
+read_plain() { timeout 5 dd if="$1" iflag=nofollow,nonblock bs=65536 count=1 status=none 2>/dev/null; }
 
 pm2_homes=()
 rev_files=()
@@ -249,11 +263,16 @@ fi
 # A space in the label becomes "_" (Docker_CE): no value in the output has a space.
 # The cache options stop apt from writing its binary cache; the empty Planner log stops it from
 # rewriting /var/log/apt/eipp.log.xz; NoLocking leaves the dpkg lock alone.
+# apt-get fails (broken lists, ...) → status "error" and upgradable null: not checked. Never an
+# empty list, which would read as "nothing pending". No apt-get → status and upgradable null.
 upg_json=null
+apt_state=""
 if command -v apt-get >/dev/null 2>&1; then
   upg=()
+  apt_ok=false
   re='^Inst ([^ ]+) \[([^]]*)\] \(([^ ]+) (.*)\)'
   while IFS= read -r line; do
+    if [ "$line" = "$END_MARK" ]; then apt_ok=true; continue; fi
     [[ $line =~ $re ]] || continue
     name=${BASH_REMATCH[1]%%:*}
     installed=${BASH_REMATCH[2]}
@@ -265,9 +284,14 @@ if command -v apt-get >/dev/null 2>&1; then
     shaped apt "$VER_RE" "$candidate" || candidate=""
     origin=""
     archives=()
-    IFS=',' read -ra parts <<< "$rel"
-    for part in "${parts[@]}"; do
+    # The parts of "<label>:<release>/<archive>, ...", split here (a here-string could write a
+    # temp file).
+    rest="$rel,"
+    while [ -n "$rest" ]; do
+      part=${rest%%,*}
+      rest=${rest#*,}
       part=${part# }
+      [ -n "$part" ] || continue
       label=""
       if [[ $part == */* ]]; then
         archive=${part##*/}
@@ -287,8 +311,13 @@ if command -v apt-get >/dev/null 2>&1; then
     shaped apt "$WORD_RE" "$origin" || origin=""
     src=${dpkg_src[$name]:-$name}
     upg+=("{\"package\":$(js "$name"),\"source\":$(js "$src"),\"installed\":$(js "$installed"),\"candidate\":$(js "$candidate"),\"origin\":$(js "$origin"),\"archives\":$(jarr ${archives[@]+"${archives[@]}"})}")
-  done < <(apt-get --simulate -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= -o Dir::Log::Planner= -o Debug::NoLocking=1 dist-upgrade 2>/dev/null)
-  upg_json=$(jarr ${upg[@]+"${upg[@]}"})
+  done < <(apt-get --simulate -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= -o Dir::Log::Planner= -o Debug::NoLocking=1 dist-upgrade 2>/dev/null && printf '%s\n' "$END_MARK")
+  if [ "$apt_ok" = true ]; then
+    apt_state=ok
+    upg_json=$(jarr ${upg[@]+"${upg[@]}"})
+  else
+    apt_state=error
+  fi
 fi
 
 # ---- running binaries, from /proc/<pid>/exe links only -----------------------------------------
@@ -341,7 +370,7 @@ for nvm in /root/.nvm /home/*/.nvm /usr/local/nvm /opt/nvm; do
   room nvm ${#nvm_json[@]} $MAX_LIST || continue
   # The "default" alias as written ("22", "lts/*", ...). nvm resolves it; Claude does too.
   dflt=""
-  if plain_file "$nvm/alias/default"; then read -r dflt < "$nvm/alias/default"; fi
+  if plain_file "$nvm/alias/default"; then read -r dflt < <(read_plain "$nvm/alias/default"); fi
   shaped nvm "$ALIAS_RE" "$dflt" || dflt=""
   nvm_json+=("{\"nvm_dir\":$(js "$nvm"),\"default_alias\":$(js "$dflt")}")
   for bin in "$nvm"/versions/node/*/bin/node; do
@@ -378,7 +407,7 @@ json_version() {
   plain_file "$1" || return 0
   while IFS= read -r line; do
     if [[ $line =~ $re ]]; then printf '%s' "${BASH_REMATCH[1]}"; return 0; fi
-  done < "$1"
+  done < <(read_plain "$1")
 }
 
 pm2_json=()
@@ -386,7 +415,7 @@ for home in ${pm2_homes[@]+"${pm2_homes[@]}"}; do
   pid="" exe="" nver="" pver="" pidfile=false up=false
   if plain_file "$home/pm2.pid"; then
     pidfile=true
-    read -r pid < "$home/pm2.pid"
+    read -r pid < <(read_plain "$home/pm2.pid")
   fi
   [[ $pid =~ $PID_RE ]] || pid=""
   # The pid file is the user's: it can name any process. Its binary is passed on only when it is
@@ -442,16 +471,23 @@ done < <(printf '%s\n' ${rubies[@]+"${rubies[@]}"} | sort -uV)
 
 # ---- Docker: running images only (no "inspect": it prints container env) -----------------------
 
+# "docker ps" is read as a stream (no copy in memory, no temp file), at most MAX_PS lines. It
+# failed (no daemon, no access) → null, not an empty list.
 docker_json=null
 if command -v docker >/dev/null 2>&1; then
-  if ps_out=$(timeout 20 docker ps --format '{{.Image}}' 2>/dev/null); then
-    declare -A in_use=()
-    while IFS= read -r ref; do
-      [ -n "$ref" ] || continue
-      [[ ${ref##*/} == *:* || $ref == *@* || $ref =~ $SHORT_ID_RE ]] || ref="$ref:latest"
-      shaped docker_images "$IMAGE_RE" "$ref" || continue
-      in_use[$ref]=1
-    done <<< "$ps_out"
+  declare -A in_use=()
+  ps_ok=false
+  n_ps=0
+  while IFS= read -r ref; do
+    if [ "$ref" = "$END_MARK" ]; then ps_ok=true; continue; fi
+    [ -n "$ref" ] || continue
+    room docker_images $n_ps $MAX_PS || continue
+    n_ps=$((n_ps + 1))
+    [[ ${ref##*/} == *:* || $ref == *@* || $ref =~ $SHORT_ID_RE ]] || ref="$ref:latest"
+    shaped docker_images "$IMAGE_RE" "$ref" || continue
+    in_use[$ref]=1
+  done < <(timeout 20 docker ps --format '{{.Image}}' 2>/dev/null && printf '%s\n' "$END_MARK")
+  if [ "$ps_ok" = true ]; then
     imgs=()
     # "created" as 2026-01-02T10:00:00+0000 (docker prints "2026-01-02 10:00:00 +0000 UTC").
     while IFS=$'\t' read -r ref id created; do
@@ -488,7 +524,7 @@ fi
 revs=()
 for f in ${rev_files[@]+"${rev_files[@]}"}; do
   sha=""
-  if plain_file "$f"; then read -r sha < "$f"; fi
+  if plain_file "$f"; then read -r sha < <(read_plain "$f"); fi
   [[ $sha =~ $SHA_RE ]] || sha=""
   revs+=("$(js "$f"):$(js "$sha")")
 done
@@ -499,7 +535,7 @@ out="{\"collected_at\":$(js "$(date -u +%Y-%m-%dT%H:%M:%SZ)"),\"host\":null,"
 out+="\"os\":{\"id\":$(js "$os_id"),\"version_id\":$(js "$os_ver"),\"codename\":$(js "$os_code"),"
 out+="\"kernel_running\":$(js "$kernel_running"),\"kernel_newest_installed\":$(js "$kernel_newest"),"
 out+="\"reboot_required\":$reboot_required,\"reboot_required_pkgs\":$(jarr ${reboot_pkgs[@]+"${reboot_pkgs[@]}"})},"
-out+="\"apt\":{\"lists_age_hours\":${lists_age:-null},\"upgradable\":$upg_json},"
+out+="\"apt\":{\"status\":$(js "$apt_state"),\"lists_age_hours\":${lists_age:-null},\"upgradable\":$upg_json},"
 out+="\"node\":$(jarr ${node_json[@]+"${node_json[@]}"}),"
 out+="\"nvm\":$(jarr ${nvm_json[@]+"${nvm_json[@]}"}),"
 out+="\"pm2\":$(jarr ${pm2_json[@]+"${pm2_json[@]}"}),"

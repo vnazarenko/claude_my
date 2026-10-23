@@ -23,6 +23,10 @@
 #   no free text gets out. A value of the wrong shape is dropped and counted; each list has a cap,
 #   and entries over it are dropped and counted too ("filtered" in the output). inventory.sh
 #   checks all of this again on the user's side.
+# - the path of a binary leaves the server only when root chose every part of it: a file in a
+#   system folder (/usr, /bin, /sbin, /lib*, /opt, /snap) whose folders only root can write, or an
+#   nvm Node path of the strict form (.../versions/node/vX.Y.Z/bin/node). Any other path is only
+#   counted ("filtered.other_paths"): any user can run a binary from a folder they name.
 # The test also runs this script in a container and checks that no file changed.
 #
 # Keep the style simple, the test reads this file line by line: one command per line,
@@ -49,12 +53,20 @@ IMAGE_ID_RE='^(sha256:)?[0-9a-f]{12,64}$'
 NVM_RE='^(/root/\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\.nvm|/usr/local/nvm|/opt/nvm)$'
 NVM_NODE_RE='^(/root/\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\.nvm|/usr/local/nvm|/opt/nvm)/versions/node/v[0-9]{1,3}\.[0-9]{1,4}\.[0-9]{1,4}/bin/node$'
 DOCKER_DATE_RE='^([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-9]{2}:[0-9]{2}:[0-9]{2}) ([+-][0-9]{4})'
+# System folders: only root writes them. An nvm tree is not one, even inside them: its group
+# may write it, so a path there must have the strict nvm form.
+SYS_RE='^/(usr|bin|sbin|lib|lib32|lib64|libx32|opt|snap)/'
+NVM_TREE_RE='/versions/node/|^/(usr/local|opt)/nvm/'
+# A Node in a container: the path inside the image. Only the usual places are passed on.
+CT_NODE_RE='^/usr/(local/)?bin/node(js)?$'
 
-declare -A dropped=()
+declare -A dropped=() others=()
 truncated=false
 
 # drop <list>: count one value left out of <list>.
 drop() { dropped[$1]=$(( ${dropped[$1]:-0} + 1 )); }
+# unnamed <list>: count one path left out of <list> because a user may have named it.
+unnamed() { others[$1]=$(( ${others[$1]:-0} + 1 )); }
 
 # shaped <list> <regex> <value>: true when the value is empty or has the shape; else counts it.
 shaped() {
@@ -75,13 +87,28 @@ room() {
 # A path: absolute, plain characters, no spaces, no "..", at most MAX_PATH characters.
 safe_path() { [[ ${#1} -le $MAX_PATH && $1 == /* && $1 != *..* && $1 =~ ^[A-Za-z0-9_./@+-]+$ ]]; }
 
-# A Node path: a safe path; one in an nvm tree only with a plain version folder (vX.Y.Z).
-node_path_ok() {
-  if [[ $1 == */versions/node/* ]]; then
-    [[ $1 =~ $NVM_NODE_RE ]]
-    return
-  fi
-  safe_path "$1"
+# root_tree <path>: every folder from / down to the path's folder is a real folder (not a link),
+# owned by root and not writable by group or others. Then only root could have named the path.
+root_tree() {
+  local d=${1%/*} dirs ok
+  dirs=(/)
+  while [ -n "$d" ]; do
+    dirs+=("$d")
+    d=${d%/*}
+  done
+  ok=$(find "${dirs[@]}" -maxdepth 0 -type d -user root ! -perm /022 -printf x 2>/dev/null)
+  [ "${#ok}" -eq "${#dirs[@]}" ]
+}
+
+# named <path>: a file is at this path on this host, and root chose every part of its name: an
+# nvm Node path of the strict form, or a path in a system folder (not in an nvm tree) under
+# folders that only root can write. Every other path is only counted.
+named() {
+  safe_path "$1" || return 1
+  [ -e "$1" ] || return 1
+  [[ $1 =~ $NVM_NODE_RE ]] && return 0
+  [[ $1 =~ $SYS_RE && ! $1 =~ $NVM_TREE_RE ]] || return 1
+  root_tree "$1"
 }
 
 # A file root may read in a folder that other users can write: a regular file, not a symlink.
@@ -282,10 +309,12 @@ while IFS=$'\t' read -r dir exe; do
 done < <(find /proc/[0-9]*/exe -maxdepth 0 -printf '%h\t%l\n' 2>/dev/null)
 
 # A binary replaced on disk but still running: the old code runs until a restart.
+# "named" wants a file at that path now (the update put a new one there): so the path is the
+# host's, not one inside a container or another mount namespace.
 deleted_json=()
 while IFS= read -r p; do
   [ -n "$p" ] || continue
-  if ! safe_path "$p"; then drop running_deleted_exe; continue; fi
+  if ! named "$p"; then unnamed running_deleted_exe; continue; fi
   room running_deleted_exe ${#deleted_json[@]} $MAX_LIST || continue
   deleted_json+=("$(js "$p")")
 done < <(printf '%s\n' "${!deleted[@]}" | sort)
@@ -326,14 +355,14 @@ done
 node_json=()
 while IFS= read -r p; do
   [ -n "$p" ] || continue
-  if ! node_path_ok "$p"; then drop node; continue; fi
+  if ! named "$p"; then unnamed node; continue; fi
   room node ${#node_json[@]} $MAX_LIST || continue
   node_json+=("{\"path\":$(js "$p"),\"version\":$(js "$(node_version "$p")"),\"running\":${running[$p]:-0},\"container\":false}")
 done < <(printf '%s\n' "${!node_paths[@]}" | sort)
 # A container's Node: its version is the image's, not the host package's.
 while IFS= read -r p; do
   [ -n "$p" ] || continue
-  if ! node_path_ok "$p"; then drop node; continue; fi
+  if ! [[ $p =~ $CT_NODE_RE ]]; then unnamed node; continue; fi
   room node ${#node_json[@]} $MAX_LIST || continue
   node_json+=("{\"path\":$(js "$p"),\"version\":null,\"running\":${in_container[$p]},\"container\":true}")
 done < <(printf '%s\n' "${!node_in_container[@]}" | sort)
@@ -357,12 +386,19 @@ for home in ${pm2_homes[@]+"${pm2_homes[@]}"}; do
     read -r pid < "$home/pm2.pid"
   fi
   [[ $pid =~ ^[0-9]+$ ]] || pid=""
+  # The pid file is the user's: it can name any process. Its binary is passed on only when it is
+  # the host file at that path (or, when replaced, a file is there now) and root named it.
   if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
     up=true
+    host=true
     exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
-    exe=${exe% (deleted)}
-    if [ -n "$exe" ] && ! node_path_ok "$exe"; then
-      drop pm2
+    if [[ $exe == *' (deleted)' ]]; then
+      exe=${exe% (deleted)}
+    elif [ -n "$exe" ] && [ ! "/proc/$pid/exe" -ef "$exe" ]; then
+      host=false
+    fi
+    if [ -n "$exe" ] && { [ "$host" = false ] || ! named "$exe"; }; then
+      unnamed pm2
       exe=""
     fi
   fi
@@ -474,5 +510,10 @@ counts=()
 for k in "${!dropped[@]}"; do
   counts+=("$(js "$k"):${dropped[$k]}")
 done
-out+="\"filtered\":{\"truncated\":$truncated,\"dropped\":{$(IFS=,; printf '%s' "${counts[*]:-}")}}}"
+other_counts=()
+for k in "${!others[@]}"; do
+  other_counts+=("$(js "$k"):${others[$k]}")
+done
+out+="\"filtered\":{\"truncated\":$truncated,\"dropped\":{$(IFS=,; printf '%s' "${counts[*]:-}")},"
+out+="\"other_paths\":{$(IFS=,; printf '%s' "${other_counts[*]:-}")}}}"
 printf '%s\n' "$out"

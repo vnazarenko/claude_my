@@ -78,6 +78,9 @@ A distro Node (`/usr/bin/node`, a dpkg version such as `18.19.1+dfsg-…`):
   **inside** the container. The inventory compares the link's target with the host file at that
   path: a container's process is listed apart, with `container: true` and `version: null`. Its
   Node is the image's: check the image (`docker_images[]`), not the host package.
+- A Node binary in a folder a user may name (`/tmp`, a home folder outside nvm, a folder others
+  can write) or a container's Node outside `/usr/bin` and `/usr/local/bin` is not listed: only
+  counted in `filtered.other_paths.node`. Report the count under "Not checked".
 
 ## pm2
 

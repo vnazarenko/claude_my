@@ -20,8 +20,13 @@
 #   - only the known fields are kept, each in its expected shape (a version, a package name, a git
 #     sha, a number, a date, a plain path without spaces, ...); a value of another shape is left
 #     out and counted; a pm2 home or a revision file must be one this call asked for
+#   - the path of a binary is kept only in a form root chose: a system folder (/usr, /bin, /sbin,
+#     /lib*, /opt, /snap; not an nvm tree there), or an nvm Node path .../versions/node/vX.Y.Z/bin/node;
+#     a container's Node only at /usr/bin or /usr/local/bin. Any other path is left out and only
+#     counted in "filtered.other_paths": any user can run a binary from a folder they name
 #   - each list has a cap; entries over it are left out and counted, and filtered.truncated is true
-#   - "filtered.dropped" gives the counts per field, added to the counts the server sent
+#   - "filtered.dropped" and "filtered.other_paths" give the counts per field, added to the
+#     counts the server sent
 # - sets "host" to <ssh_host>
 set -uo pipefail
 
@@ -81,15 +86,31 @@ clean='
   def NVM_NODE: "^(/root/\\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\\.nvm|/usr/local/nvm|/opt/nvm)/versions/node/v[0-9]{1,3}\\.[0-9]{1,4}\\.[0-9]{1,4}/bin/node$";
   def SHA: "^[0-9a-f]{7,40}$";
   def DATE: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{4})$";
+  def SYS: "^/(usr|bin|sbin|lib|lib32|lib64|libx32|opt|snap)/";
+  def NVM_TREE: "/versions/node/|^/(usr/local|opt)/nvm/";
+  def CT_NODE: "^/usr/(local/)?bin/node(js)?$";
 
   def o: if type == "object" then . else {} end;
-  # good($t): the value has the shape $t: a regex above, or "num", "bool", "path", "node_path".
+  def arr: if type == "array" then . else [] end;
+  # good($t): the value has the shape $t: a regex above, or "num", "bool", "path",
+  # "named" (a binary path root chose), "ct_node" (a Node path in a container).
   def good($t):
     if $t == "num" then type == "number" and . >= 0 and . <= 1000000000
     elif $t == "bool" then type == "boolean"
     elif $t == "path" then type == "string" and length <= 128 and test("^/[A-Za-z0-9_./@+-]+$") and (contains("..") | not)
-    elif $t == "node_path" then good("path") and (if contains("/versions/node/") then test(NVM_NODE) else true end)
+    elif $t == "named" then good("path") and (test(NVM_NODE) or (test(SYS) and (test(NVM_TREE) | not)))
+    elif $t == "ct_node" then good("path") and test(CT_NODE)
     else type == "string" and test($t) end;
+  # unnamed($t): a string that is not a good $t: a path a user may have named. Only counted.
+  def unnamed($t): type == "string" and (good($t) | not);
+  def node_t: if type == "object" and .container == true then "ct_node" else "named" end;
+  def node_unnamed: type == "object" and (node_t as $t | .path | unnamed($t));
+  def pm2_unnamed: type == "object" and (.daemon_node_path | unnamed("named"));
+  # counts($here; $there): {<field>: <count here + count the server sent>}, only counts over 0.
+  def counts($here; $there):
+    reduce ($here | keys[]) as $k ({};
+      ($here[$k] + ($there[$k] | if good("num") then floor else 0 end)) as $n
+      | if $n > 0 then .[$k] = $n else . end);
   # chk($t): {v: the value, or null; b: 1 when a value of the wrong shape was left out}.
   def chk($t): if . == null then {v: null, b: 0} elif good($t) then {v: ., b: 0} else {v: null, b: 1} end;
   # obj($spec): exactly the keys of $spec, each value checked. Other keys are left out.
@@ -133,24 +154,28 @@ clean='
   | ($r.os | o | .reboot_required_pkgs | list(50; chk(PKG))) as $rpk
   | ($r.apt | o | .lists_age_hours | chk("num")) as $age
   | ($r.apt | o | .upgradable | if . == null then {v: null, b: 0, t: false} else list(2000; apt_e) end) as $upg
-  | ($r.node | list(50; entry({path: "node_path", version: VER, running: "num", container: "bool"}; "path"))) as $node
+  | ($r.node | arr | map(select(node_unnamed | not))
+     | list(50; node_t as $t | entry({path: $t, version: VER, running: "num", container: "bool"}; "path"))) as $node
   | ($r.nvm | list(50; entry({nvm_dir: NVM, default_alias: ALIAS}; "nvm_dir"))) as $nvm
-  | ($r.pm2 | list(20; entry({pm2_home: "path", pid_file: "bool", daemon_running: "bool",
-                              daemon_node_path: "node_path", daemon_node: VER, pm2_version: SEMVER}; "pm2_home")
-                      | if .v != null and (.v.pm2_home | IN($H[]) | not) then {v: null, b: 0} else . end)) as $pm2
+  | ($r.pm2 | arr | map(if pm2_unnamed then .daemon_node_path = null else . end)
+     | list(20; entry({pm2_home: "path", pid_file: "bool", daemon_running: "bool",
+                       daemon_node_path: "named", daemon_node: VER, pm2_version: SEMVER}; "pm2_home")
+                | if .v != null and (.v.pm2_home | IN($H[]) | not) then {v: null, b: 0} else . end)) as $pm2
   | ($r.services | obj({nginx: VER, postgresql: VER, redis: VER, clickhouse: VER, docker: VER,
                         containerd: VER, openssh: VER, openssl: VER})) as $svc
   | ($r.ruby | list(50; chk(RUBY))) as $ruby
   | ($r.python3 | chk(VER)) as $py
   | ($r.docker_images | if . == null then {v: null, b: 0, t: false}
                         else list(50; entry({image: IMAGE, id: IMAGE_ID, created: DATE}; "image")) end) as $img
-  | ($r.running_deleted_exe | list(50; chk("path"))) as $del
+  | ($r.running_deleted_exe | arr | map(select(unnamed("named") | not)) | list(50; chk("named"))) as $del
   | ($r.revisions | revs($R)) as $rev
   | ({collected_at: $ca.b, os: $os.b, reboot_required_pkgs: $rpk.b, apt: ($age.b + $upg.b),
       node: $node.b, nvm: $nvm.b, pm2: $pm2.b, services: $svc.b, ruby: $ruby.b, python3: $py.b,
       docker_images: $img.b, running_deleted_exe: $del.b, revisions: $rev.b, dpkg: 0}) as $here
+  | ({node: ($r.node | arr | map(select(node_unnamed)) | length),
+      pm2: ($r.pm2 | arr | map(select(pm2_unnamed)) | length),
+      running_deleted_exe: ($r.running_deleted_exe | arr | map(select(unnamed("named"))) | length)}) as $here_paths
   | ($r.filtered | o) as $rf
-  | ($rf.dropped | o) as $there
   | {collected_at: $ca.v, host: $host,
      os: ($os.v + {reboot_required_pkgs: $rpk.v}),
      apt: {lists_age_hours: $age.v, upgradable: $upg.v},
@@ -158,8 +183,7 @@ clean='
      docker_images: $img.v, running_deleted_exe: $del.v, revisions: $rev.v,
      filtered: {
        truncated: ($rf.truncated == true or ([$rpk, $upg, $node, $nvm, $pm2, $ruby, $img, $del] | any(.t))),
-       dropped: (reduce ($here | keys[]) as $k ({};
-         ($here[$k] + ($there[$k] | if good("num") then floor else 0 end)) as $n
-         | if $n > 0 then .[$k] = $n else . end))}}'
+       dropped: counts($here; $rf.dropped | o),
+       other_paths: counts($here_paths; $rf.other_paths | o)}}'
 jq -e -s --arg host "$host" --arg homes "$homes" --arg rev_files "$rev_files" "$clean" <<< "$out" 2>/dev/null \
   || die "$host did not return a valid inventory (one JSON object)"

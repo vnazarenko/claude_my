@@ -1,0 +1,48 @@
+{
+  "collected_at": "2026-10-23T10:00:00Z",
+  "host": "example-host",
+  "os": {"id": "ubuntu", "version_id": "24.04", "codename": "noble",
+         "kernel_running": "6.8.0-40-generic", "kernel_newest_installed": "6.8.0-45-generic",
+         "reboot_required": true, "reboot_required_pkgs": ["linux-image-6.8.0-45-generic"]},
+  "apt": {"lists_age_hours": 20, "upgradable": [
+    {"package": "libssl3t64", "source": "openssl", "installed": "3.0.13-0ubuntu3.4", "candidate": "3.0.13-0ubuntu3.6",
+     "origin": "Ubuntu", "archives": ["noble-updates", "noble-security"]},
+    {"package": "openssl", "source": "openssl", "installed": "3.0.13-0ubuntu3.4", "candidate": "3.0.13-0ubuntu3.6",
+     "origin": "Ubuntu", "archives": ["noble-updates", "noble-security"]},
+    {"package": "curl", "source": "curl", "installed": "8.5.0-2ubuntu10.6", "candidate": "8.5.0-2ubuntu10.7",
+     "origin": "Ubuntu", "archives": ["noble-security"]},
+    {"package": "libcurl4t64", "source": "curl", "installed": "8.5.0-2ubuntu10.6", "candidate": "8.5.0-2ubuntu10.7",
+     "origin": "Ubuntu", "archives": ["noble-security"]},
+    {"package": "nginx", "source": "nginx", "installed": "1.24.0-2ubuntu7.1", "candidate": "1.24.0-2ubuntu7.2",
+     "origin": "Ubuntu", "archives": ["noble-updates"]},
+    {"package": "linux-generic", "source": "linux-meta", "installed": "6.8.0.45.45", "candidate": "6.8.0.47.47",
+     "origin": "Ubuntu", "archives": ["noble-updates", "noble-security"]},
+    {"package": "docker-ce", "source": "docker-ce", "installed": "5:27.3.1-1~ubuntu.24.04~noble",
+     "candidate": "5:27.3.2-1~ubuntu.24.04~noble", "origin": "Docker CE", "archives": ["noble"]},
+    {"package": "clickhouse-server", "source": "clickhouse-server", "installed": "24.8.1.1",
+     "candidate": "24.8.2.1", "origin": null, "archives": ["stable"]}
+  ]},
+  "node": [
+    {"path": "/home/app/.nvm/versions/node/v24.21.0/bin/node", "version": "v24.21.0", "running": 2, "default_alias": false},
+    {"path": "/home/other/.nvm/versions/node/v22.2.0/bin/node", "version": "v22.2.0", "running": 1, "default_alias": true},
+    {"path": "/home/third/.nvm/versions/node/v22.2.0/bin/node", "version": "v22.2.0", "running": 0, "default_alias": true},
+    {"path": "/opt/tool/bin/node", "version": null, "running": 1, "default_alias": false},
+    {"path": "/usr/bin/node", "version": "18.19.1+dfsg-6ubuntu5", "running": 0, "default_alias": false}
+  ],
+  "nvm": [{"nvm_dir": "/home/app/.nvm", "default_alias": "v24.21.0"},
+          {"nvm_dir": "/home/other/.nvm", "default_alias": "v22.2.0"},
+          {"nvm_dir": "/home/third/.nvm", "default_alias": "22"}],
+  "pm2": [
+    {"pm2_home": "/srv/app/.pm2", "pid_file": true, "daemon_running": true,
+     "daemon_node_path": "/home/app/.nvm/versions/node/v24.21.0/bin/node", "daemon_node": "v24.21.0", "pm2_version": "6.0.5"},
+    {"pm2_home": "/srv/old/.pm2", "pid_file": false, "daemon_running": false,
+     "daemon_node_path": null, "daemon_node": null, "pm2_version": null}
+  ],
+  "services": {"nginx": "1.24.0-2ubuntu7.1", "postgresql": null, "redis": null, "clickhouse": "24.8.1.1",
+               "docker": "5:27.3.1-1~ubuntu.24.04~noble", "containerd": null, "openssh": "1:9.6p1-3ubuntu13.5",
+               "openssl": "3.0.13-0ubuntu3.4"},
+  "ruby": ["3.4.7"], "python3": "3.12.3-1ubuntu0.8",
+  "docker_images": [{"image": "example/app:1.0", "id": "sha256:0000000000000000000000000000000000000000000000000000000000000001", "created": "2026-01-01 00:00:00 +0000 UTC"}],
+  "running_deleted_exe": [],
+  "revisions": {"/srv/app/current/REVISION": "0123456789abcdef0123456789abcdef01234567"}
+}

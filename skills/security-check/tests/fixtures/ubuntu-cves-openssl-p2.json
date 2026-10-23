@@ -1,0 +1,113 @@
+{
+ "cves": [
+  {
+   "id": "CVE-2025-0103",
+   "published": "2025-05-20T00:00:00",
+   "priority": "medium",
+   "cvss3": 5.9,
+   "status": "active",
+   "description": "Synthetic test record.",
+   "packages": [
+    {
+     "name": "openssl",
+     "statuses": [
+      {
+       "release_codename": "noble",
+       "status": "released",
+       "description": "3.0.13-0ubuntu3.5",
+       "pocket": "security",
+       "component": null
+      }
+     ]
+    }
+   ],
+   "notices_ids": [
+    "USN-8001-1"
+   ],
+   "notices": [
+    {
+     "id": "USN-8001-1",
+     "title": "OpenSSL vulnerability",
+     "published": "2025-06-01T12:00:00.000000",
+     "release_packages": {
+      "noble": []
+     }
+    }
+   ]
+  },
+  {
+   "id": "CVE-2024-0104",
+   "published": "2024-08-01T00:00:00",
+   "priority": "high",
+   "cvss3": 7.5,
+   "status": "active",
+   "description": "Synthetic test record.",
+   "packages": [
+    {
+     "name": "openssl",
+     "statuses": [
+      {
+       "release_codename": "noble",
+       "status": "released",
+       "description": "3.0.13-0ubuntu3.4",
+       "pocket": "security",
+       "component": null
+      }
+     ]
+    }
+   ],
+   "notices_ids": [
+    "USN-7001-1"
+   ],
+   "notices": [
+    {
+     "id": "USN-7001-1",
+     "title": "OpenSSL vulnerability",
+     "published": "2024-09-03T12:00:00.000000",
+     "release_packages": {
+      "noble": []
+     }
+    }
+   ]
+  },
+  {
+   "id": "CVE-2024-0105",
+   "published": "2024-02-01T00:00:00",
+   "priority": "critical",
+   "cvss3": 9.8,
+   "status": "active",
+   "description": "Synthetic test record.",
+   "packages": [
+    {
+     "name": "openssl",
+     "statuses": [
+      {
+       "release_codename": "noble",
+       "status": "not-affected",
+       "description": "3.4+ only",
+       "pocket": "security",
+       "component": null
+      }
+     ]
+    },
+    {
+     "name": "edk2",
+     "statuses": [
+      {
+       "release_codename": "noble",
+       "status": "released",
+       "description": "9.9-0ubuntu1",
+       "pocket": "security",
+       "component": null
+      }
+     ]
+    }
+   ],
+   "notices_ids": [],
+   "notices": []
+  }
+ ],
+ "offset": 2,
+ "limit": 20,
+ "total_results": 5
+}

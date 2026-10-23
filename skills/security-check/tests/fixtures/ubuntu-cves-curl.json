@@ -1,0 +1,57 @@
+{
+ "cves": [
+  {
+   "id": "CVE-2026-0201",
+   "published": "2026-09-10T00:00:00",
+   "priority": "medium",
+   "cvss3": 6.5,
+   "status": "active",
+   "description": "Synthetic test record.",
+   "packages": [
+    {
+     "name": "curl",
+     "statuses": [
+      {
+       "release_codename": "noble",
+       "status": "released",
+       "description": "8.5.0-2ubuntu10.7",
+       "pocket": "security",
+       "component": null
+      }
+     ]
+    }
+   ],
+   "notices_ids": [
+    "USN-9002-1"
+   ],
+   "notices": []
+  },
+  {
+   "id": "CVE-2026-0202",
+   "published": "2026-09-12T00:00:00",
+   "priority": "critical",
+   "cvss3": 9.1,
+   "status": "active",
+   "description": "Synthetic test record.",
+   "packages": [
+    {
+     "name": "curl",
+     "statuses": [
+      {
+       "release_codename": "noble",
+       "status": "released",
+       "description": "8.5.0-2ubuntu10.8+esm1",
+       "pocket": "esm-infra",
+       "component": null
+      }
+     ]
+    }
+   ],
+   "notices_ids": [],
+   "notices": []
+  }
+ ],
+ "offset": 0,
+ "limit": 20,
+ "total_results": 2
+}

@@ -1,0 +1,95 @@
+{
+ "cves": [
+  {
+   "id": "CVE-2026-0101",
+   "published": "2026-10-01T00:00:00",
+   "priority": "high",
+   "cvss3": 8.2,
+   "status": "active",
+   "description": "Synthetic test record.",
+   "packages": [
+    {
+     "name": "openssl",
+     "statuses": [
+      {
+       "release_codename": "jammy",
+       "status": "released",
+       "description": "3.0.2-0ubuntu1.30",
+       "pocket": "security",
+       "component": null
+      },
+      {
+       "release_codename": "noble",
+       "status": "released",
+       "description": "3.0.13-0ubuntu3.6",
+       "pocket": "security",
+       "component": null
+      }
+     ]
+    }
+   ],
+   "notices_ids": [
+    "USN-9001-1",
+    "USN-9001-2"
+   ],
+   "notices": [
+    {
+     "id": "USN-9001-1",
+     "title": "OpenSSL vulnerabilities",
+     "published": "2026-10-15T12:00:00.000000",
+     "release_packages": {
+      "noble": [],
+      "jammy": []
+     }
+    },
+    {
+     "id": "USN-9001-2",
+     "title": "OpenSSL vulnerabilities",
+     "published": "2026-10-16T12:00:00.000000",
+     "release_packages": {
+      "bionic": []
+     }
+    }
+   ]
+  },
+  {
+   "id": "CVE-2026-0102",
+   "published": "2026-10-02T00:00:00",
+   "priority": "low",
+   "cvss3": 3.7,
+   "status": "active",
+   "description": "Synthetic test record.",
+   "packages": [
+    {
+     "name": "openssl",
+     "statuses": [
+      {
+       "release_codename": "noble",
+       "status": "released",
+       "description": "3.0.13-0ubuntu3.6",
+       "pocket": "security",
+       "component": null
+      }
+     ]
+    }
+   ],
+   "notices_ids": [
+    "USN-9001-1"
+   ],
+   "notices": [
+    {
+     "id": "USN-9001-1",
+     "title": "OpenSSL vulnerabilities",
+     "published": "2026-10-15T12:00:00.000000",
+     "release_packages": {
+      "noble": [],
+      "jammy": []
+     }
+    }
+   ]
+  }
+ ],
+ "offset": 0,
+ "limit": 20,
+ "total_results": 5
+}

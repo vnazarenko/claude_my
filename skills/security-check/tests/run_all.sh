@@ -30,7 +30,7 @@ done
 
 if compgen -G "$here/test_*.py" >/dev/null; then
   echo "== python unittest"
-  python3 -m unittest discover -s "$here" -p 'test_*.py' || failed+=("python unittest")
+  PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$here" -p 'test_*.py' || failed+=("python unittest")
 fi
 
 echo

@@ -1,0 +1,42 @@
+{
+ "cves": [
+  {
+   "id": "CVE-2025-0301",
+   "published": "2025-03-01T00:00:00",
+   "priority": "medium",
+   "cvss3": 5.3,
+   "status": "active",
+   "description": "Synthetic test record.",
+   "packages": [
+    {
+     "name": "nginx",
+     "statuses": [
+      {
+       "release_codename": "noble",
+       "status": "released",
+       "description": "1.24.0-2ubuntu7.1",
+       "pocket": "security",
+       "component": null
+      }
+     ]
+    }
+   ],
+   "notices_ids": [
+    "USN-7501-1"
+   ],
+   "notices": [
+    {
+     "id": "USN-7501-1",
+     "title": "nginx vulnerability",
+     "published": "2025-03-10T12:00:00.000000",
+     "release_packages": {
+      "noble": []
+     }
+    }
+   ]
+  }
+ ],
+ "offset": 0,
+ "limit": 20,
+ "total_results": 1
+}

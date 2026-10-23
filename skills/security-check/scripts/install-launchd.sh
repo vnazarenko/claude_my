@@ -31,23 +31,23 @@ server="${2:-}"
 project="${3:-}"
 
 plist_dir="$HOME/Library/LaunchAgents"
-sock="${AGTERM_SOCKET:-$HOME/Library/Application Support/agterm/agterm.sock}"
+AGTERM_SOCKET="${AGTERM_SOCKET:-$HOME/Library/Application Support/agterm/agterm.sock}"
 due="$HOME/.claude/skills/security-check/scripts/security-check-due.sh"
 logs="$HOME/Library/Logs"
 path="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Exact ASCII sets. No ranges: in some locales a range like A-Z also matches other letters.
-AZ=ABCDEFGHIJKLMNOPQRSTUVWXYZ
-az=abcdefghijklmnopqrstuvwxyz
-D=0123456789
+UPPER=ABCDEFGHIJKLMNOPQRSTUVWXYZ
+LOWER=abcdefghijklmnopqrstuvwxyz
+DIGITS=0123456789
 
 die() { echo "ERROR: $1" >&2; exit "${2:-1}"; }   # die <message> [exit code]
 usage() { die "$1. Usage: install-launchd.sh <repo> <server> <jira_project>" 2; }
 
 [ -n "$repo_in" ] && [ -n "$server" ] && [ -n "$project" ] || usage "three arguments needed"
 # The name goes into a file name, a launchd label and the plist.
-case "$server" in "" | [!$AZ$az$D]* | *[!$AZ$az${D}_-]*) usage "bad server name '$server' (letters, digits, - and _ only)" ;; esac
-case "$project" in "" | [!$AZ]* | *[!$AZ${D}_]*) usage "bad Jira project '$project' (capital letters and digits, e.g. PROJ)" ;; esac
+case "$server" in "" | [!$UPPER$LOWER$DIGITS]* | *[!$UPPER$LOWER${DIGITS}_-]*) usage "bad server name '$server' (letters, digits, - and _ only)" ;; esac
+case "$project" in "" | [!$UPPER]* | *[!$UPPER${DIGITS}_]*) usage "bad Jira project '$project' (capital letters and digits, e.g. PROJ)" ;; esac
 repo="$(cd "$repo_in" 2>/dev/null && pwd -P)" || usage "repo '$repo_in' does not exist"
 [ -d "$repo/.git" ] || usage "'$repo' is not the main checkout of a git repo (a worktree gets deleted)"
 [ -f "$due" ] || die "$due is not installed: merge and pull the skill first"
@@ -101,7 +101,7 @@ cat > "$tmp" <<EOF || die "cannot write $tmp"
     <key>AGTERM_ENABLED</key>
     <string>1</string>
     <key>AGTERM_SOCKET</key>
-    <string>$(xml "$sock")</string>
+    <string>$(xml "$AGTERM_SOCKET")</string>
   </dict>
   <key>StandardOutPath</key>
   <string>$(xml "$log_file")</string>

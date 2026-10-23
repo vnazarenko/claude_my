@@ -17,13 +17,11 @@
 # Prints `TASK_STARTED <KEY> agterm=<sid> claude=<uuid> worktree=<path>`.
 #
 # Optional overrides (for skills that reuse this flow, e.g. security-check). Unset or empty =
-# the default, so a plain new-task run does not change:
-#   TASK_SEED            first prompt of the new Claude; may use {{KEY}}, {{SUMMARY}}, {{BRIEF}}.
-#                        Default: "/planning:make {{KEY}}: {{SUMMARY}}. First read the task brief
-#                        {{BRIEF}} and follow it for the whole task."
-#   TASK_BRIEF_TEMPLATE  brief template file. Default: ../references/brief-template.md
-#   TASK_NEXT            text after "- Next: " in the "work started" Jira comment. Default:
-#                        "an implementation plan (planning:make). The plan summary will be posted here."
+# the default (default_seed, no extra, default_next below), so a plain new-task run does not change:
+#   TASK_SEED         first prompt of the new Claude; may use {{KEY}}, {{SUMMARY}}, {{BRIEF}}
+#   TASK_BRIEF_EXTRA  a file added to the end of the brief, after ../references/brief-template.md
+#                     and before the ticket text; same {{...}} placeholders as the template
+#   TASK_NEXT         text after "- Next: " in the "work started" Jira comment
 set -uo pipefail
 shopt -u patsub_replacement 2>/dev/null || true   # bash 5.2+: keep '&' literal in ${v//p/r}
 
@@ -36,17 +34,20 @@ here="$(cd "$(dirname "$0")" && pwd -P)"
 JIRA_PY="${JIRA_PY:-/Users/vnazarenko/code/Orthhank/.claude/skills/jira-tickets/scripts/jira.py}"
 NEW_WT="${NEW_WT:-$HOME/.claude/skills/parallel-issues/scripts/new-worktree.sh}"
 briefs="$HOME/.claude/task-briefs"
-brief_tpl="${TASK_BRIEF_TEMPLATE:-$here/../references/brief-template.md}"
+brief_tpl="$here/../references/brief-template.md"
+brief_extra="${TASK_BRIEF_EXTRA:-}"
 default_seed='/planning:make {{KEY}}: {{SUMMARY}}. First read the task brief {{BRIEF}} and follow it for the whole task.'
 seed_tpl="${TASK_SEED:-$default_seed}"
-next="${TASK_NEXT:-an implementation plan (planning:make). The plan summary will be posted here.}"
+default_next='an implementation plan (planning:make). The plan summary will be posted here.'
+next="${TASK_NEXT:-$default_next}"
 
 die() { echo "ERROR: $*"; exit 1; }
 [ "${AGTERM_ENABLED:-}" = "1" ] || die "not inside agterm (AGTERM_ENABLED != 1)"
 for c in agtermctl jq uuidgen python3; do command -v "$c" >/dev/null 2>&1 || die "$c not on PATH"; done
 [ -f "$JIRA_PY" ] || die "jira.py not found at $JIRA_PY (set JIRA_PY)"
 [ -x "$NEW_WT" ] || [ -f "$NEW_WT" ] || die "new-worktree.sh not found at $NEW_WT"
-[ -f "$brief_tpl" ] || die "brief template not found at $brief_tpl (TASK_BRIEF_TEMPLATE)"
+[ -f "$brief_tpl" ] || die "brief template not found at $brief_tpl"
+[ -z "$brief_extra" ] || [ -f "$brief_extra" ] || die "extra brief not found at $brief_extra (TASK_BRIEF_EXTRA)"
 # The seed is typed into a shell inside double quotes: refuse what that shell would expand.
 case "$seed_tpl" in
   *[\"\$\`\\!]* | *$'\n'* | *$'\r'*) die 'TASK_SEED must not contain " $ ` \ ! or a line break' ;;
@@ -94,10 +95,15 @@ mkdir -p "$briefs"
 brief="$briefs/$key.md"
 reg="$briefs/$key.env"
 
-{
+# fill <file>: the file with every {{...}} placeholder of the brief filled in.
+fill() {
   sed -e "s|{{KEY}}|$key|g" -e "s|{{URL}}|$url|g" -e "s|{{REPO}}|$repo|g" \
       -e "s|{{WORKTREE}}|$wt|g" -e "s|{{BRANCH}}|$branch|g" -e "s|{{SESSION_ID}}|$uuid|g" \
-      -e "s|{{JIRA_PY}}|$JIRA_PY|g" -e "s|{{REGISTRY}}|$reg|g" -e "s|{{PROCS}}|$briefs/$key.procs|g" "$brief_tpl"
+      -e "s|{{JIRA_PY}}|$JIRA_PY|g" -e "s|{{REGISTRY}}|$reg|g" -e "s|{{PROCS}}|$briefs/$key.procs|g" "$1"
+}
+{
+  fill "$brief_tpl"
+  if [ -n "$brief_extra" ]; then printf '\n'; fill "$brief_extra"; fi
   printf '\n## The ticket (from Jira, %s)\n\n**%s** — status %s\n\n%s\n' "$(date +%F)" "$summary" "$status" "$description"
 } > "$brief"
 

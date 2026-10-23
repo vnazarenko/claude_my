@@ -31,5 +31,5 @@ ours:                           # apps we own: the check may propose updates for
 
 not_ours:                       # on the server, but someone else owns it: reported, never proposed
   - "Node apps of another team under /srv/other (owner: other team)"
-  - name: the shared pm2 daemon of another team
+  - name: shared-pm2                               # the pm2 daemon of another team. A short name; say more in a comment
     pm2_home: /srv/other/.pm2                      # optional: also read by the inventory, so the report shows its Node

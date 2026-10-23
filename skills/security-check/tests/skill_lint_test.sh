@@ -16,11 +16,10 @@ here="$(cd "$(dirname "$0")" && pwd -P)"
 lint="$here/skill_lint.sh"
 skill="$(dirname "$here")"
 
-fails=0
-ok() { printf 'ok   %s\n' "$1"; }
-bad() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$here/lib.sh"
 
-command -v perl >/dev/null 2>&1 || { echo "ERROR: perl not on PATH" >&2; exit 1; }
+command -v perl >/dev/null 2>&1 || die "perl not on PATH"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -177,10 +176,4 @@ expect_fail "macOS home path" "home path"
 fresh; printf '\n{"host": "%s"}\n' "$(tr '[:lower:]' '[:upper:]' <<< "$word")" >> "$c/tests/fixtures/inventory.json"
 expect_fail "private word, other case, in a fixture" "private word"
 
-echo
-if [ "$fails" -eq 0 ]; then
-  echo "skill_lint_test: all passed"
-  exit 0
-fi
-echo "skill_lint_test: $fails failed"
-exit 1
+finish skill_lint_test

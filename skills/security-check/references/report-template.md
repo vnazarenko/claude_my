@@ -41,7 +41,7 @@ Nothing critical. No Critical, High or exploited fix is missing for anything tha
 
 | package | ours | fixed | CVE | severity | affects us | update command | restart | risk |
 |---|---|---|---|---|---|---|---|---|
-| node (<app> pm2 daemon) | v<x.y.z> | v<x.y.z> | CVE-<id>, CVE-<id> | High | yes — runs the web app | see "Node.js" below | pm2 daemon (`pm2 kill` + start) | medium — a few seconds of outage |
+| node (<app> pm2 daemon) | v<x.y.z> | v<x.y.z> | CVE-<id>, CVE-<id> | High | yes — runs the web app | see "Node.js" below | pm2 daemon (a full restart, through its boot unit) | medium — a few seconds of outage |
 | openssl (libssl3t64) | <installed> | <fixed> | CVE-<id> | high (Ubuntu) | yes — nginx and the apps link it | `apt-get install --only-upgrade libssl3t64 openssl` | nginx, app servers | low |
 
 ### Still open (older)

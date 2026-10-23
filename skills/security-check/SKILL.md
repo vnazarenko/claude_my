@@ -50,16 +50,17 @@ In this file, `$SKILL` means `~/.claude/skills/security-check`.
 | file | what it does |
 |---|---|
 | `scripts/inventory.sh` | runs `remote-inventory.sh` on the server over SSH. No agent forwarding, no port forwards, no shared connection. Prints one JSON. |
+| `scripts/inventory-clean.jq` | the filter `inventory.sh` runs on the server's answer: known fields only, each in its shape. |
 | `scripts/remote-inventory.sh` | the read-only script that runs on the server. A test allows only 9 commands in it. |
 | `scripts/advisories.py` | `node`, `usn`, `kev`: finds the fixes for the inventory. Stdlib Python, disk cache. |
+| `scripts/security-check-due.sh` | the daily call of the schedule: when a run is due, it creates (or reuses) the Jira ticket and starts the run's session. See "Schedule". |
+| `scripts/install-launchd.sh` | installs the daily launchd job for one server (macOS). See "Schedule". |
 | `references/sources.md` | per component: where fixes are announced, how to judge "affects us", update and restart. |
 | `references/report-template.md` | the report and the Jira summary. |
 | `references/profile-example.yml` | a profile to copy into a project. |
-| `references/run-brief.md` | the brief of a scheduled run (one Jira ticket, one worktree, one session). |
-| `scripts/security-check-due.sh` | the daily call of the schedule: when a run is due, it creates (or reuses) the Jira ticket and starts the run's session. See "Schedule". |
-| `scripts/install-launchd.sh` | installs the daily launchd job for one server (macOS). See "Schedule". |
+| `references/run-brief.md` | what a scheduled run adds to the `new-task` brief (one Jira ticket, one worktree, one session). |
 | `tests/run_all.sh` | every test of this skill. Run it after any change here. It lists every skipped part (`WARN`) at the end. |
-| `tests/skill_lint.sh` | the public-repo lint of this skill (also run by `run_all.sh`): no IPs, session links, Jira links, home paths or private words. The private words come from a local list that is never committed: `~/.config/security-check/private-words.txt` (or `$SECURITY_CHECK_PRIVATE_WORDS`), one word per line. No list → a warning, and that check is skipped. |
+| `tests/skill_lint.sh` | the public-repo lint of this skill (also run by `run_all.sh`; the checks are in `tests/skill_lint.py`): no IPs, session links, Jira links, home paths or private words. The private words come from a local list that is never committed: `~/.config/security-check/private-words.txt` (or `$SECURITY_CHECK_PRIVATE_WORDS`), one word per line. No list → a warning, and that check is skipped. |
 
 ## Step 0 — read the profile
 
@@ -85,7 +86,7 @@ In this file, `$SKILL` means `~/.claude/skills/security-check`.
 | `ours[].node_pin` | no | files that pin the Node version (for the update proposal) |
 | `ours[].image` | no | a Docker image we run |
 | `ours[].deploy_doc` | no | the project's own steps for updating this app on this server (a path in this repo). When set, the update proposal follows it, not the generic steps in `references/sources.md` |
-| `not_ours[]` | no | things on the server that belong to others: reported, never proposed. A text, or a map with `name` |
+| `not_ours[]` | no | things on the server that belong to others: reported, never proposed. A text, or a map with a short `name` (a YAML comment can say more) |
 | `not_ours[].pm2_home` | no | a pm2 daemon of others: also passed as `--pm2-home`, so the report shows its Node |
 
 3. Make an output folder outside every repo: the session's scratchpad, else `mktemp -d`. Call it
@@ -144,8 +145,8 @@ python3 $SKILL/scripts/advisories.py usn  "$OUT/inventory.json" --since-days N >
   and `no_security_fix[]`.
 - Exit 1 = a source could not be fetched (the message names the URL). `CERTIFICATE_VERIFY_FAILED`
   means this Python has no CA certificates: set `SSL_CERT_FILE` to a CA bundle and run again.
-  Any other fetch error: put that part under
-  "Not checked" and go on. Exit 2 = bad input: fix the call.
+  Any other fetch error: put that part under "Not checked" and go on. Exit 2 = bad input: fix
+  the call.
 - The cache is `~/.cache/security-check` (or `$SECURITY_CHECK_CACHE`). A repeat within 6 hours
   uses it.
 
@@ -252,8 +253,9 @@ user's explicit go for that PR.
 
 A launchd job on the Mac starts a run every 14 days. A scheduled run gets its own Jira ticket,
 worktree and agterm session (the `new-task` flow), and starts with
-`/security-check <server> --ticket <KEY>`. Its brief is `references/run-brief.md`: it adds the PR
-for the report, the Jira events and the question to the user. The read-only rule is the same.
+`/security-check <server> --ticket <KEY>`. Its brief is the `new-task` brief plus
+`references/run-brief.md`, which adds the PR for the report, the Jira events and the question to
+the user. The read-only rule is the same.
 
 Install it once per server. `<repo>` is the project's **main checkout**, not a worktree
 (worktrees get deleted):
@@ -280,7 +282,7 @@ bash $SKILL/scripts/install-launchd.sh <repo> <server> <jira_project>
     a second ticket. To give up on that ticket, delete the `PENDING_KEY=` line from the state
     file.
 - It needs: agterm, `jq`, `python3`, `git`, the `jira-tickets` skill's `jira.py` and the
-  `new-task` skill with the `TASK_SEED` override.
+  `new-task` skill with the `TASK_SEED`, `TASK_BRIEF_EXTRA` and `TASK_NEXT` overrides.
 
 | what | command or path |
 |---|---|

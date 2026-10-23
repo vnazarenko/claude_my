@@ -37,26 +37,12 @@ due="$skill/scripts/security-check-due.sh"
 install="$skill/scripts/install-launchd.sh"
 real_brief="$skill/references/run-brief.md"
 real_start_task="$skill/../new-task/scripts/start-task.sh"
+real_task_brief="$skill/../new-task/references/brief-template.md"
 BASH_BIN=/bin/bash
 [ -x "$BASH_BIN" ] || BASH_BIN="$(command -v bash)"
 
-fails=0
-ok() { printf 'ok   %s\n' "$1"; }
-bad() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
-# expect_eq <label> <expected> <actual>
-expect_eq() {
-  if [ "$2" = "$3" ]; then ok "$1"; else
-    bad "$1"; printf '     expected: %s\n     actual:   %s\n' "$2" "$3"
-  fi
-}
-# expect_has <label> <needle> <text>
-expect_has() {
-  case "$3" in *"$2"*) ok "$1" ;; *) bad "$1"; printf '     missing: %s\n     in: %s\n' "$2" "$3" ;; esac
-}
-# expect_not_has <label> <needle> <text>
-expect_not_has() {
-  case "$3" in *"$2"*) bad "$1"; printf '     found: %s\n' "$2" ;; *) ok "$1" ;; esac
-}
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$here/lib.sh"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -139,7 +125,7 @@ cat > "$tmp/start-task.sh" <<'EOF'
 {
   echo "ARGS=$*"
   echo "TASK_SEED=${TASK_SEED:-}"
-  echo "TASK_BRIEF_TEMPLATE=${TASK_BRIEF_TEMPLATE:-}"
+  echo "TASK_BRIEF_EXTRA=${TASK_BRIEF_EXTRA:-}"
   echo "TASK_NEXT=${TASK_NEXT:-}"
   echo "AGTERM_ENABLED=${AGTERM_ENABLED:-}"
   echo "AGTERM_SOCKET=${AGTERM_SOCKET:-}"
@@ -245,7 +231,7 @@ run_due() {
 # due_cmd [VAR=value ...]: the same, output not captured.
 due_cmd() {
   env -u DRY_RUN -u SECURITY_CHECK_INTERVAL_DAYS -u AGTERM_ENABLED -u AGTERM_SOCKET -u AGTERM_SESSION_ID \
-    -u TASK_SEED -u TASK_BRIEF_TEMPLATE -u TASK_NEXT -u NEW_WT \
+    -u TASK_SEED -u TASK_BRIEF_EXTRA -u TASK_NEXT -u NEW_WT \
     HOME="$home" PATH="$tmp/bin:$PATH" STUB_LOG="$log" STUB_TODAY="$today" JIRA_PY="$tmp/jira_stub.py" \
     "$@" "$BASH_BIN" "$due" "$arg_repo" "$arg_server" "$arg_project"
 }
@@ -348,8 +334,8 @@ expect_eq "due: one Jira create, exact arguments" \
 expect_eq "due: start-task.sh arguments" "ARGS=$repo $key" "$(grep '^ARGS=' "$log/start.calls")"
 expect_eq "due: TASK_SEED" "$seed" "$(start_env TASK_SEED)"
 expect_has "due: TASK_SEED has the key and a space after it" "--ticket $key (first" "$(start_env TASK_SEED)"
-expect_eq "due: TASK_BRIEF_TEMPLATE = installed run brief" \
-  "$home/.claude/skills/security-check/references/run-brief.md" "$(start_env TASK_BRIEF_TEMPLATE)"
+expect_eq "due: TASK_BRIEF_EXTRA = installed run brief" \
+  "$home/.claude/skills/security-check/references/run-brief.md" "$(start_env TASK_BRIEF_EXTRA)"
 expect_eq "due: TASK_NEXT" "$next_text" "$(start_env TASK_NEXT)"
 expect_eq "due: AGTERM_ENABLED=1 for start-task.sh" "1" "$(start_env AGTERM_ENABLED)"
 expect_eq "due: AGTERM_SOCKET default" "$home/Library/Application Support/agterm/agterm.sock" "$(start_env AGTERM_SOCKET)"
@@ -631,9 +617,11 @@ expect_eq "bad SECURITY_CHECK_INTERVAL_DAYS: no ticket" 0 "$(count jira)"
 
 # ---- 9. the whole chain with the real start-task.sh -------------------------------------------
 
-if [ -f "$real_start_task" ] && grep -q TASK_SEED "$real_start_task"; then
+if [ -f "$real_start_task" ] && grep -q TASK_BRIEF_EXTRA "$real_start_task"; then
   new_case chain
   cp "$real_start_task" "$home/.claude/skills/new-task/scripts/start-task.sh"
+  mkdir -p "$home/.claude/skills/new-task/references"
+  cp "$real_task_brief" "$home/.claude/skills/new-task/references/brief-template.md"
   run_due NEW_WT="$tmp/new-worktree.sh"
   brief="$home/.claude/task-briefs/$key.md"
   uuid="$(sed -n 's/^TASK_STARTED .* claude=\([^ ]*\) .*/\1/p' <<<"$out")"
@@ -643,12 +631,15 @@ if [ -f "$real_start_task" ] && grep -q TASK_SEED "$real_start_task"; then
   expect_eq "chain: the typed command runs /security-check on the ticket" \
     "claude --session-id $uuid -n \"$key Security check: $server $today\" \"/security-check $server --ticket $key (first read the task brief $brief and follow it for the whole run)\"" \
     "$(head -n 1 "$log/typed" 2>/dev/null)"
-  expect_has "chain: brief from the run brief" "# Security run brief — $key" "$(head -n 1 "$brief" 2>/dev/null)"
+  expect_eq "chain: brief starts with new-task's brief" "# Task brief — $key" "$(head -n 1 "$brief" 2>/dev/null)"
+  expect_eq "chain: new-task's last part, the run brief, the ticket, in this order" \
+    "## 6. When the work is merged and deployed|## 7. This task is a scheduled security check|## The ticket (from Jira, $today)|" \
+    "$(grep -e '^## 6\. ' -e '^## 7\. ' -e '^## The ticket' "$brief" 2>/dev/null | tr '\n' '|')"
   expect_not_has "chain: every brief placeholder filled" "{{" "$(cat "$brief" 2>/dev/null)"
   expect_eq "chain: Jira Next line" "- Next: $next_text" "$(grep '^- Next: ' "$log/comment.txt" 2>/dev/null)"
   expect_started "chain"
 else
-  echo "WARN: no start-task.sh with TASK_SEED at $real_start_task; chain test skipped"
+  echo "WARN: no start-task.sh with TASK_BRIEF_EXTRA at $real_start_task; chain test skipped"
 fi
 
 # launchd gives a bare environment: only what the plist sets (PATH, AGTERM_*), plus HOME.
@@ -759,10 +750,4 @@ else
   echo "WARN: plutil not found (not macOS); install-launchd.sh tests skipped"
 fi
 
-echo
-if [ "$fails" -eq 0 ]; then
-  echo "due_test: all passed"
-  exit 0
-fi
-echo "due_test: $fails failed"
-exit 1
+finish due_test

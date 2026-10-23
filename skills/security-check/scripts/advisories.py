@@ -23,7 +23,7 @@ kev   Which CVE ids are in the CISA Known Exploited Vulnerabilities catalog.
 The script collects facts. It does not judge what affects us; see references/sources.md.
 
 Every pending fix is listed, of any age. "in_window" marks the ones published in the last
---since-days days (default 14) before --today (default: today, UTC).
+--since-days days before --today (the defaults are in --help).
 
 Network: only HTTPS GET requests to the sources above, all through Fetcher, which keeps a
 disk cache (default ~/.cache/security-check, or $SECURITY_CHECK_CACHE). A cached answer is
@@ -56,9 +56,11 @@ CACHE_MAX_AGE = 6 * HOUR  # for every URL
 PAGE_SIZE = 20   # the most the Ubuntu API gives per page
 MAX_PAGES = 15   # per source package, so at most 300 CVEs
 TIMEOUT = 60
+DEFAULT_SINCE_DAYS = 14   # --since-days
 USER_AGENT = "security-check-advisories/1"
 
 PRIORITIES = ["critical", "high", "medium", "low", "negligible"]
+DIGITS = "0123456789"   # what dpkg counts as a digit in a version
 CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
 NODE_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 # A NodeSource apt package is an upstream build: "22.11.0-1nodesource1".
@@ -199,7 +201,7 @@ def node_version(s):
 
 
 def _order(c):
-    if c == "" or c in "0123456789":
+    if c == "" or c in DIGITS:
         return 0
     if c.isascii() and c.isalpha():
         return ord(c)
@@ -212,7 +214,7 @@ def _verrevcmp(a, b):
     """dpkg's comparison of one upstream or revision part."""
     i = j = 0
     while i < len(a) or j < len(b):
-        while (i < len(a) and a[i] not in "0123456789") or (j < len(b) and b[j] not in "0123456789"):
+        while (i < len(a) and a[i] not in DIGITS) or (j < len(b) and b[j] not in DIGITS):
             ac = _order(a[i] if i < len(a) else "")
             bc = _order(b[j] if j < len(b) else "")
             if ac != bc:
@@ -224,14 +226,14 @@ def _verrevcmp(a, b):
         while j < len(b) and b[j] == "0":
             j += 1
         first_diff = 0
-        while i < len(a) and a[i] in "0123456789" and j < len(b) and b[j] in "0123456789":
+        while i < len(a) and a[i] in DIGITS and j < len(b) and b[j] in DIGITS:
             if not first_diff:
                 first_diff = ord(a[i]) - ord(b[j])
             i += 1
             j += 1
-        if i < len(a) and a[i] in "0123456789":
+        if i < len(a) and a[i] in DIGITS:
             return 1
-        if j < len(b) and b[j] in "0123456789":
+        if j < len(b) and b[j] in DIGITS:
             return -1
         if first_diff:
             return first_diff
@@ -655,8 +657,9 @@ def build_parser():
     common.add_argument("--cache-dir", default=default_cache_dir(),
                         help="disk cache (default: %(default)s)")
     dated = argparse.ArgumentParser(add_help=False)
-    dated.add_argument("--since-days", type=_days, default=14,
-                       help="fixes published in this many days are marked in_window (default 14)")
+    dated.add_argument("--since-days", type=_days, default=DEFAULT_SINCE_DAYS,
+                       help="fixes published in this many days are marked in_window "
+                            "(default: %(default)s)")
     dated.add_argument("--today", type=_date, default=dt.datetime.now(dt.timezone.utc).date(),
                        help="the date to count from (default: today, UTC)")
 

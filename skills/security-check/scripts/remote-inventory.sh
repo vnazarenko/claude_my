@@ -34,7 +34,7 @@
 set -uo pipefail
 export LC_ALL=C
 
-die() { printf 'remote-inventory: %s\n' "$*" >&2; exit 2; }
+die() { printf 'ERROR: remote-inventory: %s\n' "$1" >&2; exit "${2:-1}"; }   # die <message> [exit code]
 
 # ---- what may leave the server -----------------------------------------------------------------
 
@@ -53,6 +53,9 @@ IMAGE_ID_RE='^(sha256:)?[0-9a-f]{12,64}$'
 NVM_RE='^(/root/\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\.nvm|/usr/local/nvm|/opt/nvm)$'
 NVM_NODE_RE='^(/root/\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\.nvm|/usr/local/nvm|/opt/nvm)/versions/node/v[0-9]{1,3}\.[0-9]{1,4}\.[0-9]{1,4}/bin/node$'
 DOCKER_DATE_RE='^([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-9]{2}:[0-9]{2}:[0-9]{2}) ([+-][0-9]{4})'
+SHA_RE='^[0-9a-f]{7,40}$'      # a git sha in a REVISION file
+PID_RE='^[0-9]+$'              # a process id (a /proc folder, a pm2.pid file)
+SHORT_ID_RE='^[0-9a-f]{12}$'   # a short docker image id, as "docker ps" prints it
 # System folders: only root writes them. An nvm tree is not one, even inside them: its group
 # may write it, so a path there must have the strict nvm form.
 SYS_RE='^/(usr|bin|sbin|lib|lib32|lib64|libx32|opt|snap)/'
@@ -118,15 +121,15 @@ pm2_homes=()
 rev_files=()
 while [ $# -gt 0 ]; do
   if [ "$1" = "--pm2-home" ] && [ $# -ge 2 ]; then
-    safe_path "$2" || die "bad path: $2"
+    safe_path "$2" || die "bad path: $2" 2
     pm2_homes+=("$2")
     shift 2
   elif [ "$1" = "--revision-file" ] && [ $# -ge 2 ]; then
-    safe_path "$2" || die "bad path: $2"
+    safe_path "$2" || die "bad path: $2" 2
     rev_files+=("$2")
     shift 2
   else
-    die "unknown argument: $1"
+    die "unknown argument: $1" 2
   fi
 done
 
@@ -297,7 +300,7 @@ declare -A running=() deleted=() in_container=()
 while IFS=$'\t' read -r dir exe; do
   [ -n "$exe" ] || continue
   pid=${dir##*/}
-  [[ $pid =~ ^[0-9]+$ ]] || continue
+  [[ $pid =~ $PID_RE ]] || continue
   if [[ $exe == *' (deleted)' ]]; then
     exe=${exe% (deleted)}
     deleted[$exe]=1
@@ -385,7 +388,7 @@ for home in ${pm2_homes[@]+"${pm2_homes[@]}"}; do
     pidfile=true
     read -r pid < "$home/pm2.pid"
   fi
-  [[ $pid =~ ^[0-9]+$ ]] || pid=""
+  [[ $pid =~ $PID_RE ]] || pid=""
   # The pid file is the user's: it can name any process. Its binary is passed on only when it is
   # the host file at that path (or, when replaced, a file is there now) and root named it.
   if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
@@ -445,7 +448,7 @@ if command -v docker >/dev/null 2>&1; then
     declare -A in_use=()
     while IFS= read -r ref; do
       [ -n "$ref" ] || continue
-      [[ ${ref##*/} == *:* || $ref == *@* || $ref =~ ^[0-9a-f]{12}$ ]] || ref="$ref:latest"
+      [[ ${ref##*/} == *:* || $ref == *@* || $ref =~ $SHORT_ID_RE ]] || ref="$ref:latest"
       shaped docker_images "$IMAGE_RE" "$ref" || continue
       in_use[$ref]=1
     done <<< "$ps_out"
@@ -461,8 +464,8 @@ if command -v docker >/dev/null 2>&1; then
       else
         continue
       fi
-      room docker_images ${#imgs[@]} $MAX_LIST || continue
       shaped docker_images "$IMAGE_RE" "$ref" || continue
+      room docker_images ${#imgs[@]} $MAX_LIST || continue
       shaped docker_images "$IMAGE_ID_RE" "$id" || id=""
       if [[ $created =~ $DOCKER_DATE_RE ]]; then
         created="${BASH_REMATCH[1]}T${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
@@ -486,7 +489,7 @@ revs=()
 for f in ${rev_files[@]+"${rev_files[@]}"}; do
   sha=""
   if plain_file "$f"; then read -r sha < "$f"; fi
-  [[ $sha =~ ^[0-9a-f]{7,40}$ ]] || sha=""
+  [[ $sha =~ $SHA_RE ]] || sha=""
   revs+=("$(js "$f"):$(js "$sha")")
 done
 

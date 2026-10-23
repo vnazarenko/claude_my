@@ -9,9 +9,10 @@
 # prints "WORKTREE_READY <dir>". jq, uuidgen and python3 are the real ones.
 #
 # 1. no override set → the /planning:make seed, the default brief, the default Jira "Next:" line
-# 2. TASK_SEED, TASK_BRIEF_TEMPLATE and TASK_NEXT set → all three used, placeholders filled
+# 2. TASK_SEED, TASK_BRIEF_EXTRA and TASK_NEXT set → all three used, placeholders filled; the
+#    extra file comes after the default brief and before the ticket text
 # 3. overrides set but empty → the defaults
-# 4. TASK_BRIEF_TEMPLATE names a missing file → clear error; no worktree, no session, no Jira
+# 4. TASK_BRIEF_EXTRA names a missing file → clear error; no worktree, no session, no Jira
 # 5. TASK_SEED with a character the typed shell would expand → clear error; nothing started
 # 6. an open agterm session of the same ticket blocks the start; one of PROJ-1234 does not
 # 7. macOS /bin/bash (3.2), no caller session (AGTERM_SESSION_ID unset): the way launchd starts it
@@ -92,8 +93,8 @@ repo="$tmp/code/demo"
 mkdir -p "$repo/.git"
 wt="$repo/.claude/worktrees/$key"
 
-cat > "$tmp/custom-brief.md" <<'EOF'
-# Custom brief {{KEY}}
+cat > "$tmp/custom-extra.md" <<'EOF'
+## 7. Custom part for {{KEY}}
 
 {{URL}} | {{REPO}} | {{WORKTREE}} | {{BRANCH}}
 {{SESSION_ID}} | {{JIRA_PY}} | {{REGISTRY}} | {{PROCS}}
@@ -111,7 +112,7 @@ run_case() {
   log="$tmp/$case_name/log"
   mkdir -p "$home" "$log"
   rm -rf "$repo/.claude"
-  out="$(env -u TASK_SEED -u TASK_BRIEF_TEMPLATE -u TASK_NEXT -u AGTERM_SESSION_ID -u AGTERM_SOCKET -u STUB_TREE \
+  out="$(env -u TASK_SEED -u TASK_BRIEF_EXTRA -u TASK_NEXT -u AGTERM_SESSION_ID -u AGTERM_SOCKET -u STUB_TREE \
     HOME="$home" PATH="$tmp/bin:$PATH" STUB_LOG="$log" AGTERM_ENABLED=1 \
     JIRA_PY="$tmp/jira_stub.py" NEW_WT="$tmp/new-worktree.sh" \
     STUB_SUMMARY="$summary" STUB_STATUS="$status" STUB_URL="$url" STUB_DESCRIPTION="$description" \
@@ -138,24 +139,29 @@ expect_has() {
 typed_command() { head -n 1 "$log/typed" 2>/dev/null; }
 next_line() { grep '^- Next: ' "$log/comment.txt" 2>/dev/null; }
 
-# expected_brief <template>: the template with every placeholder filled, plus the ticket part.
+# expected_brief [extra]: the default template, then the extra file after a blank line, each
+# with every placeholder filled, plus the ticket part.
 expected_brief() {
-  local text k v kv
-  text="$(cat "$1")"
-  for kv in "KEY=$key" "URL=$url" "REPO=$repo" "WORKTREE=$wt" "BRANCH=$branch" \
-            "SESSION_ID=$uuid" "JIRA_PY=$tmp/jira_stub.py" \
-            "REGISTRY=$home/.claude/task-briefs/$key.env" "PROCS=$home/.claude/task-briefs/$key.procs"; do
-    k="${kv%%=*}"; v="${kv#*=}"
-    text="${text//"{{$k}}"/$v}"
+  local f text k v kv sep=""
+  for f in "$default_tpl" "$@"; do
+    printf '%s' "$sep"
+    sep=$'\n'
+    text="$(cat "$f")"
+    for kv in "KEY=$key" "URL=$url" "REPO=$repo" "WORKTREE=$wt" "BRANCH=$branch" \
+              "SESSION_ID=$uuid" "JIRA_PY=$tmp/jira_stub.py" \
+              "REGISTRY=$home/.claude/task-briefs/$key.env" "PROCS=$home/.claude/task-briefs/$key.procs"; do
+      k="${kv%%=*}"; v="${kv#*=}"
+      text="${text//"{{$k}}"/$v}"
+    done
+    printf '%s\n' "$text"
   done
-  printf '%s\n' "$text"
   printf '\n## The ticket (from Jira, %s)\n\n**%s** — status %s\n\n%s\n' \
     "$(date +%F)" "$summary" "$status" "$description"
 }
 
-# expect_brief <label> <template>
+# expect_brief <label> [extra]
 expect_brief() {
-  if diff <(expected_brief "$2") "$brief" >"$tmp/brief.diff" 2>&1; then ok "$1"; else
+  if diff <(expected_brief "${@:2}") "$brief" >"$tmp/brief.diff" 2>&1; then ok "$1"; else
     bad "$1"; sed 's/^/     /' "$tmp/brief.diff" | head -20
   fi
 }
@@ -180,7 +186,7 @@ if [ -n "$uuid" ]; then ok "defaults: TASK_STARTED line"; else bad "defaults: TA
 expect_eq "defaults: typed /planning:make seed" \
   "claude --session-id $uuid -n \"$name\" \"/planning:make $key: $clean. First read the task brief $brief and follow it for the whole task.\"" \
   "$(typed_command)"
-expect_brief "defaults: brief from references/brief-template.md" "$default_tpl"
+expect_brief "defaults: brief from references/brief-template.md"
 expect_eq "defaults: Jira Next line" "$default_next" "$(next_line)"
 expect_eq "defaults: Jira calls get, transition, comment" \
   "$(printf 'get %s\ntransition %s\ncomment %s' "$key" "$key" "$key")" "$(cat "$log/jira.calls")"
@@ -191,31 +197,31 @@ expect_has "defaults: session opened in the worktree" \
 
 run_case overrides \
   TASK_SEED='/security-check example-host --ticket {{KEY}}. First read the task brief {{BRIEF}} and follow it ({{SUMMARY}}).' \
-  TASK_BRIEF_TEMPLATE="$tmp/custom-brief.md" \
+  TASK_BRIEF_EXTRA="$tmp/custom-extra.md" \
   TASK_NEXT='a security report (/security-check). The report summary will be posted here.'
 expect_eq "overrides: exit 0" 0 "$rc"
 expect_eq "overrides: typed custom seed, placeholders filled" \
   "claude --session-id $uuid -n \"$name\" \"/security-check example-host --ticket $key. First read the task brief $brief and follow it ($clean).\"" \
   "$(typed_command)"
-expect_brief "overrides: brief from the custom template" "$tmp/custom-brief.md"
+expect_brief "overrides: default brief, then the extra file, then the ticket" "$tmp/custom-extra.md"
 expect_eq "overrides: Jira Next line" \
   "- Next: a security report (/security-check). The report summary will be posted here." "$(next_line)"
 
 # ---- 3. empty overrides = defaults ------------------------------------------------------------
 
-run_case empty TASK_SEED= TASK_BRIEF_TEMPLATE= TASK_NEXT=
+run_case empty TASK_SEED= TASK_BRIEF_EXTRA= TASK_NEXT=
 expect_eq "empty: exit 0" 0 "$rc"
 expect_has "empty: typed /planning:make seed" "\"/planning:make $key: $clean. First read" "$(typed_command)"
-expect_brief "empty: default brief" "$default_tpl"
+expect_brief "empty: default brief"
 expect_eq "empty: Jira Next line" "$default_next" "$(next_line)"
 
-# ---- 4. missing custom template ---------------------------------------------------------------
+# ---- 4. missing extra brief -------------------------------------------------------------------
 
-run_case missing TASK_BRIEF_TEMPLATE="$tmp/no-such-brief.md"
-expect_eq "missing template: exit 1" 1 "$rc"
-expect_has "missing template: error names the file" \
-  "ERROR: brief template not found at $tmp/no-such-brief.md (TASK_BRIEF_TEMPLATE)" "$out"
-expect_nothing_started "missing template: nothing started"
+run_case missing TASK_BRIEF_EXTRA="$tmp/no-such-extra.md"
+expect_eq "missing extra brief: exit 1" 1 "$rc"
+expect_has "missing extra brief: error names the file" \
+  "ERROR: extra brief not found at $tmp/no-such-extra.md (TASK_BRIEF_EXTRA)" "$out"
+expect_nothing_started "missing extra brief: nothing started"
 
 # ---- 5. seed the typed shell would expand -----------------------------------------------------
 

@@ -48,7 +48,7 @@ The script:
    plus the ticket text) and the registry `~/.claude/task-briefs/<KEY>.env`;
 4. opens an agterm session named `<KEY> <summary>` in the worktree and starts
    `claude --session-id <uuid> -n "<name>" "/planning:make <KEY> … read the brief …"`
-   (another skill can change the prompt and the brief: see "Overrides");
+   (another skill can change the prompt and add to the brief: see "Overrides");
 5. moves the ticket to **In Progress** and posts a "work started" comment: session name, Claude
    session id with the resume command, repo, branch, worktree.
 
@@ -78,23 +78,27 @@ Edit `references/brief-template.md` to change these rules for every future task.
 
 ## Overrides (for other skills)
 
-Another skill can reuse this flow with its own first prompt and brief. `start-task.sh` reads three
-optional env vars. Unset or empty means the default, so a normal new-task run does not change.
+Another skill can reuse this flow with its own first prompt and an extra part of the brief.
+`start-task.sh` reads three optional env vars. Unset or empty means the default, so a normal
+new-task run does not change. The defaults are at the top of `start-task.sh`.
 
-| env | default | the scheduled security-check run sets |
+| env | default | what it changes |
 |---|---|---|
-| `TASK_SEED` | `/planning:make {{KEY}}: {{SUMMARY}}. First read the task brief {{BRIEF}} and follow it for the whole task.` | `/security-check <server> --ticket <KEY> (first read the task brief {{BRIEF}} and follow it for the whole run)` — the due script writes the real key; only `{{BRIEF}}` is left for this script |
-| `TASK_BRIEF_TEMPLATE` | `references/brief-template.md` | `security-check/references/run-brief.md` |
-| `TASK_NEXT` | `an implementation plan (planning:make). The plan summary will be posted here.` | `a security report (/security-check). The report summary will be posted here.` |
+| `TASK_SEED` | the `/planning:make` prompt | the first prompt of the new Claude |
+| `TASK_BRIEF_EXTRA` | none | a file added to the end of the brief, after `references/brief-template.md` and before the ticket text |
+| `TASK_NEXT` | "an implementation plan …" | the text after `- Next: ` in the "work started" Jira comment |
 
-- `TASK_SEED` is the first prompt of the new Claude. `{{KEY}}`, `{{SUMMARY}}` and `{{BRIEF}}` (the
-  brief's path) are filled in; `{{SUMMARY}}` last, so text from Jira is never read as a
-  placeholder. It is typed into a shell inside double quotes, so a seed with `"`, `$`, a
-  backtick, `\`, `!` or a line break is refused before anything starts. The Jira summary loses
-  the same characters (and `'`) before it goes into the typed command.
-- `TASK_BRIEF_TEMPLATE` gets the same `{{…}}` placeholders as the default template. A missing file
-  is refused before the worktree or the session is created.
-- `TASK_NEXT` is the text after `- Next: ` in the "work started" Jira comment.
+- `TASK_SEED`: `{{KEY}}`, `{{SUMMARY}}` and `{{BRIEF}}` (the brief's path) are filled in;
+  `{{SUMMARY}}` last, so text from Jira is never read as a placeholder. The seed is typed into a
+  shell inside double quotes, so a seed with `"`, `$`, a backtick, `\`, `!` or a line break is
+  refused before anything starts. The Jira summary loses the same characters (and `'`) before it
+  goes into the typed command.
+- `TASK_BRIEF_EXTRA` gets the same `{{…}}` placeholders as the template. The rules of the default
+  brief stay; the extra part says where its task differs (for example: no plan). A missing file is
+  refused before the worktree or the session is created.
+- The `security-check` skill's scheduled run sets all three: its own command as the seed, its
+  `references/run-brief.md` as the extra part, and a "security report" Next line. The exact
+  values are in its `scripts/security-check-due.sh`.
 
 Test (stubs only: no agterm session, no Jira call, a temp HOME):
 `bash ~/.claude/skills/new-task/tests/start_task_test.sh`

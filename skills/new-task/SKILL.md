@@ -47,7 +47,8 @@ The script:
 3. writes the task brief `~/.claude/task-briefs/<KEY>.md` (from `references/brief-template.md`
    plus the ticket text) and the registry `~/.claude/task-briefs/<KEY>.env`;
 4. opens an agterm session named `<KEY> <summary>` in the worktree and starts
-   `claude --session-id <uuid> -n "<name>" "/planning:make <KEY> … read the brief …"`;
+   `claude --session-id <uuid> -n "<name>" "/planning:make <KEY> … read the brief …"`
+   (another skill can change the prompt and the brief: see "Overrides");
 5. moves the ticket to **In Progress** and posts a "work started" comment: session name, Claude
    session id with the resume command, repo, branch, worktree.
 
@@ -74,6 +75,27 @@ The brief tells the task session to:
 - say "ready for /task-cleanup" when merged and deployed, and not clean up on its own.
 
 Edit `references/brief-template.md` to change these rules for every future task.
+
+## Overrides (for other skills)
+
+Another skill can reuse this flow with its own first prompt and brief. `start-task.sh` reads three
+optional env vars. Unset or empty means the default, so a normal new-task run does not change.
+
+| env | default | the scheduled security-check run sets |
+|---|---|---|
+| `TASK_SEED` | `/planning:make {{KEY}}: {{SUMMARY}}. First read the task brief {{BRIEF}} and follow it for the whole task.` | `/security-check <server> --ticket {{KEY}}. First read the task brief {{BRIEF}} and follow it for the whole run.` |
+| `TASK_BRIEF_TEMPLATE` | `references/brief-template.md` | `security-check/references/run-brief.md` |
+| `TASK_NEXT` | `an implementation plan (planning:make). The plan summary will be posted here.` | `a security report (/security-check). The report summary will be posted here.` |
+
+- `TASK_SEED` is the first prompt of the new Claude. `{{KEY}}`, `{{SUMMARY}}` and `{{BRIEF}}` (the
+  brief's path) are filled in. It is typed into a shell inside double quotes, so a seed with
+  `"`, `$`, a backtick, `\`, `!` or a line break is refused before anything starts.
+- `TASK_BRIEF_TEMPLATE` gets the same `{{…}}` placeholders as the default template. A missing file
+  is refused before the worktree or the session is created.
+- `TASK_NEXT` is the text after `- Next: ` in the "work started" Jira comment.
+
+Test (stubs only: no agterm session, no Jira call, a temp HOME):
+`bash ~/.claude/skills/new-task/tests/start_task_test.sh`
 
 ## Several tickets at once
 

@@ -39,6 +39,8 @@ In this file, `$SKILL` means `~/.claude/skills/security-check`.
 | `references/report-template.md` | the report and the Jira summary. |
 | `references/profile-example.yml` | a profile to copy into a project. |
 | `references/run-brief.md` | the brief of a scheduled run (one Jira ticket, one worktree, one session). |
+| `scripts/security-check-due.sh` | the daily call of the schedule: when a run is due, it creates (or reuses) the Jira ticket and starts the run's session. See "Schedule". |
+| `scripts/install-launchd.sh` | installs the daily launchd job for one server (macOS). See "Schedule". |
 | `tests/run_all.sh` | every test of this skill. Run it after any change here. |
 
 ## Step 0 — read the profile
@@ -217,8 +219,42 @@ in the project: a PR that changes the pins or configs, with "Deploy steps" (the 
 the restart) and "After deploy" (the check, the rollback). Running it on the server needs the
 user's explicit go for that PR.
 
-## Scheduled runs
+## Schedule
 
-A scheduled run gets its own Jira ticket, worktree and session, and starts with
+A launchd job on the Mac starts a run every 14 days. A scheduled run gets its own Jira ticket,
+worktree and agterm session (the `new-task` flow), and starts with
 `/security-check <server> --ticket <KEY>`. Its brief is `references/run-brief.md`: it adds the PR
 for the report, the Jira events and the question to the user. The read-only rule is the same.
+
+Install it once per server. `<repo>` is the project's **main checkout**, not a worktree
+(worktrees get deleted):
+
+```bash
+bash $SKILL/scripts/install-launchd.sh <repo> <server> <jira_project>
+```
+
+- It writes `~/Library/LaunchAgents/local.security-check.<server>.plist` (every day at 10:00; a
+  missed time runs at wake) and loads it. Running it again replaces the job.
+- Every day the job runs `scripts/security-check-due.sh <repo> <server> <jira_project>`:
+  - less than 14 days since the last run → nothing;
+  - agterm is not running → a desktop notification; the next day tries again;
+  - else: a new Jira ticket (type Task, label `security`), or the ticket of a failed try, then
+    `start-task.sh` of the `new-task` skill opens the session.
+  - A lock stops a second call at the same time. A failed start keeps the ticket for the next
+    call, so a failure never makes a second ticket.
+- It needs: agterm, `jq`, `python3`, `git`, the `jira-tickets` skill's `jira.py` and the
+  `new-task` skill with the `TASK_SEED` override.
+
+| what | command or path |
+|---|---|
+| is it loaded | `launchctl print gui/$(id -u)/local.security-check.<server>` |
+| stop it | `launchctl bootout gui/$(id -u)/local.security-check.<server>` |
+| remove it | stop it, then delete `~/Library/LaunchAgents/local.security-check.<server>.plist` |
+| log | `~/Library/Logs/security-check-<server>.log` |
+| state | `~/.local/state/security-check/<server>.state`: `LAST_RUN`, `LAST_KEY`, `PENDING_KEY` |
+| what the next call would do | `DRY_RUN=1 bash $SKILL/scripts/security-check-due.sh <repo> <server> <jira_project>` |
+| run now, before the 14 days | `SECURITY_CHECK_INTERVAL_DAYS=0 bash $SKILL/scripts/security-check-due.sh <repo> <server> <jira_project>` |
+| test the two scripts (stubs only) | `bash $SKILL/tests/due_test.sh` |
+
+The other overrides of `security-check-due.sh` (`START_TASK`, `JIRA_PY`, `SECURITY_CHECK_BRIEF`,
+`SECURITY_CHECK_STATE_DIR`, …) are listed at the top of the script.

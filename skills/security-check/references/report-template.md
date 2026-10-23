@@ -72,6 +72,7 @@ the pm2 restart, the boot unit, the check, the rollback.>
 | component | version | why not | how to check by hand |
 |---|---|---|---|
 | <Go binary / image base OS / a source that was down> | <version> | <reason> | <page or command> |
+| <inventory field from `filtered.dropped`> | — | <N values left out: wrong shape, or over the cap (`filtered.truncated`)> | for the user, not this skill: look at that field on the server |
 
 ## Reboot needed
 

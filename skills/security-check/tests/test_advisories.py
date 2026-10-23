@@ -653,7 +653,7 @@ class TestUsn(Base):
         data = self.run_report("usn", web=web)
         self.assertEqual(sorted(web.packages_asked()), ["curl", "nginx", "openssl", "openssl"])
         self.assertEqual([(p["package"], p["origin"]) for p in data["vendor"]],
-                         [("clickhouse-server", None), ("docker-ce", "Docker CE")])
+                         [("clickhouse-server", None), ("docker-ce", "Docker_CE")])
         self.assertEqual([k["source"] for k in data["kernel"]], ["linux-meta"])
         self.assertTrue(any("kernel" in n for n in data["notes"]))
 

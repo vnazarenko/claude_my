@@ -116,7 +116,8 @@ esac
 
 # A login shell, then type the claude command: `--command` gets a minimal PATH and often
 # cannot find claude (same reason as parallel-issues/launch-agterm-session.sh).
-sid="$(agtermctl session new --cwd "$wt" "${ws_args[@]}" --name "$name" --json | jq -r '.result.id // empty')"
+# ${ws_args[@]+...}: bash 3.2 (macOS /bin/bash) calls an empty array unbound under set -u.
+sid="$(agtermctl session new --cwd "$wt" ${ws_args[@]+"${ws_args[@]}"} --name "$name" --json | jq -r '.result.id // empty')"
 [ -n "$sid" ] || die "'agtermctl session new' returned no id"
 
 cat > "$reg" <<EOF

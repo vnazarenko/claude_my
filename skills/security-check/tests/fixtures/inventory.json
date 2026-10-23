@@ -18,7 +18,7 @@
     {"package": "linux-generic", "source": "linux-meta", "installed": "6.8.0.45.45", "candidate": "6.8.0.47.47",
      "origin": "Ubuntu", "archives": ["noble-updates", "noble-security"]},
     {"package": "docker-ce", "source": "docker-ce", "installed": "5:27.3.1-1~ubuntu.24.04~noble",
-     "candidate": "5:27.3.2-1~ubuntu.24.04~noble", "origin": "Docker CE", "archives": ["noble"]},
+     "candidate": "5:27.3.2-1~ubuntu.24.04~noble", "origin": "Docker_CE", "archives": ["noble"]},
     {"package": "clickhouse-server", "source": "clickhouse-server", "installed": "24.8.1.1",
      "candidate": "24.8.2.1", "origin": null, "archives": ["stable"]}
   ]},
@@ -43,7 +43,7 @@
                "docker": "5:27.3.1-1~ubuntu.24.04~noble", "containerd": null, "openssh": "1:9.6p1-3ubuntu13.5",
                "openssl": "3.0.13-0ubuntu3.4"},
   "ruby": ["3.4.7"], "python3": "3.12.3-1ubuntu0.8",
-  "docker_images": [{"image": "example/app:1.0", "id": "sha256:0000000000000000000000000000000000000000000000000000000000000001", "created": "2026-01-01 00:00:00 +0000 UTC"}],
+  "docker_images": [{"image": "example/app:1.0", "id": "sha256:0000000000000000000000000000000000000000000000000000000000000001", "created": "2026-01-01T00:00:00+0000"}],
   "running_deleted_exe": [],
   "revisions": {"/srv/app/current/REVISION": "0123456789abcdef0123456789abcdef01234567"}
 }

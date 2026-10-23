@@ -152,7 +152,7 @@ in `usn.vendor[]`. Check the vendor page instead:
 
 ## Docker engine and containerd (vendor apt repo)
 
-- `origin` `Docker CE` → in `usn.vendor[]`.
+- `origin` `Docker_CE` → in `usn.vendor[]`.
 - Release notes: `https://docs.docker.com/engine/release-notes/`. Advisories:
   `https://github.com/moby/moby/security/advisories`,
   `https://github.com/containerd/containerd/security/advisories`,

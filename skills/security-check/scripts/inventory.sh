@@ -11,18 +11,23 @@
 # The server runs remote-inventory.sh (read-only; see its header). This side:
 # - turns off agent forwarding, X11 and every port forward, and does not reuse a shared
 #   connection, so the server gets no way back to the user's keys
-# - accepts only absolute paths made of plain characters, without "..", because the
-#   remote shell reads the arguments again
+# - accepts only absolute paths made of plain characters, without "..", at most 128 characters,
+#   because the remote shell reads the arguments again
 # - stops a connection that hangs (ServerAlive: about 1 minute without an answer)
-# - treats the answer as untrusted data, because other users on the server can write the files
-#   it comes from: it must be valid JSON; a revision that is not a git sha becomes null; every
-#   other string keeps only plain characters (A-Z a-z 0-9 . _ : + ~ / @ * , - and space; others
-#   become "?") and at most 200 of them
+# - treats the answer as untrusted data: other users on the server can name folders and run
+#   their own binaries, and the server itself can lie. So no free text from the server gets out:
+#   - the answer must be one JSON object, at most MAX_BYTES; else it fails
+#   - only the known fields are kept, each in its expected shape (a version, a package name, a git
+#     sha, a number, a date, a plain path without spaces, ...); a value of another shape is left
+#     out and counted; a pm2 home or a revision file must be one this call asked for
+#   - each list has a cap; entries over it are left out and counted, and filtered.truncated is true
+#   - "filtered.dropped" gives the counts per field, added to the counts the server sent
 # - sets "host" to <ssh_host>
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd -P)"
 remote="$here/remote-inventory.sh"
+MAX_BYTES=2000000   # the raw answer. A real one is far smaller; the caps keep it under ~1.5 MB.
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 usage() { die "usage: inventory.sh <ssh_host> [--pm2-home DIR ...] [--revision-file FILE ...]"; }
@@ -36,6 +41,8 @@ command -v jq >/dev/null 2>&1 || die "jq not on PATH"
 [ -f "$remote" ] || die "remote-inventory.sh not found next to $0"
 
 args=()
+homes=""
+rev_files=""
 while [ $# -gt 0 ]; do
   [ "$1" = "--pm2-home" ] || [ "$1" = "--revision-file" ] || die "unknown argument: $1"
   [ $# -ge 2 ] || die "$1 needs a path"
@@ -43,30 +50,116 @@ while [ $# -gt 0 ]; do
   [[ $p == /* ]] || die "$1 must be an absolute path: '$p'"
   [[ $p != *..* ]] || die "$1 must not contain '..': '$p'"
   [[ $p =~ ^[A-Za-z0-9_./@+-]+$ ]] || die "$1 has characters that are not allowed: '$p'"
+  [ ${#p} -le 128 ] || die "$1 is longer than 128 characters: '$p'"
+  if [ "$1" = "--pm2-home" ]; then homes+="$p"$'\n'; else rev_files+="$p"$'\n'; fi
   args+=("$1" "$p")
   shift 2
 done
 
+# head -c: never hold more than MAX_BYTES + 1 of the answer. ssh's own exit code is kept.
 out=$(ssh -a -x -T \
   -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes \
   -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
   -o ControlMaster=no -o ControlPath=none -o PermitLocalCommand=no \
-  -- "$host" bash -s -- ${args[@]+"${args[@]}"} < "$remote")
+  -- "$host" bash -s -- ${args[@]+"${args[@]}"} < "$remote" | head -c $((MAX_BYTES + 1)); exit "${PIPESTATUS[0]}")
 rc=$?
+[ ${#out} -le $MAX_BYTES ] || die "$host returned more than $MAX_BYTES bytes: refused"
 [ "$rc" -eq 0 ] || die "inventory on $host failed (ssh exit $rc)"
 
-# shellcheck disable=SC2016 # $host is a jq variable
+# The same shapes as in remote-inventory.sh.
+# shellcheck disable=SC2016 # $host, $homes and $rev_files are jq variables
 clean='
-  def plain: if type == "string" then gsub("[^A-Za-z0-9._:+~/@*, -]"; "?") | .[0:200] else . end;
-  def walk_plain:
-    if type == "object" then with_entries(.key |= plain | .value |= walk_plain)
-    elif type == "array" then map(walk_plain)
-    else plain end;
-  if type != "object" then error("not an object") else . end
-  | .revisions |= (if type == "object"
-                   then with_entries(.value |= (if type == "string" and test("^[0-9a-f]{7,40}$") then . else null end))
-                   else {} end)
-  | walk_plain
-  | .host = $host'
-jq -e --arg host "$host" "$clean" <<< "$out" 2>/dev/null \
-  || die "$host did not return a valid inventory (JSON object)"
+  def VER: "^v?([0-9]{1,5}:)?[0-9][A-Za-z0-9.+~-]{0,63}$";
+  def SEMVER: "^[0-9]{1,3}\\.[0-9]{1,4}\\.[0-9]{1,4}$";
+  def RUBY: "^[0-9]{1,2}\\.[0-9]{1,2}\\.[0-9]{1,3}(-[a-z]{1,8}[0-9]{0,4})?$";
+  def PKG: "^[a-z0-9][a-z0-9.+-]{1,63}$";
+  def WORD: "^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$";
+  def ALIAS: "^(v?[0-9]{1,3}(\\.[0-9]{1,4}){0,2}|lts/(\\*|-?[0-9]{1,2}|[a-z]{2,12})|node|stable|unstable|system|iojs)$";
+  def IMAGE: "^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,127}$";
+  def IMAGE_ID: "^(sha256:)?[0-9a-f]{12,64}$";
+  def NVM: "^(/root/\\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\\.nvm|/usr/local/nvm|/opt/nvm)$";
+  def NVM_NODE: "^(/root/\\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\\.nvm|/usr/local/nvm|/opt/nvm)/versions/node/v[0-9]{1,3}\\.[0-9]{1,4}\\.[0-9]{1,4}/bin/node$";
+  def SHA: "^[0-9a-f]{7,40}$";
+  def DATE: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{4})$";
+
+  def o: if type == "object" then . else {} end;
+  # good($t): the value has the shape $t: a regex above, or "num", "bool", "path", "node_path".
+  def good($t):
+    if $t == "num" then type == "number" and . >= 0 and . <= 1000000000
+    elif $t == "bool" then type == "boolean"
+    elif $t == "path" then type == "string" and length <= 128 and test("^/[A-Za-z0-9_./@+-]+$") and (contains("..") | not)
+    elif $t == "node_path" then good("path") and (if contains("/versions/node/") then test(NVM_NODE) else true end)
+    else type == "string" and test($t) end;
+  # chk($t): {v: the value, or null; b: 1 when a value of the wrong shape was left out}.
+  def chk($t): if . == null then {v: null, b: 0} elif good($t) then {v: ., b: 0} else {v: null, b: 1} end;
+  # obj($spec): exactly the keys of $spec, each value checked. Other keys are left out.
+  def obj($spec):
+    o as $o
+    | reduce ($spec | to_entries[]) as $f ({v: {}, b: 0};
+        ($o[$f.key] | chk($f.value)) as $c | .v[$f.key] = $c.v | .b += $c.b);
+  # entry($spec; $key): obj($spec); the whole entry is left out when $key is not good.
+  def entry($spec; $key):
+    if type != "object" then {v: null, b: 0}
+    else obj($spec) | if .v[$key] == null then {v: null, b: 0} else . end end;
+  # list($max; f): an array; f gives {v, b} per entry (v null: left out); at most $max kept.
+  # {v: the kept entries, b: entries and values left out, t: true when over $max}
+  def list($max; f):
+    (if type == "array" then . else [] end) as $in
+    | [$in[] | f | select(.v != null)] as $ok
+    | $ok[:$max] as $kept
+    | {v: [$kept[].v], b: (($in | length) - ($kept | length) + ([$kept[].b] | add // 0)),
+       t: (($ok | length) > $max)};
+
+  def apt_e:
+    if type != "object" then {v: null, b: 0}
+    else entry({package: PKG, source: PKG, installed: VER, candidate: VER, origin: WORD}; "package") as $e
+      | (.archives | list(8; chk(WORD))) as $a
+      | if $e.v == null then $e else {v: ($e.v + {archives: $a.v}), b: ($e.b + $a.b)} end
+    end;
+  def revs($files):
+    if type != "object" then {v: {}, b: 0}
+    else [to_entries[] | select(.key | IN($files[])) | {key, c: (.value | chk(SHA))}] as $ok
+      | {v: ($ok | map({key, value: .c.v}) | from_entries),
+         b: (length - ($ok | length) + ([$ok[].c.b] | add // 0))}
+    end;
+
+  if length != 1 or (.[0] | type) != "object" then error("not one JSON object") else .[0] end
+  | . as $r
+  | ($homes | split("\n") | map(select(length > 0))) as $H
+  | ($rev_files | split("\n") | map(select(length > 0))) as $R
+  | ($r.collected_at | chk(DATE)) as $ca
+  | ($r.os | obj({id: WORD, version_id: WORD, codename: WORD, kernel_running: VER,
+                  kernel_newest_installed: VER, reboot_required: "bool"})) as $os
+  | ($r.os | o | .reboot_required_pkgs | list(50; chk(PKG))) as $rpk
+  | ($r.apt | o | .lists_age_hours | chk("num")) as $age
+  | ($r.apt | o | .upgradable | if . == null then {v: null, b: 0, t: false} else list(2000; apt_e) end) as $upg
+  | ($r.node | list(50; entry({path: "node_path", version: VER, running: "num", container: "bool"}; "path"))) as $node
+  | ($r.nvm | list(50; entry({nvm_dir: NVM, default_alias: ALIAS}; "nvm_dir"))) as $nvm
+  | ($r.pm2 | list(20; entry({pm2_home: "path", pid_file: "bool", daemon_running: "bool",
+                              daemon_node_path: "node_path", daemon_node: VER, pm2_version: SEMVER}; "pm2_home")
+                      | if .v != null and (.v.pm2_home | IN($H[]) | not) then {v: null, b: 0} else . end)) as $pm2
+  | ($r.services | obj({nginx: VER, postgresql: VER, redis: VER, clickhouse: VER, docker: VER,
+                        containerd: VER, openssh: VER, openssl: VER})) as $svc
+  | ($r.ruby | list(50; chk(RUBY))) as $ruby
+  | ($r.python3 | chk(VER)) as $py
+  | ($r.docker_images | if . == null then {v: null, b: 0, t: false}
+                        else list(50; entry({image: IMAGE, id: IMAGE_ID, created: DATE}; "image")) end) as $img
+  | ($r.running_deleted_exe | list(50; chk("path"))) as $del
+  | ($r.revisions | revs($R)) as $rev
+  | ({collected_at: $ca.b, os: $os.b, reboot_required_pkgs: $rpk.b, apt: ($age.b + $upg.b),
+      node: $node.b, nvm: $nvm.b, pm2: $pm2.b, services: $svc.b, ruby: $ruby.b, python3: $py.b,
+      docker_images: $img.b, running_deleted_exe: $del.b, revisions: $rev.b, dpkg: 0}) as $here
+  | ($r.filtered | o) as $rf
+  | ($rf.dropped | o) as $there
+  | {collected_at: $ca.v, host: $host,
+     os: ($os.v + {reboot_required_pkgs: $rpk.v}),
+     apt: {lists_age_hours: $age.v, upgradable: $upg.v},
+     node: $node.v, nvm: $nvm.v, pm2: $pm2.v, services: $svc.v, ruby: $ruby.v, python3: $py.v,
+     docker_images: $img.v, running_deleted_exe: $del.v, revisions: $rev.v,
+     filtered: {
+       truncated: ($rf.truncated == true or ([$rpk, $upg, $node, $nvm, $pm2, $ruby, $img, $del] | any(.t))),
+       dropped: (reduce ($here | keys[]) as $k ({};
+         ($here[$k] + ($there[$k] | if good("num") then floor else 0 end)) as $n
+         | if $n > 0 then .[$k] = $n else . end))}}'
+jq -e -s --arg host "$host" --arg homes "$homes" --arg rev_files "$rev_files" "$clean" <<< "$out" 2>/dev/null \
+  || die "$host did not return a valid inventory (one JSON object)"

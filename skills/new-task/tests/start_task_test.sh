@@ -14,6 +14,7 @@
 # 4. TASK_BRIEF_TEMPLATE names a missing file → clear error; no worktree, no session, no Jira
 # 5. TASK_SEED with a character the typed shell would expand → clear error; nothing started
 # 6. an open agterm session of the same ticket blocks the start; one of PROJ-1234 does not
+# 7. macOS /bin/bash (3.2), no caller session (AGTERM_SESSION_ID unset): the way launchd starts it
 #
 # The Jira summary holds " $ ! and a {{BRIEF}}: they must be dropped, or stay literal.
 set -uo pipefail
@@ -101,6 +102,7 @@ EOF
 # ---- helpers ----------------------------------------------------------------------------------
 
 out="" rc=0 home="" log="" brief="" uuid="" branch=""
+shell_bin=bash   # the bash that runs start-task.sh; case 7 uses /bin/bash
 
 # run_case <name> [VAR=value ...]: start-task.sh in a fresh HOME, log dir and repo.
 run_case() {
@@ -113,7 +115,7 @@ run_case() {
     HOME="$home" PATH="$tmp/bin:$PATH" STUB_LOG="$log" AGTERM_ENABLED=1 \
     JIRA_PY="$tmp/jira_stub.py" NEW_WT="$tmp/new-worktree.sh" \
     STUB_SUMMARY="$summary" STUB_STATUS="$status" STUB_URL="$url" STUB_DESCRIPTION="$description" \
-    "$@" bash "$script" "$repo" "$key" 2>&1)"
+    "$@" "$shell_bin" "$script" "$repo" "$key" 2>&1)"
   rc=$?
   brief="$home/.claude/task-briefs/$key.md"
   uuid="$(sed -n 's/^TASK_STARTED .* claude=\([^ ]*\) .*/\1/p' <<<"$out")"
@@ -239,6 +241,25 @@ run_case same STUB_TREE="$(tree_with "$key Earlier try")"
 expect_eq "open session of the same ticket: exit 1" 1 "$rc"
 expect_has "open session of the same ticket: says so" "an agterm session for $key already exists (sid=SID-9)" "$out"
 expect_nothing_started "open session of the same ticket: nothing started"
+
+# ---- 7. macOS /bin/bash, no caller session ---------------------------------------------------
+
+# launchd runs the due script with /bin/bash (3.2 on macOS) and no AGTERM_SESSION_ID. bash 3.2
+# calls an empty array "unbound" under set -u, so an unguarded "${arr[@]}" stops the script.
+if [ -x /bin/bash ]; then
+  shell_bin=/bin/bash
+  run_case sysbash
+  shell_bin=bash
+  expect_eq "/bin/bash: exit 0" 0 "$rc"
+  if [ -n "$uuid" ]; then ok "/bin/bash: TASK_STARTED line"; else bad "/bin/bash: TASK_STARTED line"; echo "$out"; fi
+  expect_has "/bin/bash: session opened without --after" \
+    "session new --cwd $wt --name $name --json" "$(cat "$log/agtermctl.calls")"
+  expect_eq "/bin/bash: typed /planning:make seed" \
+    "claude --session-id $uuid -n \"$name\" \"/planning:make $key: $clean. First read the task brief $brief and follow it for the whole task.\"" \
+    "$(typed_command)"
+else
+  echo "WARN: no /bin/bash - skipped the system bash case"
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then

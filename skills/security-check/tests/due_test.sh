@@ -18,7 +18,7 @@
 #   5. agterm down → one notification, state unchanged
 #   6. lock held → exit 0, nothing done; stale lock → removed, run goes on; two calls at
 #      once → one ticket
-#   7. DRY_RUN=1 → prints the actions, changes nothing
+#   7. DRY_RUN=1 → prints the actions, changes nothing; it may use a worktree (a real run may not)
 #   8. errors before the ticket (old start-task.sh, no brief, no profile, no jira.py, bad
 #      arguments, broken state) and Jira errors → no ticket or no session, state unchanged
 #   9. the whole chain with the real new-task start-task.sh: the typed /security-check command
@@ -420,6 +420,39 @@ run_due DRY_RUN=1 STUB_AGTERM_DOWN=1
 expect_eq "dry run, agterm down: exit 0" 0 "$rc"
 expect_has "dry run, agterm down: prints the notification" "DRY_RUN: would notify: Security check of $server is due" "$out"
 expect_nothing_done "dry run, agterm down: no notification"
+
+# A real worktree of a repo whose commit holds the profile: a dry run uses it, a real run refuses it.
+wt_src="$tmp/code/wtsrc"
+wt="$tmp/code/wtreal"
+mkdir -p "$wt_src/infra/security-check"
+echo "server: $server" > "$wt_src/infra/security-check/$server.yml"
+if git -C "$wt_src" init -q \
+  && git -C "$wt_src" add -A \
+  && git -C "$wt_src" -c user.name=test -c user.email=test@example.invalid -c commit.gpgsign=false \
+       -c core.hooksPath=/dev/null commit -q --no-verify -m profile \
+  && git -C "$wt_src" -c core.hooksPath=/dev/null worktree add -q "$wt" 2>/dev/null \
+  && [ -f "$wt/.git" ]; then
+  new_case drywt
+  arg_repo="$wt"
+  run_due DRY_RUN=1
+  expect_eq "dry run, a worktree: exit 0" 0 "$rc"
+  expect_has "dry run, a worktree: warns" "'$wt' is a worktree, not the main checkout: a real run refuses it" "$out"
+  expect_has "dry run, a worktree: ticket action" "DRY_RUN: would create a ticket: python3 $tmp/jira_stub.py create --project PROJ" "$out"
+  expect_has "dry run, a worktree: session action" "bash $home/.claude/skills/new-task/scripts/start-task.sh $wt PROJ-NEW" "$out"
+  expect_nothing_done "dry run, a worktree: nothing done"
+  if [ -e "$home/.local/state" ]; then bad "dry run, a worktree: no state folder"; else ok "dry run, a worktree: no state folder"; fi
+
+  new_case realwt
+  arg_repo="$wt"
+  run_due
+  expect_eq "real run, a worktree: exit 2" 2 "$rc"
+  expect_has "real run, a worktree: says why" "'$wt' is not the main checkout of a git repo" "$out"
+  expect_eq "real run, a worktree: no ticket" 0 "$(count jira)"
+  expect_eq "real run, a worktree: no start-task.sh" 0 "$(count start '^ARGS=')"
+  if [ -e "$home/.local/state" ]; then bad "real run, a worktree: no state"; else ok "real run, a worktree: no state"; fi
+else
+  bad "dry run, a worktree: could not make a git worktree for the test"
+fi
 
 # ---- 8. errors --------------------------------------------------------------------------------
 

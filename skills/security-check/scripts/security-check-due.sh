@@ -28,7 +28,8 @@
 # PENDING_KEY. It is parsed, never sourced. The lock is the folder <state dir>/<server>.lock.
 #
 # Environment (all optional):
-#   DRY_RUN=1                     print what would happen: no lock, no ticket, no session, no state
+#   DRY_RUN=1                     print what would happen: no lock, no ticket, no session, no state.
+#                                 <repo> may be a worktree here (a warning says a real run refuses it)
 #   SECURITY_CHECK_INTERVAL_DAYS  days between runs. Default 14; 0 = due on every call
 #   SECURITY_CHECK_STATE_DIR      default ~/.local/state/security-check
 #   SECURITY_CHECK_TODAY          today as YYYY-MM-DD (for tests). Default: the local date
@@ -125,7 +126,15 @@ interval=$((10#$interval))
 today="${SECURITY_CHECK_TODAY:-$(date +%F)}"
 { valid_date "$today" && days_between "$today" "$today" >/dev/null; } || fail 2 "SECURITY_CHECK_TODAY must be YYYY-MM-DD"
 repo="$(cd "$repo_in" 2>/dev/null && pwd -P)" || fail 2 "repo '$repo_in' does not exist"
-[ -d "$repo/.git" ] || fail 2 "'$repo' is not the main checkout of a git repo"
+# A worktree gets deleted after its PR, so a real run refuses it. A dry run only prints, so it
+# may use one: to try a profile or a skill change before it is merged.
+if [ ! -d "$repo/.git" ]; then
+  if [ "$dry" = 1 ] && [ -f "$repo/.git" ]; then
+    log "WARN: '$repo' is a worktree, not the main checkout: a real run refuses it"
+  else
+    fail 2 "'$repo' is not the main checkout of a git repo"
+  fi
+fi
 for c in "$AGTERMCTL" jq python3 git; do
   command -v "$c" >/dev/null 2>&1 || fail 1 "$c not on PATH"
 done

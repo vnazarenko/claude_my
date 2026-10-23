@@ -252,7 +252,7 @@ bash $SKILL/scripts/install-launchd.sh <repo> <server> <jira_project>
 | remove it | stop it, then delete `~/Library/LaunchAgents/local.security-check.<server>.plist` |
 | log | `~/Library/Logs/security-check-<server>.log` |
 | state | `~/.local/state/security-check/<server>.state`: `LAST_RUN`, `LAST_KEY`, `PENDING_KEY` |
-| what the next call would do | `DRY_RUN=1 bash $SKILL/scripts/security-check-due.sh <repo> <server> <jira_project>` |
+| what the next call would do (`<repo>` may be a worktree here) | `DRY_RUN=1 bash $SKILL/scripts/security-check-due.sh <repo> <server> <jira_project>` |
 | run now, before the 14 days | `SECURITY_CHECK_INTERVAL_DAYS=0 bash $SKILL/scripts/security-check-due.sh <repo> <server> <jira_project>` |
 | test the two scripts (stubs only) | `bash $SKILL/tests/due_test.sh` |
 

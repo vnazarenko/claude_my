@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run every test of the security-check skill: the shell linter on all scripts,
-# every tests/*_test.sh, and every tests/test_*.py (unittest).
+# the skill lint (skill_lint.sh), every tests/*_test.sh, and every tests/test_*.py (unittest).
 #
 # Usage:
 #   run_all.sh
@@ -21,6 +21,9 @@ if command -v shellcheck >/dev/null 2>&1; then
 else
   echo "WARN: shellcheck not found - skipped"
 fi
+
+echo "== skill_lint.sh"
+bash "$here/skill_lint.sh" "$skill" || failed+=("skill_lint.sh")
 
 for t in "$here"/*_test.sh; do
   [ -e "$t" ] || continue

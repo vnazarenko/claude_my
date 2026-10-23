@@ -1,0 +1,32 @@
+# Profile of one server for the security-check skill. Claude reads it; no script does.
+#
+# Copy it to <project repo>/infra/security-check/<server>.yml and fill it in.
+# It lives in the project's repo, not in the skill. Still: no IPs, passwords or tokens here.
+# Every key is described in SKILL.md, Step 0.
+
+server: example-host            # the name in /security-check <server> and in report file names
+ssh_host: example-host          # an alias from ~/.ssh/config (or user@host); no IPs
+jira_project: PROJ              # Jira project for a new ticket when there is no --ticket
+report_dir: docs/security       # reports go to <report_dir>/<YYYY-MM-DD>-<server>.md
+since_days: 14                  # "new" = published in the last 14 days
+
+ours:                           # apps we own: the check may propose updates for them
+  - name: example-web
+    runtime: node
+    node_pin: [web/.nvmrc, web/config/deploy.rb]   # files in this repo that pin the Node version
+    pm2_home: /srv/app/.pm2                        # a PM2_HOME on the server (absolute)
+    revision_file: /srv/app/current/REVISION       # the deploy's REVISION file on the server
+    repo: .                                        # the app's git repo: "." = this repo
+    lockfile: web/pnpm-lock.yaml                   # path inside that repo
+
+  - name: example-api
+    runtime: ruby
+    revision_file: /srv/api/current/REVISION
+    repo: ../example-api                           # a path from this repo's root
+    lockfile: Gemfile.lock
+
+  - name: example-search
+    image: vendor/search:1.2                       # a Docker image we run
+
+not_ours:                       # on the server, but someone else owns it: reported, never proposed
+  - Node apps of another team under /srv/other (owner: other team)

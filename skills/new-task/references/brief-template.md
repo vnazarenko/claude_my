@@ -62,7 +62,7 @@ such thing to `{{PROCS}}`:
 <what>|<how to find it>|<how to stop it>
 rails server :3099|lsof -ti tcp:3099|kill $(lsof -ti tcp:3099)
 test db|psql -lqt | grep parsalytics_test7|dropdb parsalytics_test7
-prod screen|ssh investviews screen -ls | grep kan297|ssh investviews screen -S kan297 -X quit
+prod screen|ssh prod-host screen -ls | grep kan297|ssh prod-host screen -S kan297 -X quit
 ```
 
 Prefer `run_in_background` for servers and watchers, so they stay children of this session.

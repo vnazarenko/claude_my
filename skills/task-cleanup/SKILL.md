@@ -150,7 +150,7 @@ that mount the worktree. It never touches the Claude process itself or the agter
 Then go through the `recorded in …procs` lines one by one. Those are things the script cannot see:
 a remote `screen`, a test database, a tunnel. Check each with its find command and stop it with
 its stop command. **On a production host, show the user what you will stop and ask first** — a
-`screen` on `investviews` may be a long import that must finish.
+`screen` on a production host may be a long import that must finish.
 
 Also stop what this session itself runs in the background: `TaskStop` every background task and
 Monitor you started, and `CronDelete` any cron you created.

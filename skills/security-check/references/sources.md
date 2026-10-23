@@ -41,6 +41,7 @@ A binary that is installed but does not run is still listed when it is used by a
 | Where | `advisories.py node` (nodejs.org release index + release schedule) |
 | CVEs and severity | the release post: `https://nodejs.org/en/blog/vulnerability/` (one post per security release, for example `<month>-<year>-security-releases`), or the version's entry in `https://github.com/nodejs/node/blob/main/doc/changelogs/CHANGELOG_V<major>.md` |
 | End of life | `support: end_of_life` in the `node` output → no more fixes. Propose a move to a supported line. |
+| Distro build | `status: not_checked` (for example `/usr/bin/node` from the Ubuntu `nodejs` package). See below. |
 
 - Affects us: a running Node (`running` > 0) or a pm2 daemon's Node → `yes` for most CVEs. Read
   each CVE: some are only for Windows, the permission model, or a module we do not use.
@@ -56,6 +57,20 @@ A binary that is installed but does not run is still listed when it is used by a
   4. check: the pm2 daemon's Node in the next inventory (`pm2[].daemon_node`).
 - Rollback: keep the old version installed. Revert the pin, deploy, `pm2 kill` and start on the
   old Node, regenerate `pm2 startup`.
+
+A distro Node (`/usr/bin/node`, a dpkg version such as `18.19.1+dfsg-…`):
+
+- `usn` does not see it unless apt offers an upgrade. Look it up by hand in the Ubuntu CVE
+  tracker: `https://ubuntu.com/security/cves.json?package=nodejs&version=<codename>&status=needed`
+  (and `status=released`), or the page `https://ubuntu.com/security/cves?package=nodejs`.
+- On Ubuntu the `nodejs` package is in `universe`: Canonical covers it only through Ubuntu Pro
+  (`esm-apps`), see `https://ubuntu.com/security/esm`. Say how many CVEs are `needed` (no fix yet)
+  and whether any fix exists at all.
+- Compare with upstream: when its major line is end of life, every Node security release since
+  then says "End-of-Life versions are always affected".
+- `running` counts `/proc/<pid>/exe` links. For a process inside a container, the link is the path
+  **inside** the container, so a running `/usr/bin/node` may be a container process, not the
+  host package. When `docker_images[]` is not empty, write "host package or a container".
 
 ## pm2
 
@@ -76,6 +91,10 @@ A binary that is installed but does not run is still listed when it is used by a
 - `in_candidate: false` → the fix is newer than what apt offers now: the package lists are old
   (`apt.lists_age_hours`), or the fix is only in ESM (Ubuntu Pro). Say which.
 - `pocket` tells where the fix is: `security`, `updates`, `esm-infra`, `esm-apps`.
+- `usn` only looks at packages apt offers an upgrade for. A fix that is only in ESM never shows
+  up on a host without Ubuntu Pro. To check the `services` too, run `usn` on a copy of the
+  inventory (in `$OUT`) whose `apt.upgradable` lists their packages with `candidate` =
+  `installed` and `origin` `Ubuntu`: any CVE it prints is a fix apt does not offer.
 - A library (libssl, libc, zlib, …) affects every process linked to it. After the update, those
   processes run old code until they restart; `running_deleted_exe` in the next inventory shows
   what was missed.
@@ -148,15 +167,26 @@ in `usn.vendor[]`. Check the vendor page instead:
 
 - Ruby: `https://www.ruby-lang.org/en/security/`; supported lines:
   `https://www.ruby-lang.org/en/downloads/branches/`. An end-of-life line → propose a move.
-- Gems: `bundle-audit check --update --format json` on the deployed `Gemfile.lock` (ruby-advisory-db).
-  `criticality` can be empty: use the CVE's CVSS then.
+- Gems: `bundle-audit update --quiet`, then `bundle-audit check --format json` on the deployed
+  `Gemfile.lock` (ruby-advisory-db). `criticality` is often empty: use the GitHub advisory's
+  `severity` (`gh api /advisories/GHSA-<id>`), else the CVSS score.
+- Which gems run in production: the gems of the Gemfile's default and `production` groups, plus
+  everything they depend on in the `Gemfile.lock`. A gem reached only from `development` or `test`
+  (for example `selenium-webdriver`, `puma` when production runs Passenger) is `no — test group`.
+  With Ruby installed locally: `Bundler::LockfileParser` for the lockfile and `Bundler::Dsl#eval_gemfile`
+  for the groups, in a script in `$OUT`.
+- The app server (Passenger, Puma) is a gem or a vendor package: say which, and check it too.
 - Affects us: the gem is in the production bundle and its vulnerable part is used.
 - Update proposal: `bundle update --conservative <gem>` in the app repo, tests, deploy. Restart:
   the app servers (a normal deploy does it).
 
 ## npm packages (pnpm)
 
-- `pnpm audit --prod --json` on the deployed lockfile (GitHub advisory database).
+- `pnpm audit --prod --json` on the deployed lockfile (GitHub advisory database). `cves` is often
+  empty: `gh api /advisories/<github_advisory_id>` gives `cve_id`.
+- Read each Critical and High advisory: most name the feature that must be in use (for Next.js:
+  `next/og`, `use cache`, Server Actions, `images.remotePatterns`, SVG in image optimization).
+  `git grep` the deployed sha for it, and write what you found in "affects us".
   `--prod` leaves out dev dependencies: they do not run on the server.
 - Framework advisories, for example Next.js: `https://github.com/vercel/next.js/security/advisories`.
 - Affects us: server-side code paths first (SSR, API routes, middleware); a client-only package

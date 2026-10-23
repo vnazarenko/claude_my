@@ -36,6 +36,7 @@ import http.client
 import json
 import os
 import re
+import ssl
 import sys
 import tempfile
 import time
@@ -82,11 +83,51 @@ class InputError(Exception):
 
 # ---- network and cache ---------------------------------------------------------------------
 
+# CA bundles to try when Python's OpenSSL has no CA certificates of its own. The python.org
+# installer for macOS ships that way until "Install Certificates.command" is run, and then
+# every HTTPS request fails with CERTIFICATE_VERIFY_FAILED. Verification always stays on.
+CA_BUNDLES = (
+    "/etc/ssl/cert.pem",                    # macOS, Alpine, some BSDs
+    "/etc/ssl/certs/ca-certificates.crt",   # Debian, Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",     # Fedora, RHEL
+)
+CERT_HINT = ("Python has no CA certificates: set SSL_CERT_FILE to a CA bundle "
+             "(for example /etc/ssl/cert.pem)")
+
+
+def ssl_context(bundles=CA_BUNDLES):
+    """The default TLS context; without CA certificates, the first CA bundle that loads.
+
+    Left as it is when it already has CA certificates, or when SSL_CERT_FILE or SSL_CERT_DIR
+    is set (the user chose the store).
+    """
+    ctx = ssl.create_default_context()
+    if ctx.cert_store_stats().get("x509_ca"):
+        return ctx
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return ctx
+    for path in bundles:
+        if not os.path.isfile(path):
+            continue
+        try:
+            ctx.load_verify_locations(cafile=path)
+        except (OSError, ssl.SSLError):
+            continue
+        break
+    return ctx
+
+
+_SSL_CONTEXT = None
+
+
 def http_get(url):
     """One HTTPS GET. The only place that opens a network connection."""
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        _SSL_CONTEXT = ssl_context()
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
                                                "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CONTEXT) as resp:
         return resp.read()
 
 
@@ -127,7 +168,8 @@ class Fetcher:
             raise FetchError(f"could not fetch {url}: HTTP {e.code}") from None
         except (OSError, http.client.HTTPException) as e:
             reason = getattr(e, "reason", None) or e
-            raise FetchError(f"could not fetch {url}: {reason}") from None
+            hint = f" ({CERT_HINT})" if "CERTIFICATE_VERIFY_FAILED" in str(reason) else ""
+            raise FetchError(f"could not fetch {url}: {reason}{hint}") from None
         try:
             data = json.loads(body)
         except ValueError:

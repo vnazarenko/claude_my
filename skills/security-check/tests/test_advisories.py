@@ -321,12 +321,127 @@ class TestFetch(Base):
         with mock.patch.dict(os.environ, {"SECURITY_CHECK_CACHE": "/srv/cache-x"}):
             self.assertEqual(adv.default_cache_dir(), "/srv/cache-x")
 
+    def test_certificate_error_names_the_fix(self):
+        err_obj = urllib.error.URLError(
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer")
+        web = FakeWeb(fail={adv.KEV_URL: err_obj})
+        rc, _, err = self.run_main(["kev", "CVE-2026-0101"], web)
+        self.assertEqual(rc, 1)
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", err)
+        self.assertIn("SSL_CERT_FILE", err)
+
+    def test_other_errors_have_no_certificate_hint(self):
+        web = FakeWeb(fail={adv.KEV_URL: TimeoutError("timed out")})
+        _, _, err = self.run_main(["kev", "CVE-2026-0101"], web)
+        self.assertNotIn("SSL_CERT_FILE", err)
+
     def test_unexpected_shape(self):
         web = FakeWeb(override={("curl", "0"): b'{"errors": "bad query"}'})
         path = self.write_inventory(inventory())
         rc, _, err = self.run_main(["usn", path, "--today", TODAY], web)
         self.assertEqual(rc, 1)
         self.assertIn("no 'cves' list", err)
+
+
+class FakeContext:
+    """Stands in for ssl.SSLContext: a CA count and a record of the bundles loaded."""
+
+    def __init__(self, ca=0, bad=()):
+        self.ca = ca
+        self.bad = set(bad)
+        self.loaded = []
+
+    def cert_store_stats(self):
+        return {"x509": self.ca, "crl": 0, "x509_ca": self.ca}
+
+    def load_verify_locations(self, cafile=None):
+        if cafile in self.bad:
+            raise adv.ssl.SSLError("bad bundle")
+        self.loaded.append(cafile)
+        self.ca += 1
+
+
+class TestSslContext(unittest.TestCase):
+    """http_get must work on a Python whose OpenSSL has no CA store, without turning off checks."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("SSL_CERT_FILE", None)
+        os.environ.pop("SSL_CERT_DIR", None)
+
+    def bundle(self, name):
+        path = os.path.join(self.dir, name)
+        with open(path, "w") as f:
+            f.write("synthetic\n")
+        return path
+
+    def context(self, fake, bundles):
+        with mock.patch.object(adv.ssl, "create_default_context", return_value=fake):
+            return adv.ssl_context(bundles)
+
+    def test_store_with_ca_is_kept(self):
+        fake = FakeContext(ca=5)
+        self.assertIs(self.context(fake, [self.bundle("a.pem")]), fake)
+        self.assertEqual(fake.loaded, [])
+
+    def test_empty_store_loads_first_existing_bundle(self):
+        missing = os.path.join(self.dir, "missing.pem")
+        first, second = self.bundle("first.pem"), self.bundle("second.pem")
+        fake = FakeContext()
+        self.context(fake, [missing, first, second])
+        self.assertEqual(fake.loaded, [first])
+
+    def test_bad_bundle_is_skipped(self):
+        bad, good = self.bundle("bad.pem"), self.bundle("good.pem")
+        fake = FakeContext(bad=[bad])
+        self.context(fake, [bad, good])
+        self.assertEqual(fake.loaded, [good])
+
+    def test_no_bundle_leaves_context_as_is(self):
+        fake = FakeContext()
+        self.assertIs(self.context(fake, [os.path.join(self.dir, "none.pem")]), fake)
+        self.assertEqual(fake.loaded, [])
+
+    def test_user_choice_in_env_wins(self):
+        for var in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+            with mock.patch.dict(os.environ, {var: self.dir}):
+                fake = FakeContext()
+                self.context(fake, [self.bundle("a.pem")])
+                self.assertEqual(fake.loaded, [], var)
+
+    def test_real_context_keeps_verification_on(self):
+        ctx = adv.ssl_context([os.path.join(self.dir, "none.pem")])
+        self.assertEqual(ctx.verify_mode, adv.ssl.CERT_REQUIRED)
+        self.assertTrue(ctx.check_hostname)
+
+    def test_http_get_passes_the_context(self):
+        seen = {}
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        def fake_urlopen(req, timeout=None, context=None):
+            seen["context"] = context
+            return Resp()
+
+        fake = FakeContext(ca=1)
+        with mock.patch.object(adv, "_SSL_CONTEXT", None), \
+                mock.patch.object(adv.ssl, "create_default_context", return_value=fake), \
+                mock.patch.object(adv.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(adv.http_get("https://example.invalid/x.json"), b"{}")
+        self.assertIs(seen["context"], fake)
 
 
 # ---- usn -------------------------------------------------------------------------------------

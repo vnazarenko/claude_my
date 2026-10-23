@@ -59,7 +59,7 @@ In this file, `$SKILL` means `~/.claude/skills/security-check`.
 | `ours[].name` | yes | the row name in the report |
 | `ours[].pm2_home` | no | `--pm2-home` for `inventory.sh` |
 | `ours[].revision_file` | no | `--revision-file` for `inventory.sh`; the deployed git sha |
-| `ours[].repo` | no | the local git repo of the app: `.` = this repo, or a path from its root |
+| `ours[].repo` | no | the local git repo of the app: `.` = this repo, or a path from the root of its **main checkout** (in a worktree: the parent of `git rev-parse --path-format=absolute --git-common-dir`) |
 | `ours[].lockfile` | no | the lockfile path inside `repo` (`pnpm-lock.yaml`, `Gemfile.lock`) |
 | `ours[].runtime` | no | `node`, `ruby`, … |
 | `ours[].node_pin` | no | files that pin the Node version (for the update proposal) |
@@ -117,7 +117,9 @@ python3 $SKILL/scripts/advisories.py usn  "$OUT/inventory.json" --since-days N >
 - `usn`: per Ubuntu source package with a pending fix: `cves[]` (`priority`, `fixed`, `usns`,
   `in_candidate`), `max_priority`, `new_in_window`. Also `kernel[]` and `vendor[]` (not looked up)
   and `no_security_fix[]`.
-- Exit 1 = a source could not be fetched (the message names the URL): put that part under
+- Exit 1 = a source could not be fetched (the message names the URL). `CERTIFICATE_VERIFY_FAILED`
+  means this Python has no CA certificates: set `SSL_CERT_FILE` to a CA bundle and run again.
+  Any other fetch error: put that part under
   "Not checked" and go on. Exit 2 = bad input: fix the call.
 - The cache is `~/.cache/security-check` (or `$SECURITY_CHECK_CACHE`). Repeat runs are cheap.
 
@@ -131,14 +133,20 @@ mkdir -p "$OUT/<name>"
 git -C <repo> show "${sha}:<dir>/package.json"   > "$OUT/<name>/package.json"
 git -C <repo> show "${sha}:<dir>/pnpm-lock.yaml" > "$OUT/<name>/pnpm-lock.yaml"
 (cd "$OUT/<name>" && pnpm audit --prod --json > ../audit-<name>.json)
-# Ruby: only the Gemfile.lock is needed
+# Ruby: the Gemfile.lock for the audit; the Gemfile tells which gems are dev/test only
 git -C <repo> show "${sha}:Gemfile.lock" > "$OUT/<name>/Gemfile.lock"
-bundle-audit check --update --format json "$OUT/<name>" > "$OUT/audit-<name>.json"
+git -C <repo> show "${sha}:Gemfile"      > "$OUT/<name>/Gemfile"
+bundle-audit update --quiet     # not "check --update": it prints the update lines into the JSON
+bundle-audit check --format json "$OUT/<name>" > "$OUT/audit-<name>.json"
 ```
 
 - Write `${sha}:…` with braces: in zsh `$sha:w…` is a modifier, not a path.
 - Both audits exit 1 when they find something. That is a result, not an error.
 - Never `pnpm audit --fix`, `pnpm install` or `bundle update` here.
+- Both audits often give a GHSA id with no CVE id or no rating (`cves: []`, `criticality: null`).
+  `gh api /advisories/<GHSA-id>` gives `cve_id` and `severity`. Use them for the table and `kev`.
+- `bundle-audit` checks every gem group. A gem only in `development` or `test` does not run on
+  the server: `affects us: no — test group`. `references/sources.md` says how to tell.
 
 Then the exploited ones: feed every CVE id you have to `kev` (it reads ids from any text).
 
@@ -165,10 +173,15 @@ Use `references/sources.md`. For every pending fix:
 - **restart**: what must restart for the fix to take effect (`none` when nothing).
 - **risk**: `low`, `medium` or `high`, plus a few words (outage length, major version jump).
 - Medium and Low: one count line, not rows.
+- Critical or High with `affects us: no`: not in the table, but one line in "Lower severity"
+  with the reason, so the reader sees it was looked at.
+- One fix for many advisories (one version bump) → one row, even when only some of them may
+  affect us.
 - `not_ours[]` → "Not ours (needs owner)". Never propose a change to someone else's app.
 - **New or older**: new = published inside the window (`in_window` / `new_in_window`) or not in the
   previous report. Older = in the previous report and still pending. The previous report is the
-  newest `<report_dir>/*-<server>.md` before today.
+  newest `<report_dir>/*-<server>.md` before today. No previous report (first run) → every row is
+  new; mark the ones published inside the window with ★.
 
 ## Step 4 — write the report
 

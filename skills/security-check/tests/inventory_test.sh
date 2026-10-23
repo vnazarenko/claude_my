@@ -504,7 +504,7 @@ touch /var/run/reboot-required
 printf 'linux-image-6.8.0-48-generic\nlinux-base\nlinux-base\n' > /var/run/reboot-required.pkgs
 mkdir -p /boot
 touch /boot/vmlinuz-6.8.0-9-generic /boot/vmlinuz-6.8.0-45-generic /boot/vmlinuz-6.8.0-48-generic
-mkdir -p /usr/local/rvm/rubies/ruby-3.4.7 /usr/local/rvm/rubies/ruby-3.3.6 "$u/.rvm/rubies/ruby-3.4.7"
+mkdir -p /usr/share/rvm/rubies/ruby-3.2.2 /usr/local/rvm/rubies/ruby-3.4.7 /usr/local/rvm/rubies/ruby-3.3.6 "$u/.rvm/rubies/ruby-3.4.7"
 mkdir -p /srv/app/current /srv/bad/current
 echo 0123456789abcdef0123456789abcdef01234567 > /srv/app/current/REVISION
 echo 'not a sha; DB_PASSWORD=secret' > /srv/bad/current/REVISION
@@ -561,7 +561,7 @@ check "fake: pm2 daemon Node and version from files" '.pm2[0] | .pid_file and .d
 check "fake: stale pm2 pid -> not running, nulls" '.pm2[1] | .pid_file and (.daemon_running | not) and .daemon_node == null and .pm2_version == null' "$out"
 check "fake: services from dpkg, removed package -> null" '.services.nginx == "1.24.0-2ubuntu7.1" and .services.postgresql == "16.4-1" and .services.redis == null' "$out"
 check "fake: python3 from dpkg" '.python3 == "3.12.3-1ubuntu0.8"' "$out"
-check "fake: rvm rubies, sorted, once each" '.ruby == ["3.3.6","3.4.7"]' "$out"
+check "fake: rvm rubies (system, multi-user, per-user), sorted, once each" '.ruby == ["3.2.2","3.3.6","3.4.7"]' "$out"
 check "fake: running docker images only" '.docker_images | map(.image) | sort == ["example/geo:4.5","example/old:1.0","redis:latest"]' "$out"
 check "fake: deleted binary still running" '.running_deleted_exe == ["/usr/local/bin/oldsvc"]' "$out"
 check "fake: revision is a sha or null" '.revisions == {"/srv/app/current/REVISION":"0123456789abcdef0123456789abcdef01234567","/srv/bad/current/REVISION":null}' "$out"

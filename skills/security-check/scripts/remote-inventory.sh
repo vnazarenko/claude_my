@@ -291,7 +291,9 @@ python_ver=$(newest_pkg '^python3\.[0-9]+$')
 # ---- Ruby (rvm) ---------------------------------------------------------------------------------
 
 rubies=()
-for d in /usr/local/rvm/rubies/ruby-* /root/.rvm/rubies/ruby-* /home/*/.rvm/rubies/ruby-*; do
+# /usr/share/rvm: the Ubuntu rvm package and the common Ansible rvm role; /usr/local/rvm: the
+# rvm installer run as root; ~/.rvm: a per-user install.
+for d in /usr/share/rvm/rubies/ruby-* /usr/local/rvm/rubies/ruby-* /root/.rvm/rubies/ruby-* /home/*/.rvm/rubies/ruby-*; do
   [ -d "$d" ] && rubies+=("${d##*/ruby-}")
 done
 ruby_json=()

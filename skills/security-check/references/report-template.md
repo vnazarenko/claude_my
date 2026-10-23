@@ -87,6 +87,9 @@ rollback.>
 <One line: Medium <n>, Low <n>, Negligible <n> across <m> packages; npm <n> moderate/low;
 gems <n> medium/low. The raw lists stay in the run's output folder, not here.>
 
+<One line: the Critical / High ones that do not affect us, each with its reason in a few words
+(`next/og` not used, test group only, …). The reader must see they were looked at.>
+
 ## Appendix: versions
 
 Versions only. No file contents.

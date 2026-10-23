@@ -18,15 +18,18 @@ ours:                           # apps we own: the check may propose updates for
     revision_file: /srv/app/current/REVISION       # the deploy's REVISION file on the server
     repo: .                                        # the app's git repo: "." = this repo
     lockfile: web/pnpm-lock.yaml                   # path inside that repo
+    deploy_doc: docs/deploy-web.md                 # optional: this app's update steps on this server; they win over the generic ones
 
   - name: example-api
     runtime: ruby
     revision_file: /srv/api/current/REVISION
-    repo: ../example-api                           # a path from this repo's root
+    repo: ../example-api                           # a path from the root of this repo's MAIN checkout (not a worktree)
     lockfile: Gemfile.lock
 
   - name: example-search
     image: vendor/search:1.2                       # a Docker image we run
 
 not_ours:                       # on the server, but someone else owns it: reported, never proposed
-  - Node apps of another team under /srv/other (owner: other team)
+  - "Node apps of another team under /srv/other (owner: other team)"
+  - name: the shared pm2 daemon of another team
+    pm2_home: /srv/other/.pm2                      # optional: also read by the inventory, so the report shows its Node

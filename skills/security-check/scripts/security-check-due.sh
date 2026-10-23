@@ -5,40 +5,37 @@
 # Usage:
 #   security-check-due.sh <repo> <server> <jira_project>
 #
-# - <repo>          the project's MAIN checkout, not a worktree (worktrees get deleted). Its git
-#                   index must hold the profile: a path ending in security-check/<server>.yml
+# - <repo>          the project's MAIN checkout, not a worktree (worktrees get deleted)
 # - <server>        the profile name: letters, digits, "-" and "_"
 # - <jira_project>  the Jira project of the run's ticket, e.g. PROJ
 #
 # One call:
-#   1. take the lock; another call holds it → exit 0
-#   2. the last run is less than 14 days ago → exit 0
-#   3. agterm is not running → desktop notification, exit 0, state unchanged
+#   1. take the lock (a folder). Another call holds it → exit 0. A lock left by a crashed call
+#      → notification, exit 1: remove the folder by hand
+#   2. the last run is less than 14 days ago → exit 0. The last run is the newer of LAST_RUN in
+#      the state file and the newest report <YYYY-MM-DD>-<server>.md on origin's default branch
+#   3. fetch origin; the profile security-check/<server>.yml must be on that branch (the run's
+#      worktree starts from it)
+#   4. agterm is not running → desktop notification, exit 0, state unchanged
 #      (the next daily call tries again)
-#   4. a ticket from a failed try (PENDING_KEY) → reuse it. Else create one and save it as
+#   5. a ticket from a failed try (PENDING_KEY) → reuse it. Else create one and save it as
 #      PENDING_KEY before anything else:
 #      jira.py create --project <p> --type Task --label security --summary "Security check: <server> <date>"
-#   5. start-task.sh <repo> <KEY> (the new-task skill), with TASK_SEED, TASK_BRIEF_TEMPLATE and
+#   6. start-task.sh <repo> <KEY> (the new-task skill), with TASK_SEED, TASK_BRIEF_TEMPLATE and
 #      TASK_NEXT set: a worktree, an agterm session and a Claude that runs
 #      /security-check <server> --ticket <KEY>
-#   6. success → LAST_RUN=<today>, LAST_KEY=<KEY>, PENDING_KEY cleared.
+#   7. success → LAST_RUN=<today>, LAST_KEY=<KEY>, PENDING_KEY cleared.
 #      failure → notification, exit 1, PENDING_KEY kept for the next call.
 #
-# State: <state dir>/<server>.state, lines KEY=value: LAST_RUN (YYYY-MM-DD), LAST_KEY,
-# PENDING_KEY. It is parsed, never sourced. The lock is the folder <state dir>/<server>.lock.
+# State: ~/.local/state/security-check/<server>.state, lines KEY=value: LAST_RUN (YYYY-MM-DD),
+# LAST_KEY, PENDING_KEY. It is parsed, never sourced. The lock is the folder <server>.lock there.
 #
 # Environment (all optional):
-#   DRY_RUN=1                     print what would happen: no lock, no ticket, no session, no state.
-#                                 <repo> may be a worktree here (a warning says a real run refuses it)
+#   DRY_RUN=1                     print what would happen: no lock, no fetch, no ticket, no
+#                                 session, no state. Any value but "" and "0" means a dry run
 #   SECURITY_CHECK_INTERVAL_DAYS  days between runs. Default 14; 0 = due on every call
-#   SECURITY_CHECK_STATE_DIR      default ~/.local/state/security-check
-#   SECURITY_CHECK_TODAY          today as YYYY-MM-DD (for tests). Default: the local date
-#   SECURITY_CHECK_BRIEF          the run brief. Default: the installed
-#                                 ~/.claude/skills/security-check/references/run-brief.md
-#   START_TASK                    default ~/.claude/skills/new-task/scripts/start-task.sh
 #   JIRA_PY                       default: jira-tickets/scripts/jira.py in <repo>/.claude/skills,
 #                                 in a parent folder's .claude/skills, then in ~/.claude/skills
-#   AGTERMCTL, OSASCRIPT          the commands. Default: agtermctl and osascript from PATH
 #   AGTERM_SOCKET                 default ~/Library/Application Support/agterm/agterm.sock
 #
 # Exit: 0 started or nothing to do, 1 failed (a notification says why), 2 bad usage.
@@ -49,12 +46,10 @@ server="${2:-}"
 project="${3:-}"
 
 skills="$HOME/.claude/skills"
-START_TASK="${START_TASK:-$skills/new-task/scripts/start-task.sh}"
-BRIEF="${SECURITY_CHECK_BRIEF:-$skills/security-check/references/run-brief.md}"
-AGTERMCTL="${AGTERMCTL:-agtermctl}"
-OSASCRIPT="${OSASCRIPT:-osascript}"
+start_task="$skills/new-task/scripts/start-task.sh"
+brief="$skills/security-check/references/run-brief.md"
 AGTERM_SOCKET="${AGTERM_SOCKET:-$HOME/Library/Application Support/agterm/agterm.sock}"
-state_dir="${SECURITY_CHECK_STATE_DIR:-$HOME/.local/state/security-check}"
+state_dir="$HOME/.local/state/security-check"
 interval="${SECURITY_CHECK_INTERVAL_DAYS:-14}"
 case "${DRY_RUN:-}" in "" | 0) dry=0 ;; *) dry=1 ;; esac
 
@@ -74,7 +69,7 @@ notify() {
     log "DRY_RUN: would notify: $text"
     return 0
   fi
-  "$OSASCRIPT" -e "display notification \"$text\" with title \"security-check\"" >/dev/null 2>&1 \
+  osascript -e "display notification \"$text\" with title \"security-check\"" >/dev/null 2>&1 \
     || log "WARN: could not show the notification"
 }
 
@@ -115,6 +110,19 @@ find_jira() {
   return 1
 }
 
+# newest_report: the date of the newest <YYYY-MM-DD>-<server>.md on $ref, or nothing.
+newest_report() {
+  local p d best=""
+  while IFS= read -r p; do
+    p="${p##*/}"
+    d="${p:0:10}"
+    { [ "$p" = "$d-$server.md" ] && valid_date "$d"; } || continue
+    [ -z "$best" ] || [[ $d > $best ]] || continue
+    days_between "$d" "$today" >/dev/null && best="$d"
+  done < <(git -C "$repo" ls-tree -r --name-only "$ref" 2>/dev/null | grep -e "-$server\.md\$")
+  printf '%s' "$best"
+}
+
 # ---- arguments --------------------------------------------------------------------------------
 
 [ -n "$repo_in" ] && [ -n "$server" ] && [ -n "$project" ] \
@@ -123,21 +131,13 @@ valid_server "$server" || fail 2 "bad server name (letters, digits, - and _ only
 valid_project "$project" || fail 2 "bad Jira project '$project' (capital letters and digits, e.g. PROJ)"
 case "$interval" in "" | *[!$D]*) fail 2 "SECURITY_CHECK_INTERVAL_DAYS must be a whole number of days" ;; esac
 interval=$((10#$interval))
-today="${SECURITY_CHECK_TODAY:-$(date +%F)}"
-{ valid_date "$today" && days_between "$today" "$today" >/dev/null; } || fail 2 "SECURITY_CHECK_TODAY must be YYYY-MM-DD"
 repo="$(cd "$repo_in" 2>/dev/null && pwd -P)" || fail 2 "repo '$repo_in' does not exist"
-# A worktree gets deleted after its PR, so a real run refuses it. A dry run only prints, so it
-# may use one: to try a profile or a skill change before it is merged.
-if [ ! -d "$repo/.git" ]; then
-  if [ "$dry" = 1 ] && [ -f "$repo/.git" ]; then
-    log "WARN: '$repo' is a worktree, not the main checkout: a real run refuses it"
-  else
-    fail 2 "'$repo' is not the main checkout of a git repo"
-  fi
-fi
-for c in "$AGTERMCTL" jq python3 git; do
+# A worktree gets deleted after its PR.
+[ -d "$repo/.git" ] || fail 2 "'$repo' is not the main checkout of a git repo"
+for c in agtermctl jq python3 git; do
   command -v "$c" >/dev/null 2>&1 || fail 1 "$c not on PATH"
 done
+today="$(date +%F)"
 export AGTERM_SOCKET
 
 state="$state_dir/$server.state"
@@ -145,28 +145,24 @@ lock="$state_dir/$server.lock"
 
 # ---- lock: two calls at once must not create two tickets --------------------------------------
 
-# A lock is stale when its process is gone. A lock with no pid file yet is being taken right
-# now, unless it is older than a minute.
-lock_is_stale() {
+# A live call: the lock is younger than an hour (a call takes seconds), and its pid is alive
+# or not written yet. Anything else was left by a crash. It is never removed here: two calls
+# that both judge it stale could both take it.
+lock_is_live() {
   local pid
+  [ -n "$(find "$lock" -maxdepth 0 -mmin -60 2>/dev/null)" ] || return 1
   pid="$(cat "$lock/pid" 2>/dev/null)"
-  if [ -n "$pid" ]; then
-    ! kill -0 "$pid" 2>/dev/null
-  else
-    [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]
-  fi
+  [ -z "$pid" ] || kill -0 "$pid" 2>/dev/null
 }
 
 if [ "$dry" = 0 ]; then
   mkdir -p "$state_dir" || fail 1 "cannot create $state_dir"
   if ! mkdir "$lock" 2>/dev/null; then
-    if ! lock_is_stale; then
+    if lock_is_live; then
       log "another call holds the lock $lock: nothing to do"
       exit 0
     fi
-    log "removing a stale lock $lock"
-    rm -rf "$lock"
-    mkdir "$lock" 2>/dev/null || { log "another call took the lock: nothing to do"; exit 0; }
+    fail 1 "a crashed call left the lock $lock: remove that folder, then the next call runs"
   fi
   trap 'rm -rf "$lock"' EXIT
   echo "$$" > "$lock/pid"
@@ -197,27 +193,46 @@ write_state() {
     && mv -f "$tmp" "$state"
 }
 
-# ---- 1. due? ----------------------------------------------------------------------------------
-
-if [ -n "$LAST_RUN" ]; then
-  age="$(days_between "$LAST_RUN" "$today")"
+# not_due <last run> [<where it comes from>]: exit 0 when the last run is too recent.
+not_due() {
+  local age
+  age="$(days_between "$1" "$today")"
   if [ "$age" -lt "$interval" ]; then
-    log "not due: last run $LAST_RUN, $age days ago (every $interval days)"
+    log "not due: last run $1, $age days ago (every $interval days)${2:-}"
     exit 0
   fi
-  log "due: last run $LAST_RUN, $age days ago (every $interval days)"
+  log "due: last run $1, $age days ago (every $interval days)${2:-}"
+}
+
+# ---- 1. due? ----------------------------------------------------------------------------------
+
+[ -z "$LAST_RUN" ] || not_due "$LAST_RUN"
+
+# The run's worktree starts from origin's default branch: read the profile and the newest
+# report there, not in the main checkout (other sessions keep it as it is).
+if [ "$dry" = 1 ]; then
+  log "DRY_RUN: would fetch origin"
 else
-  log "due: no run recorded yet"
+  GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet origin </dev/null \
+    || log "WARN: git fetch origin failed; using the origin branch as it is"
+fi
+ref="$(git -C "$repo" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)" || ref="origin/main"
+git -C "$repo" rev-parse -q --verify "$ref^{commit}" >/dev/null 2>&1 \
+  || fail 1 "$repo has no branch $ref: set its remote 'origin'"
+
+report_date="$(newest_report)"
+if [ -n "$report_date" ] && { [ -z "$LAST_RUN" ] || [[ $report_date > $LAST_RUN ]]; }; then
+  not_due "$report_date" " (the newest report on $ref)"
+elif [ -z "$LAST_RUN" ]; then
+  log "due: no run recorded yet, no report on $ref"
 fi
 
 # ---- 2. what the run needs, checked before a ticket exists -------------------------------------
 
-[ -f "$START_TASK" ] || fail 1 "start-task.sh not found at $START_TASK (START_TASK)"
-grep -q 'TASK_SEED' "$START_TASK" \
-  || fail 1 "$START_TASK has no TASK_SEED override: update the new-task skill first"
-[ -f "$BRIEF" ] || fail 1 "run brief not found at $BRIEF (SECURITY_CHECK_BRIEF)"
-[ -n "$(git -C "$repo" ls-files -- "*security-check/$server.yml" 2>/dev/null)" ] \
-  || fail 1 "no profile security-check/$server.yml in $repo"
+[ -f "$start_task" ] || fail 1 "start-task.sh of the new-task skill not found at $start_task"
+[ -f "$brief" ] || fail 1 "run brief not found at $brief"
+git -C "$repo" ls-tree -r --name-only "$ref" 2>/dev/null | grep -e "security-check/$server\.yml\$" >/dev/null \
+  || fail 1 "no profile security-check/$server.yml on $ref of $repo"
 if [ -z "${JIRA_PY:-}" ]; then
   JIRA_PY="$(find_jira)" || fail 1 "jira.py of the jira-tickets skill not found (set JIRA_PY)"
 fi
@@ -226,7 +241,7 @@ export JIRA_PY
 
 # ---- 3. agterm --------------------------------------------------------------------------------
 
-if ! tree="$("$AGTERMCTL" tree --json --socket "$AGTERM_SOCKET" 2>/dev/null)" || [ -z "$tree" ]; then
+if ! tree="$(agtermctl tree --json --socket "$AGTERM_SOCKET" 2>/dev/null)" || [ -z "$tree" ]; then
   log "agterm is not running: no run started; the next daily call tries again"
   notify "Security check of $server is due, but agterm is not running. The next daily call tries again."
   exit 0
@@ -234,27 +249,9 @@ fi
 
 # ---- 4. the ticket ----------------------------------------------------------------------------
 
-started() {   # started <KEY>: record the run
-  if [ "$dry" = 1 ]; then
-    log "DRY_RUN: would save $state: LAST_RUN=$today LAST_KEY=$1 PENDING_KEY="
-    return 0
-  fi
-  write_state "$today" "$1" "" || fail 1 "$1 started, but $state could not be saved"
-  log "started $1"
-  notify "Security check of $server started: $1"
-}
-
 if [ -n "$PENDING_KEY" ]; then
   key="$PENDING_KEY"
   log "reusing $key from a failed try"
-  # The try may have failed after its session opened. start-task.sh refuses a second session.
-  sid="$(jq -r --arg k "$key " '[.. | objects | select(.cwd? and (.name? // "" | startswith($k))) | .id] | first // empty' \
-    <<<"$tree" 2>/dev/null)"
-  if [ -n "$sid" ]; then
-    log "an agterm session for $key is already open ($sid): the run started before"
-    started "$key"
-    exit 0
-  fi
 else
   summary="Security check: $server $today"
   desc="Scheduled read-only security check of $server. The Claude session of this ticket writes the report and posts its summary here."
@@ -273,20 +270,23 @@ fi
 
 # ---- 5. the session ---------------------------------------------------------------------------
 
-seed="/security-check $server --ticket $key. First read the task brief {{BRIEF}} and follow it for the whole run."
+# A space after the key, so the key is never read as "PROJ-123." or "PROJ-123,".
+seed="/security-check $server --ticket $key (first read the task brief {{BRIEF}} and follow it for the whole run)"
 next="a security report (/security-check). The report summary will be posted here."
 
 if [ "$dry" = 1 ]; then
-  log "DRY_RUN: would run: AGTERM_ENABLED=1 TASK_SEED='$seed' TASK_BRIEF_TEMPLATE=$BRIEF TASK_NEXT='$next' JIRA_PY=$JIRA_PY bash $START_TASK $repo $key"
-  started "$key"
+  log "DRY_RUN: would run: AGTERM_ENABLED=1 TASK_SEED='$seed' TASK_BRIEF_TEMPLATE=$brief TASK_NEXT='$next' JIRA_PY=$JIRA_PY bash $start_task $repo $key"
+  log "DRY_RUN: would save $state: LAST_RUN=$today LAST_KEY=$key PENDING_KEY="
   exit 0
 fi
 
-out="$(AGTERM_ENABLED=1 TASK_SEED="$seed" TASK_BRIEF_TEMPLATE="$BRIEF" TASK_NEXT="$next" \
-  bash "$START_TASK" "$repo" "$key" 2>&1)"
+out="$(AGTERM_ENABLED=1 TASK_SEED="$seed" TASK_BRIEF_TEMPLATE="$brief" TASK_NEXT="$next" \
+  bash "$start_task" "$repo" "$key" 2>&1)"
 rc=$?
 printf '%s\n' "$out"
 if [ "$rc" -ne 0 ] || ! grep -q "^TASK_STARTED $key " <<<"$out"; then
   fail 1 "the session for $key did not start (start-task.sh exit $rc). The next call reuses $key."
 fi
-started "$key"
+write_state "$today" "$key" "" || fail 1 "$key started, but $state could not be saved"
+log "started $key"
+notify "Security check of $server started: $key"

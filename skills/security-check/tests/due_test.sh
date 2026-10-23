@@ -6,22 +6,25 @@
 # Usage:
 #   due_test.sh
 #
-# Stubs: agtermctl, osascript, launchctl and sleep on PATH (and passed as AGTERMCTL, OSASCRIPT,
-# LAUNCHCTL); JIRA_PY = a stub python script; start-task.sh = a stub installed in the temp HOME.
+# Stubs: agtermctl, osascript, launchctl and sleep first on PATH; JIRA_PY = a stub python script;
+# start-task.sh = a stub installed in the temp HOME, where the scripts look for it. The project
+# repo is a clone of a local bare "origin", so git fetch works without a network.
 # The scripts run under /bin/bash, as launchd runs them.
 #
 # security-check-due.sh:
-#   1. not due → nothing; 14 days → due; no state yet → due; interval override
-#   2. due → one ticket, start-task.sh with the right env, state saved
-#   3. start-task.sh fails → PENDING_KEY kept; the next call reuses it, no second ticket
-#   4. pending ticket whose session is already open → recorded, no second session
+#   1. not due → nothing; 14 days → due; no state, no report → due; interval override
+#   2. the newest report on origin counts as the last run (also one pushed after the clone)
+#   3. due → one ticket, start-task.sh with the right env, state saved
+#   4. start-task.sh fails, or prints no TASK_STARTED line → PENDING_KEY kept; the next call
+#      reuses it, no second ticket
 #   5. agterm down → one notification, state unchanged
-#   6. lock held → exit 0, nothing done; stale lock → removed, run goes on; two calls at
-#      once → one ticket
-#   7. DRY_RUN=1 → prints the actions, changes nothing; it may use a worktree (a real run may not)
-#   8. errors before the ticket (old start-task.sh, no brief, no profile, no jira.py, bad
-#      arguments, broken state) and Jira errors → no ticket or no session, state unchanged
-#   9. the whole chain with the real new-task start-task.sh: the typed /security-check command
+#   6. lock held or being taken → exit 0; a lock left by a crash → notification, kept; two calls
+#      at once → one ticket
+#   7. DRY_RUN (1, true) → prints the actions, changes nothing; DRY_RUN=0 → a real run
+#   8. errors before the ticket (no start-task.sh, no brief, no profile on origin, no jira.py, bad
+#      arguments, broken state) and Jira errors → no ticket or no session
+#   9. the whole chain with the real new-task start-task.sh: the typed /security-check command;
+#      a launchd-like environment (env -i)
 # install-launchd.sh:
 #  10. writes a plist that passes plutil -lint, with the right values; launchctl bootout + bootstrap
 #  11. a bootstrap that fails once is retried; bad names, a worktree, no installed script → refused
@@ -59,12 +62,16 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 tmp="$(cd "$tmp" && pwd -P)"   # the scripts resolve paths with pwd -P
 
+# ago <days>: the local date that many days before today (negative = in the future).
+ago() { python3 -c 'import sys, datetime as d; print(d.date.today() - d.timedelta(days=int(sys.argv[1])))' "$1"; }
+
 server="example-host"
 project="PROJ"
 key="PROJ-123"
-today="2026-10-23"
-seed="/security-check $server --ticket $key. First read the task brief {{BRIEF}} and follow it for the whole run."
+today="$(ago 0)"
 next_text="a security report (/security-check). The report summary will be posted here."
+seed_for() { printf '/security-check %s --ticket %s (first read the task brief {{BRIEF}} and follow it for the whole run)' "$server" "$1"; }
+seed="$(seed_for "$key")"
 
 # ---- stubs ------------------------------------------------------------------------------------
 
@@ -72,12 +79,11 @@ mkdir -p "$tmp/bin"
 
 cat > "$tmp/bin/agtermctl" <<'EOF'
 #!/usr/bin/env bash
-# tree: STUB_AGTERM_DOWN=1 → fail; else print STUB_TREE. The session calls are for start-task.sh.
+# tree: STUB_AGTERM_DOWN=1 → fail; else an empty tree. The session calls are for start-task.sh.
 printf '%s\n' "$*" >> "$STUB_LOG/agtermctl.calls"
 case "$1 ${2:-}" in
   "tree --json")  [ "${STUB_AGTERM_DOWN:-}" = 1 ] && exit 1
-                  empty='{"windows":[]}'
-                  printf '%s\n' "${STUB_TREE:-$empty}" ;;
+                  echo '{"result":{"tree":{"workspaces":[]}}}' ;;
   "session new")  echo '{"result":{"id":"SID-1"}}' ;;
   "session type") printf '%s\n' "${!#}" >> "$STUB_LOG/typed" ;;
 esac
@@ -87,6 +93,7 @@ EOF
 cat > "$tmp/bin/osascript" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$STUB_LOG/notify.calls"
+exit "${STUB_OSA_RC:-0}"
 EOF
 
 cat > "$tmp/bin/launchctl" <<'EOF'
@@ -119,14 +126,14 @@ if args[0] == "create":
     k = "" if os.environ.get("STUB_JIRA_NOKEY") == "1" else os.environ.get("STUB_KEY", "PROJ-123")
     print(json.dumps({"key": k or None, "id": "1", "url": "https://jira.example.com/browse/" + k}, indent=2))
 elif args[0] == "get":
-    print(json.dumps({"summary": "Security check: example-host 2026-10-23", "status": "To Do",
+    print(json.dumps({"summary": "Security check: example-host " + os.environ["STUB_TODAY"], "status": "To Do",
                       "url": "https://jira.example.com/browse/" + args[1], "description": "Scheduled."}))
 elif args[0] == "comment":
     with open(os.path.join(log, "comment.txt"), "w") as f:
         f.write(args[args.index("--body") + 1])
 EOF
 
-# start-task.sh stub: logs its arguments and the env it got. Supports TASK_SEED (named here).
+# start-task.sh stub: logs its arguments and the env it got.
 cat > "$tmp/start-task.sh" <<'EOF'
 #!/usr/bin/env bash
 {
@@ -140,15 +147,11 @@ cat > "$tmp/start-task.sh" <<'EOF'
 } >> "$STUB_LOG/start.calls"
 [ -z "${STUB_START_DELAY:-}" ] || /bin/sleep "$STUB_START_DELAY"   # the real sleep: a slow start
 rc="${STUB_START_RC:-0}"
-[ "$rc" = 0 ] && echo "TASK_STARTED $2 agterm=SID-1 claude=u-1 worktree=/w branch=b"
+if [ "$rc" = 0 ] && [ "${STUB_START_NOLINE:-}" != 1 ]; then
+  echo "TASK_STARTED $2 agterm=SID-1 claude=u-1 worktree=/w branch=b"
+fi
 [ "$rc" = 0 ] || echo "ERROR: could not read $2 from Jira"
 exit "$rc"
-EOF
-
-# An old start-task.sh, from before the overrides.
-cat > "$tmp/old-start-task.sh" <<'EOF'
-#!/usr/bin/env bash
-echo "TASK_STARTED $2"
 EOF
 
 cat > "$tmp/new-worktree.sh" <<'EOF'
@@ -159,7 +162,7 @@ mkdir -p "$dir"
 echo "WORKTREE_READY $dir"
 EOF
 
-chmod +x "$tmp/bin/"* "$tmp/start-task.sh" "$tmp/old-start-task.sh" "$tmp/new-worktree.sh"
+chmod +x "$tmp/bin/"* "$tmp/start-task.sh" "$tmp/new-worktree.sh"
 
 # The real commands would post a notification, open a session or load a job. Stop if a stub
 # does not come first on PATH.
@@ -168,12 +171,34 @@ for c in agtermctl osascript launchctl sleep; do
     || { echo "ERROR: the $c stub is not first on PATH" >&2; exit 1; }
 done
 
-# A main checkout with the profile in its index.
-repo="$tmp/code/demo"
-mkdir -p "$repo/infra/security-check"
-git -C "$repo" init -q || { echo "ERROR: git init failed" >&2; exit 1; }
-echo "server: $server" > "$repo/infra/security-check/$server.yml"
-git -C "$repo" add infra/security-check/"$server".yml
+# ---- git: a bare origin, a seed clone that pushes to it, the main checkout ---------------------
+
+g() { git -c user.name=test -c user.email=test@example.invalid -c commit.gpgsign=false \
+        -c core.hooksPath=/dev/null -c init.defaultBranch=main "$@"; }
+
+# make_repo <dir>: <dir>/origin.git, <dir>/seed (pushes), <dir>/code/demo (the main checkout).
+# The profile is on origin/main. Prints nothing; fails the test run on a git error.
+make_repo() {
+  local d="$1"
+  mkdir -p "$d/code"
+  { g init -q --bare "$d/origin.git" \
+    && g clone -q "$d/origin.git" "$d/seed" 2>/dev/null \
+    && mkdir -p "$d/seed/infra/security-check" "$d/seed/docs/security" \
+    && echo "server: $server" > "$d/seed/infra/security-check/$server.yml" \
+    && g -C "$d/seed" add -A && g -C "$d/seed" commit -q --no-verify -m profile \
+    && g -C "$d/seed" push -q origin HEAD:main 2>/dev/null \
+    && g clone -q "$d/origin.git" "$d/code/demo" 2>/dev/null; } \
+    || { echo "ERROR: could not make the test repo in $d" >&2; exit 1; }
+}
+# push_file <repo dir> <path> [content]: commit a file in the seed clone and push it to origin.
+push_file() {
+  mkdir -p "$(dirname "$1/seed/$2")"
+  echo "${3:-x}" > "$1/seed/$2"
+  g -C "$1/seed" add -A && g -C "$1/seed" commit -q --no-verify -m "$2" && g -C "$1/seed" push -q origin HEAD:main 2>/dev/null
+}
+
+make_repo "$tmp/base"
+repo="$tmp/base/code/demo"
 
 # jira.py must not be found by the default search (the "no jira.py" case relies on it).
 jira_in_parents=""
@@ -190,7 +215,7 @@ out="" rc=0 home="" log="" state_file="" lock=""
 arg_repo="" arg_server="" arg_project=""
 
 # new_case <name>: a fresh HOME (with the stub start-task.sh and the run brief installed where
-# the defaults point), log folder and arguments.
+# the due script looks), log folder and arguments.
 new_case() {
   home="$tmp/$1/home"
   log="$tmp/$1/log"
@@ -219,12 +244,9 @@ run_due() {
 }
 # due_cmd [VAR=value ...]: the same, output not captured.
 due_cmd() {
-  env -u DRY_RUN -u SECURITY_CHECK_INTERVAL_DAYS -u SECURITY_CHECK_STATE_DIR \
-    -u SECURITY_CHECK_BRIEF -u START_TASK -u AGTERM_ENABLED -u AGTERM_SOCKET -u AGTERM_SESSION_ID \
+  env -u DRY_RUN -u SECURITY_CHECK_INTERVAL_DAYS -u AGTERM_ENABLED -u AGTERM_SOCKET -u AGTERM_SESSION_ID \
     -u TASK_SEED -u TASK_BRIEF_TEMPLATE -u TASK_NEXT -u NEW_WT \
-    HOME="$home" PATH="$tmp/bin:$PATH" STUB_LOG="$log" \
-    AGTERMCTL="$tmp/bin/agtermctl" OSASCRIPT="$tmp/bin/osascript" \
-    JIRA_PY="$tmp/jira_stub.py" SECURITY_CHECK_TODAY="$today" \
+    HOME="$home" PATH="$tmp/bin:$PATH" STUB_LOG="$log" STUB_TODAY="$today" JIRA_PY="$tmp/jira_stub.py" \
     "$@" "$BASH_BIN" "$due" "$arg_repo" "$arg_server" "$arg_project"
 }
 
@@ -237,10 +259,10 @@ expect_nothing_done() {
   fi
 }
 
-# expect_started <label>: state after a good run of $key.
+# expect_started <label> [key]: state after a good run.
 expect_started() {
   expect_eq "$1: LAST_RUN" "$today" "$(state_val LAST_RUN)"
-  expect_eq "$1: LAST_KEY" "$key" "$(state_val LAST_KEY)"
+  expect_eq "$1: LAST_KEY" "${2:-$key}" "$(state_val LAST_KEY)"
   expect_eq "$1: PENDING_KEY cleared" "" "$(state_val PENDING_KEY)"
   if [ -e "$lock" ]; then bad "$1: lock released"; else ok "$1: lock released"; fi
 }
@@ -248,15 +270,22 @@ expect_started() {
 # ---- 1. not due / due -------------------------------------------------------------------------
 
 new_case notdue
-set_state "LAST_RUN=2026-10-10" "LAST_KEY=PROJ-100" "PENDING_KEY="
+set_state "LAST_RUN=$(ago 13)" "LAST_KEY=PROJ-100" "PENDING_KEY="
 cp "$state_file" "$tmp/notdue/before"
 run_due
 expect_eq "not due: exit 0" 0 "$rc"
-expect_has "not due: says so" "not due: last run 2026-10-10, 13 days ago (every 14 days)" "$out"
+expect_has "not due: says so" "not due: last run $(ago 13), 13 days ago (every 14 days)" "$out"
 expect_nothing_done "not due: nothing done"
 expect_eq "not due: agterm not asked" "" "$(calls agtermctl)"
 if cmp -s "$tmp/notdue/before" "$state_file"; then ok "not due: state unchanged"; else bad "not due: state unchanged"; fi
 if [ -e "$lock" ]; then bad "not due: lock released"; else ok "not due: lock released"; fi
+
+new_case future
+set_state "LAST_RUN=$(ago -3)"
+run_due
+expect_eq "LAST_RUN in the future: exit 0" 0 "$rc"
+expect_has "LAST_RUN in the future: not due" "not due: last run $(ago -3), -3 days ago" "$out"
+expect_nothing_done "LAST_RUN in the future: nothing done"
 
 new_case interval
 set_state "LAST_RUN=$today" "LAST_KEY=PROJ-100"
@@ -264,19 +293,61 @@ run_due SECURITY_CHECK_INTERVAL_DAYS=0
 expect_eq "interval 0: exit 0" 0 "$rc"
 expect_eq "interval 0: due again the same day" 1 "$(count start '^ARGS=')"
 
-# ---- 2. due: one ticket, start-task.sh with the right env -------------------------------------
+# ---- 2. the newest report on origin counts as the last run ------------------------------------
+
+make_repo "$tmp/rep"
+push_file "$tmp/rep" "docs/security/$(ago 3)-$server.md"
+push_file "$tmp/rep" "docs/security/$(ago 1)-web-update-deploy.md"   # not a report of this server
+push_file "$tmp/rep" "docs/security/$(ago 1)-other-host.md"          # another server's report
+new_case report
+arg_repo="$tmp/rep/code/demo"
+run_due
+expect_eq "report, no state: exit 0" 0 "$rc"
+expect_has "report, no state: not due from the report" \
+  "not due: last run $(ago 3), 3 days ago (every 14 days) (the newest report on origin/main)" "$out"
+expect_nothing_done "report, no state: nothing done"
+
+new_case reportnewer
+arg_repo="$tmp/rep/code/demo"
+set_state "LAST_RUN=$(ago 30)" "LAST_KEY=PROJ-100"
+run_due
+expect_has "report newer than LAST_RUN: due by the state" "due: last run $(ago 30), 30 days ago" "$out"
+expect_has "report newer than LAST_RUN: not due by the report" "not due: last run $(ago 3), 3 days ago" "$out"
+expect_nothing_done "report newer than LAST_RUN: nothing done"
+
+# A report merged after the main checkout was cloned: the due script fetches it.
+make_repo "$tmp/late"
+push_file "$tmp/late" "docs/security/$(ago 20)-$server.md"
+push_file "$tmp/late" "docs/security/$(ago 2)-$server.md"
+new_case late
+arg_repo="$tmp/late/code/demo"
+run_due
+expect_has "report pushed after the clone: fetched, not due" "not due: last run $(ago 2), 2 days ago" "$out"
+expect_nothing_done "report pushed after the clone: nothing done"
+
+make_repo "$tmp/old"
+push_file "$tmp/old" "docs/security/$(ago 15)-$server.md"
+new_case oldreport
+arg_repo="$tmp/old/code/demo"
+run_due
+expect_eq "report 15 days old: exit 0" 0 "$rc"
+expect_has "report 15 days old: due" "due: last run $(ago 15), 15 days ago (every 14 days) (the newest report on origin/main)" "$out"
+expect_eq "report 15 days old: one ticket" 1 "$(count jira '^create|')"
+expect_started "report 15 days old"
+
+# ---- 3. due: one ticket, start-task.sh with the right env -------------------------------------
 
 new_case due
-set_state "LAST_RUN=2026-10-09" "LAST_KEY=PROJ-100" "PENDING_KEY="
+set_state "LAST_RUN=$(ago 14)" "LAST_KEY=PROJ-100" "PENDING_KEY="
 run_due
 expect_eq "due: exit 0" 0 "$rc"
-expect_has "due: 14 days is due" "due: last run 2026-10-09, 14 days ago" "$out"
+expect_has "due: 14 days is due" "due: last run $(ago 14), 14 days ago" "$out"
 expect_eq "due: one Jira create, exact arguments" \
   "create|--project|PROJ|--type|Task|--label|security|--summary|Security check: $server $today|--description|Scheduled read-only security check of $server. The Claude session of this ticket writes the report and posts its summary here." \
   "$(calls jira)"
 expect_eq "due: start-task.sh arguments" "ARGS=$repo $key" "$(grep '^ARGS=' "$log/start.calls")"
 expect_eq "due: TASK_SEED" "$seed" "$(start_env TASK_SEED)"
-expect_has "due: TASK_SEED has the command" "/security-check $server --ticket $key" "$(start_env TASK_SEED)"
+expect_has "due: TASK_SEED has the key and a space after it" "--ticket $key (first" "$(start_env TASK_SEED)"
 expect_eq "due: TASK_BRIEF_TEMPLATE = installed run brief" \
   "$home/.claude/skills/security-check/references/run-brief.md" "$(start_env TASK_BRIEF_TEMPLATE)"
 expect_eq "due: TASK_NEXT" "$next_text" "$(start_env TASK_NEXT)"
@@ -290,19 +361,19 @@ expect_has "due: notification names the ticket" "started: $key" "$(calls notify)
 
 new_case first
 run_due
-expect_eq "first run (no state): exit 0" 0 "$rc"
-expect_has "first run: says so" "due: no run recorded yet" "$out"
+expect_eq "first run (no state, no report): exit 0" 0 "$rc"
+expect_has "first run: says so" "due: no run recorded yet, no report on origin/main" "$out"
 expect_eq "first run: one ticket" 1 "$(count jira '^create|')"
 expect_started "first run"
 
-# ---- 3. start-task.sh fails → the next call reuses the ticket ---------------------------------
+# ---- 4. start-task.sh fails → the next call reuses the ticket ---------------------------------
 
 new_case retry
-set_state "LAST_RUN=2026-09-01" "LAST_KEY=PROJ-100"
+set_state "LAST_RUN=$(ago 50)" "LAST_KEY=PROJ-100"
 run_due STUB_START_RC=1
 expect_eq "start fails: exit 1" 1 "$rc"
 expect_eq "start fails: PENDING_KEY saved" "$key" "$(state_val PENDING_KEY)"
-expect_eq "start fails: LAST_RUN unchanged" "2026-09-01" "$(state_val LAST_RUN)"
+expect_eq "start fails: LAST_RUN unchanged" "$(ago 50)" "$(state_val LAST_RUN)"
 expect_has "start fails: notification" "did not start" "$(calls notify)"
 expect_has "start fails: start-task.sh output in the log" "ERROR: could not read $key from Jira" "$out"
 if [ -e "$lock" ]; then bad "start fails: lock released"; else ok "start fails: lock released"; fi
@@ -314,21 +385,17 @@ expect_eq "next call: start-task.sh with the same ticket" "ARGS=$repo $key" "$(g
 expect_eq "next call: TASK_SEED names the same ticket" "$seed" "$(start_env TASK_SEED)"
 expect_started "next call"
 
-# ---- 4. pending ticket whose session is already open ------------------------------------------
-
-new_case open
-set_state "LAST_RUN=2026-09-01" "LAST_KEY=PROJ-100" "PENDING_KEY=$key"
-run_due STUB_TREE='{"windows":[{"workspaces":[{"sessions":[{"id":"SID-9","name":"PROJ-123 Security check","cwd":"/w"}]}]}]}'
-expect_eq "session open: exit 0" 0 "$rc"
-expect_has "session open: says so" "already open (SID-9)" "$out"
-expect_eq "session open: no ticket" 0 "$(count jira)"
-expect_eq "session open: no start-task.sh" 0 "$(count start '^ARGS=')"
-expect_started "session open"
+new_case noline
+set_state "LAST_RUN=$(ago 50)" "LAST_KEY=PROJ-100"
+run_due STUB_START_NOLINE=1
+expect_eq "start-task.sh exit 0 without TASK_STARTED: exit 1" 1 "$rc"
+expect_eq "start-task.sh exit 0 without TASK_STARTED: PENDING_KEY kept" "$key" "$(state_val PENDING_KEY)"
+expect_eq "start-task.sh exit 0 without TASK_STARTED: LAST_RUN unchanged" "$(ago 50)" "$(state_val LAST_RUN)"
 
 # ---- 5. agterm down ---------------------------------------------------------------------------
 
 new_case down
-set_state "LAST_RUN=2026-09-01" "LAST_KEY=PROJ-100" "PENDING_KEY="
+set_state "LAST_RUN=$(ago 50)" "LAST_KEY=PROJ-100" "PENDING_KEY="
 cp "$state_file" "$tmp/down/before"
 run_due STUB_AGTERM_DOWN=1
 expect_eq "agterm down: exit 0" 0 "$rc"
@@ -338,10 +405,17 @@ expect_eq "agterm down: no ticket" 0 "$(count jira)"
 expect_eq "agterm down: no start-task.sh" 0 "$(count start '^ARGS=')"
 if cmp -s "$tmp/down/before" "$state_file"; then ok "agterm down: state unchanged"; else bad "agterm down: state unchanged"; fi
 
+new_case osafail
+set_state "LAST_RUN=$(ago 50)"
+run_due STUB_OSA_RC=1
+expect_eq "notification fails: the run still starts" 1 "$(count start '^ARGS=')"
+expect_has "notification fails: logged" "WARN: could not show the notification" "$out"
+expect_started "notification fails"
+
 # ---- 6. lock ----------------------------------------------------------------------------------
 
 new_case locked
-set_state "LAST_RUN=2026-09-01"
+set_state "LAST_RUN=$(ago 50)"
 mkdir -p "$lock"
 echo "$$" > "$lock/pid"   # this test's shell: alive
 run_due
@@ -351,36 +425,37 @@ expect_nothing_done "lock held: nothing done"
 expect_eq "lock held: the other call's lock is kept" "$$" "$(cat "$lock/pid" 2>/dev/null)"
 
 new_case taking
-set_state "LAST_RUN=2026-09-01"
+set_state "LAST_RUN=$(ago 50)"
 mkdir -p "$lock"          # no pid yet, just made: being taken right now
 run_due
 expect_eq "lock being taken: exit 0" 0 "$rc"
 expect_nothing_done "lock being taken: nothing done"
 
-new_case stale
-set_state "LAST_RUN=2026-09-01"
-mkdir -p "$lock"
+# A lock left by a crash is never removed by a call: two calls could both take it.
 bash -c 'exit 0' &
 dead=$!
 wait "$dead"
-echo "$dead" > "$lock/pid"
-run_due
-expect_eq "stale lock: exit 0" 0 "$rc"
-expect_has "stale lock: removed" "removing a stale lock" "$out"
-expect_eq "stale lock: run goes on" 1 "$(count start '^ARGS=')"
-expect_started "stale lock"
-
-new_case oldlock
-set_state "LAST_RUN=2026-09-01"
-mkdir -p "$lock"
-touch -t 202601010000 "$lock"   # no pid and old: left by a crash
-run_due
-expect_eq "old lock without pid: exit 0" 0 "$rc"
-expect_eq "old lock without pid: run goes on" 1 "$(count start '^ARGS=')"
+for kind in "dead pid" "old, no pid" "old, live pid"; do
+  new_case crashlock
+  set_state "LAST_RUN=$(ago 50)"
+  mkdir -p "$lock"
+  case "$kind" in
+    "dead pid") echo "$dead" > "$lock/pid" ;;
+    "old, no pid") touch -t 202601010000 "$lock" ;;
+    "old, live pid") echo "$$" > "$lock/pid"; touch -t 202601010000 "$lock" ;;
+  esac
+  run_due
+  expect_eq "crashed lock ($kind): exit 1" 1 "$rc"
+  expect_has "crashed lock ($kind): notification says what to remove" "remove that folder" "$(calls notify)"
+  expect_eq "crashed lock ($kind): no ticket" 0 "$(count jira)"
+  expect_eq "crashed lock ($kind): no start-task.sh" 0 "$(count start '^ARGS=')"
+  if [ -d "$lock" ]; then ok "crashed lock ($kind): kept"; else bad "crashed lock ($kind): kept"; fi
+  rm -rf "$tmp/crashlock"
+done
 
 # Two calls at once (launchd at wake, plus a hand run): one ticket, one session.
 new_case race
-set_state "LAST_RUN=2026-09-01"
+set_state "LAST_RUN=$(ago 50)"
 due_cmd STUB_START_DELAY=1 > "$log/race1.out" 2>&1 &
 p1=$!
 due_cmd STUB_START_DELAY=1 > "$log/race2.out" 2>&1 &
@@ -393,21 +468,28 @@ expect_eq "two calls at once: one session" 1 "$(count start '^ARGS=')"
 expect_has "two calls at once: the other one stops" "nothing to do" "$(cat "$log/race1.out" "$log/race2.out")"
 expect_started "two calls at once"
 
-# ---- 7. DRY_RUN=1 -----------------------------------------------------------------------------
+# ---- 7. DRY_RUN -------------------------------------------------------------------------------
 
-new_case dry
-run_due DRY_RUN=1
-expect_eq "dry run: exit 0" 0 "$rc"
-expect_has "dry run: ticket action" \
-  "DRY_RUN: would create a ticket: python3 $tmp/jira_stub.py create --project PROJ --type Task --label security --summary 'Security check: $server $today'" "$out"
-expect_has "dry run: session action" \
-  "DRY_RUN: would run: AGTERM_ENABLED=1 TASK_SEED='/security-check $server --ticket PROJ-NEW. First read" "$out"
-expect_has "dry run: state action" "DRY_RUN: would save $state_file: LAST_RUN=$today LAST_KEY=PROJ-NEW PENDING_KEY=" "$out"
-expect_nothing_done "dry run: nothing done"
-if [ -e "$home/.local/state" ]; then bad "dry run: no state folder, no lock"; else ok "dry run: no state folder, no lock"; fi
+for v in 1 true; do
+  new_case "dry$v"
+  run_due DRY_RUN=$v
+  expect_eq "DRY_RUN=$v: exit 0" 0 "$rc"
+  expect_has "DRY_RUN=$v: no fetch" "DRY_RUN: would fetch origin" "$out"
+  expect_has "DRY_RUN=$v: ticket action" \
+    "DRY_RUN: would create a ticket: python3 $tmp/jira_stub.py create --project PROJ --type Task --label security --summary 'Security check: $server $today'" "$out"
+  expect_has "DRY_RUN=$v: session action" "DRY_RUN: would run: AGTERM_ENABLED=1 TASK_SEED='$(seed_for PROJ-NEW)'" "$out"
+  expect_has "DRY_RUN=$v: state action" "DRY_RUN: would save $state_file: LAST_RUN=$today LAST_KEY=PROJ-NEW PENDING_KEY=" "$out"
+  expect_nothing_done "DRY_RUN=$v: nothing done"
+  if [ -e "$home/.local/state" ]; then bad "DRY_RUN=$v: no state folder, no lock"; else ok "DRY_RUN=$v: no state folder, no lock"; fi
+done
+
+new_case dry0
+run_due DRY_RUN=0
+expect_eq "DRY_RUN=0 is a real run: one ticket" 1 "$(count jira '^create|')"
+expect_started "DRY_RUN=0"
 
 new_case drypending
-set_state "LAST_RUN=2026-09-01" "PENDING_KEY=$key"
+set_state "LAST_RUN=$(ago 50)" "PENDING_KEY=$key"
 cp "$state_file" "$tmp/drypending/before"
 run_due DRY_RUN=1
 expect_has "dry run, pending: reuses" "reusing $key" "$out"
@@ -421,42 +503,9 @@ expect_eq "dry run, agterm down: exit 0" 0 "$rc"
 expect_has "dry run, agterm down: prints the notification" "DRY_RUN: would notify: Security check of $server is due" "$out"
 expect_nothing_done "dry run, agterm down: no notification"
 
-# A real worktree of a repo whose commit holds the profile: a dry run uses it, a real run refuses it.
-wt_src="$tmp/code/wtsrc"
-wt="$tmp/code/wtreal"
-mkdir -p "$wt_src/infra/security-check"
-echo "server: $server" > "$wt_src/infra/security-check/$server.yml"
-if git -C "$wt_src" init -q \
-  && git -C "$wt_src" add -A \
-  && git -C "$wt_src" -c user.name=test -c user.email=test@example.invalid -c commit.gpgsign=false \
-       -c core.hooksPath=/dev/null commit -q --no-verify -m profile \
-  && git -C "$wt_src" -c core.hooksPath=/dev/null worktree add -q "$wt" 2>/dev/null \
-  && [ -f "$wt/.git" ]; then
-  new_case drywt
-  arg_repo="$wt"
-  run_due DRY_RUN=1
-  expect_eq "dry run, a worktree: exit 0" 0 "$rc"
-  expect_has "dry run, a worktree: warns" "'$wt' is a worktree, not the main checkout: a real run refuses it" "$out"
-  expect_has "dry run, a worktree: ticket action" "DRY_RUN: would create a ticket: python3 $tmp/jira_stub.py create --project PROJ" "$out"
-  expect_has "dry run, a worktree: session action" "bash $home/.claude/skills/new-task/scripts/start-task.sh $wt PROJ-NEW" "$out"
-  expect_nothing_done "dry run, a worktree: nothing done"
-  if [ -e "$home/.local/state" ]; then bad "dry run, a worktree: no state folder"; else ok "dry run, a worktree: no state folder"; fi
-
-  new_case realwt
-  arg_repo="$wt"
-  run_due
-  expect_eq "real run, a worktree: exit 2" 2 "$rc"
-  expect_has "real run, a worktree: says why" "'$wt' is not the main checkout of a git repo" "$out"
-  expect_eq "real run, a worktree: no ticket" 0 "$(count jira)"
-  expect_eq "real run, a worktree: no start-task.sh" 0 "$(count start '^ARGS=')"
-  if [ -e "$home/.local/state" ]; then bad "real run, a worktree: no state"; else ok "real run, a worktree: no state"; fi
-else
-  bad "dry run, a worktree: could not make a git worktree for the test"
-fi
-
 # ---- 8. errors --------------------------------------------------------------------------------
 
-# expect_refused <label> <exit code> <message>: failed before a ticket; one notification at most.
+# expect_refused <label> <exit code> <message>: failed before a ticket.
 expect_refused() {
   expect_eq "$1: exit $2" "$2" "$rc"
   expect_has "$1: says why" "$3" "$out"
@@ -464,19 +513,39 @@ expect_refused() {
   expect_eq "$1: no start-task.sh" 0 "$(count start '^ARGS=')"
 }
 
-new_case oldstart
-run_due START_TASK="$tmp/old-start-task.sh"
-expect_refused "old start-task.sh" 1 "has no TASK_SEED override"
-expect_has "old start-task.sh: notification" "has no TASK_SEED override" "$(calls notify)"
+new_case nostart
+rm "$home/.claude/skills/new-task/scripts/start-task.sh"
+run_due
+expect_refused "no start-task.sh" 1 "start-task.sh of the new-task skill not found"
+expect_has "no start-task.sh: notification" "start-task.sh of the new-task skill not found" "$(calls notify)"
 
 new_case nobrief
-run_due SECURITY_CHECK_BRIEF="$tmp/no-such-brief.md"
-expect_refused "missing run brief" 1 "run brief not found at $tmp/no-such-brief.md"
+rm "$home/.claude/skills/security-check/references/run-brief.md"
+run_due
+expect_refused "missing run brief" 1 "run brief not found at $home/.claude/skills/security-check/references/run-brief.md"
 
 new_case noprofile
 arg_server="other-host"
 run_due
-expect_refused "no profile" 1 "no profile security-check/other-host.yml"
+expect_refused "no profile on origin" 1 "no profile security-check/other-host.yml on origin/main"
+
+# The profile only in the main checkout's files, not on origin: refused.
+make_repo "$tmp/local"
+mkdir -p "$tmp/local/code/demo/infra/security-check"
+echo "server: local-host" > "$tmp/local/code/demo/infra/security-check/local-host.yml"
+g -C "$tmp/local/code/demo" add -A
+new_case localprofile
+arg_repo="$tmp/local/code/demo"
+arg_server="local-host"
+run_due
+expect_refused "profile only in the main checkout's index" 1 "no profile security-check/local-host.yml on origin/main"
+
+mkdir -p "$tmp/noorigin/demo"
+g -C "$tmp/noorigin/demo" init -q
+new_case noorigin
+arg_repo="$tmp/noorigin/demo"
+run_due
+expect_refused "no origin remote" 1 "has no branch origin/main"
 
 if [ -z "$jira_in_parents" ]; then
   new_case nojira
@@ -487,15 +556,21 @@ else
 fi
 
 new_case parentjira
-mkdir -p "$tmp/code/.claude/skills/jira-tickets/scripts"
-cp "$tmp/jira_stub.py" "$tmp/code/.claude/skills/jira-tickets/scripts/jira.py"
+mkdir -p "$tmp/base/code/.claude/skills/jira-tickets/scripts"
+cp "$tmp/jira_stub.py" "$tmp/base/code/.claude/skills/jira-tickets/scripts/jira.py"
 run_due JIRA_PY=
 expect_eq "jira.py in a parent folder: exit 0" 0 "$rc"
-expect_eq "jira.py in a parent folder: used" "$tmp/code/.claude/skills/jira-tickets/scripts/jira.py" "$(start_env JIRA_PY)"
-rm -rf "$tmp/code/.claude"
+expect_eq "jira.py in a parent folder: used" "$tmp/base/code/.claude/skills/jira-tickets/scripts/jira.py" "$(start_env JIRA_PY)"
+
+new_case repojira
+mkdir -p "$repo/.claude/skills/jira-tickets/scripts"
+cp "$tmp/jira_stub.py" "$repo/.claude/skills/jira-tickets/scripts/jira.py"
+run_due JIRA_PY=
+expect_eq "jira.py in the repo and a parent: the repo's wins" "$repo/.claude/skills/jira-tickets/scripts/jira.py" "$(start_env JIRA_PY)"
+rm -rf "$tmp/base/code/.claude" "$repo/.claude"
 
 new_case jirafail
-set_state "LAST_RUN=2026-09-01" "LAST_KEY=PROJ-100"
+set_state "LAST_RUN=$(ago 50)" "LAST_KEY=PROJ-100"
 cp "$state_file" "$tmp/jirafail/before"
 run_due STUB_JIRA_FAIL=1
 expect_eq "Jira create fails: exit 1" 1 "$rc"
@@ -509,6 +584,12 @@ expect_eq "Jira answer without a key: exit 1" 1 "$rc"
 expect_eq "Jira answer without a key: no start-task.sh" 0 "$(count start '^ARGS=')"
 expect_eq "Jira answer without a key: no pending ticket" "" "$(state_val PENDING_KEY)"
 
+new_case nostatedir
+mkdir -p "$home/.local"
+echo "not a folder" > "$home/.local/state"
+run_due
+expect_refused "state folder cannot be created" 1 "cannot create $home/.local/state/security-check"
+
 for st in "LAST_RUN=yesterday" "LAST_RUN=2026-13-45" "PENDING_KEY=not-a-key" "PENDING_KEY=OTHER-5"; do
   new_case broken
   set_state "$st"
@@ -520,19 +601,22 @@ for st in "LAST_RUN=yesterday" "LAST_RUN=2026-13-45" "PENDING_KEY=not-a-key" "PE
   rm -rf "$tmp/broken"
 done
 
-# A worktree: .git is a file.
+# A worktree: .git is a file. Refused by a real run and by a dry run.
 mkdir -p "$tmp/code/wt"
 echo "gitdir: $repo/.git/worktrees/wt" > "$tmp/code/wt/.git"
 
 for bad_args in "server=bad/name" "server=x y" "server=../x" "server=-x" "server=" \
-                "project=proj" "project=P-1" "project=" "repo=$tmp/no-such-repo" "repo=$tmp/code/wt"; do
+                "project=proj" "project=P-1" "project=" "repo=$tmp/no-such-repo" "repo=$tmp/code/wt" \
+                "dry repo=$tmp/code/wt"; do
   new_case badargs
+  dry_env=""
   case "$bad_args" in
     server=*) arg_server="${bad_args#server=}" ;;
     project=*) arg_project="${bad_args#project=}" ;;
     repo=*) arg_repo="${bad_args#repo=}" ;;
+    "dry repo="*) arg_repo="${bad_args#dry repo=}"; dry_env="DRY_RUN=1" ;;
   esac
-  run_due
+  run_due ${dry_env:+"$dry_env"}
   expect_eq "bad argument $bad_args: exit 2" 2 "$rc"
   expect_eq "bad argument $bad_args: no ticket" 0 "$(count jira)"
   expect_eq "bad argument $bad_args: no start-task.sh" 0 "$(count start '^ARGS=')"
@@ -540,26 +624,24 @@ for bad_args in "server=bad/name" "server=x y" "server=../x" "server=-x" "server
   rm -rf "$tmp/badargs"
 done
 
-for env_bad in "SECURITY_CHECK_INTERVAL_DAYS=two" "SECURITY_CHECK_TODAY=2026-02-30"; do
-  new_case badenv
-  run_due "$env_bad"
-  expect_eq "bad $env_bad: exit 2" 2 "$rc"
-  expect_eq "bad $env_bad: no ticket" 0 "$(count jira)"
-  rm -rf "$tmp/badenv"
-done
+new_case badenv
+run_due SECURITY_CHECK_INTERVAL_DAYS=two
+expect_eq "bad SECURITY_CHECK_INTERVAL_DAYS: exit 2" 2 "$rc"
+expect_eq "bad SECURITY_CHECK_INTERVAL_DAYS: no ticket" 0 "$(count jira)"
 
 # ---- 9. the whole chain with the real start-task.sh -------------------------------------------
 
 if [ -f "$real_start_task" ] && grep -q TASK_SEED "$real_start_task"; then
   new_case chain
-  run_due START_TASK="$real_start_task" NEW_WT="$tmp/new-worktree.sh"
+  cp "$real_start_task" "$home/.claude/skills/new-task/scripts/start-task.sh"
+  run_due NEW_WT="$tmp/new-worktree.sh"
   brief="$home/.claude/task-briefs/$key.md"
   uuid="$(sed -n 's/^TASK_STARTED .* claude=\([^ ]*\) .*/\1/p' <<<"$out")"
   expect_eq "chain: exit 0" 0 "$rc"
   expect_eq "chain: Jira create, get, transition, comment" \
     "$(printf 'create\nget\ntransition\ncomment')" "$(calls jira | cut -d'|' -f1)"
   expect_eq "chain: the typed command runs /security-check on the ticket" \
-    "claude --session-id $uuid -n \"$key Security check: $server $today\" \"/security-check $server --ticket $key. First read the task brief $brief and follow it for the whole run.\"" \
+    "claude --session-id $uuid -n \"$key Security check: $server $today\" \"/security-check $server --ticket $key (first read the task brief $brief and follow it for the whole run)\"" \
     "$(head -n 1 "$log/typed" 2>/dev/null)"
   expect_has "chain: brief from the run brief" "# Security run brief — $key" "$(head -n 1 "$brief" 2>/dev/null)"
   expect_not_has "chain: every brief placeholder filled" "{{" "$(cat "$brief" 2>/dev/null)"
@@ -569,6 +651,16 @@ else
   echo "WARN: no start-task.sh with TASK_SEED at $real_start_task; chain test skipped"
 fi
 
+# launchd gives a bare environment: only what the plist sets (PATH, AGTERM_*), plus HOME.
+new_case launchd
+plist_path="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+out="$(env -i HOME="$home" PATH="$tmp/bin:$plist_path" AGTERM_ENABLED=1 STUB_LOG="$log" STUB_TODAY="$today" \
+  JIRA_PY="$tmp/jira_stub.py" "$BASH_BIN" "$due" "$repo" "$server" "$project" 2>&1)"
+rc=$?
+expect_eq "launchd-like environment: exit 0" 0 "$rc"
+expect_eq "launchd-like environment: one ticket" 1 "$(count jira '^create|')"
+expect_started "launchd-like environment"
+
 # ---- 10. install-launchd.sh -------------------------------------------------------------------
 
 # run_install <repo> <server> <project> [VAR=value ...]
@@ -576,7 +668,6 @@ run_install() {
   local r="$1" s="$2" p="$3"
   shift 3
   out="$(env -u AGTERM_SOCKET HOME="$home" PATH="$tmp/bin:$PATH" STUB_LOG="$log" \
-    PLIST_DIR="$home/LaunchAgents" LAUNCHCTL="$tmp/bin/launchctl" \
     "$@" "$BASH_BIN" "$install" "$r" "$s" "$p" 2>&1)"
   rc=$?
 }
@@ -588,7 +679,7 @@ new_install_case() {
   new_case "$1"
   mkdir -p "$home/.claude/skills/security-check/scripts"
   cp "$due" "$home/.claude/skills/security-check/scripts/security-check-due.sh"
-  plist="$home/LaunchAgents/local.security-check.$server.plist"
+  plist="$home/Library/LaunchAgents/local.security-check.$server.plist"
 }
 
 plist=""
@@ -605,9 +696,7 @@ if command -v plutil >/dev/null 2>&1; then
   expect_eq "install: no sixth argument" "" "$(pl ProgramArguments.5)"
   expect_eq "install: daily at 10:00" "10:0" "$(pl StartCalendarInterval.Hour):$(pl StartCalendarInterval.Minute)"
   expect_eq "install: not at load" "false" "$(pl RunAtLoad)"
-  expect_has "install: PATH has /usr/local/bin" "/usr/local/bin" "$(pl EnvironmentVariables.PATH)"
-  expect_has "install: PATH has /opt/homebrew/bin" "/opt/homebrew/bin" "$(pl EnvironmentVariables.PATH)"
-  expect_not_has "install: PATH has no nvm" "nvm" "$(pl EnvironmentVariables.PATH)"
+  expect_eq "install: PATH" "$plist_path" "$(pl EnvironmentVariables.PATH)"
   expect_eq "install: AGTERM_ENABLED" "1" "$(pl EnvironmentVariables.AGTERM_ENABLED)"
   expect_eq "install: AGTERM_SOCKET" "$home/Library/Application Support/agterm/agterm.sock" "$(pl EnvironmentVariables.AGTERM_SOCKET)"
   expect_eq "install: log path" "$home/Library/Logs/security-check-$server.log|$home/Library/Logs/security-check-$server.log" \
@@ -644,7 +733,7 @@ if command -v plutil >/dev/null 2>&1; then
     new_install_case badname
     run_install "$repo" "$name" "$project"
     expect_eq "install, bad server name '$name': exit 2" 2 "$rc"
-    expect_eq "install, bad server name '$name': no plist" "" "$(ls "$home/LaunchAgents" 2>/dev/null)"
+    expect_eq "install, bad server name '$name': no plist" "" "$(ls "$home/Library/LaunchAgents" 2>/dev/null)"
     expect_eq "install, bad server name '$name': no launchctl" 0 "$(count launchctl)"
     rm -rf "$tmp/badname"
   done
@@ -660,7 +749,7 @@ if command -v plutil >/dev/null 2>&1; then
   expect_has "install, a worktree: says why" "not the main checkout" "$out"
 
   new_case notinstalled
-  plist="$home/LaunchAgents/local.security-check.$server.plist"
+  plist="$home/Library/LaunchAgents/local.security-check.$server.plist"
   run_install "$repo" "$server" "$project"
   expect_eq "install, due script not installed: exit 1" 1 "$rc"
   expect_has "install, due script not installed: says why" "is not installed" "$out"

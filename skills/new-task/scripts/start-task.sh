@@ -66,10 +66,11 @@ status="$(jq -r '.status' <<<"$ticket")"
 url="$(jq -r '.url' <<<"$ticket")"
 description="$(jq -r '.description // ""' <<<"$ticket")"
 
-# Text that goes into a typed shell command: drop quotes, $, backticks, backslashes.
+# Text that goes into a typed shell command: drop quotes, $, backticks, backslashes, and "!"
+# (an interactive shell expands it inside double quotes: history).
 # ('…\\' ends the set with a backslash, then "'" adds the single quote; SC1003 is a false alarm.)
 # shellcheck disable=SC1003
-clean="$(printf '%s' "$summary" | tr -d '"`$\\'"'" | tr -s ' ')"
+clean="$(printf '%s' "$summary" | tr -d '!"`$\\'"'" | tr -s ' ')"
 name="$(printf '%s %s' "$key" "$clean" | cut -c1-60 | sed 's/ *$//')"
 
 if [ -z "$branch" ]; then

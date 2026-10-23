@@ -13,6 +13,9 @@
 # 3. overrides set but empty → the defaults
 # 4. TASK_BRIEF_TEMPLATE names a missing file → clear error; no worktree, no session, no Jira
 # 5. TASK_SEED with a character the typed shell would expand → clear error; nothing started
+# 6. an open agterm session of the same ticket blocks the start; one of PROJ-1234 does not
+#
+# The Jira summary holds " $ ! and a {{BRIEF}}: they must be dropped, or stay literal.
 set -uo pipefail
 shopt -u patsub_replacement 2>/dev/null || true   # bash 5.2+: keep '&' literal in ${v//p/r}
 
@@ -30,8 +33,8 @@ tmp="$(cd "$tmp" && pwd -P)"   # the script resolves paths with pwd -P
 
 key="PROJ-123"
 # shellcheck disable=SC2016  # a literal $ on purpose: start-task.sh must drop it
-summary='R&D rankings: no "way" to clear $filters'
-clean='R&D rankings: no way to clear filters'   # start-task.sh drops " $ ` \ and '
+summary='R&D rankings! no "way" to clear $filters {{BRIEF}}'
+clean='R&D rankings no way to clear filters {{BRIEF}}'   # start-task.sh drops ! " $ ` \ and '
 name="$key $clean"
 status="To Do"
 url="https://jira.example.com/browse/$key"
@@ -46,7 +49,8 @@ cat > "$tmp/bin/agtermctl" <<'EOF'
 # Logs every call; "session type" also logs the typed text (the last argument).
 printf '%s\n' "$*" >> "$STUB_LOG/agtermctl.calls"
 case "$1 ${2:-}" in
-  "tree --json")  echo '{"windows":[]}' ;;
+  "tree --json")  empty='{"result":{"tree":{"workspaces":[]}}}'
+                  printf '%s\n' "${STUB_TREE:-$empty}" ;;
   "session new")  echo '{"result":{"id":"SID-1"}}' ;;
   "session type") printf '%s\n' "${!#}" >> "$STUB_LOG/typed" ;;
 esac
@@ -105,7 +109,7 @@ run_case() {
   log="$tmp/$case_name/log"
   mkdir -p "$home" "$log"
   rm -rf "$repo/.claude"
-  out="$(env -u TASK_SEED -u TASK_BRIEF_TEMPLATE -u TASK_NEXT -u AGTERM_SESSION_ID -u AGTERM_SOCKET \
+  out="$(env -u TASK_SEED -u TASK_BRIEF_TEMPLATE -u TASK_NEXT -u AGTERM_SESSION_ID -u AGTERM_SOCKET -u STUB_TREE \
     HOME="$home" PATH="$tmp/bin:$PATH" STUB_LOG="$log" AGTERM_ENABLED=1 \
     JIRA_PY="$tmp/jira_stub.py" NEW_WT="$tmp/new-worktree.sh" \
     STUB_SUMMARY="$summary" STUB_STATUS="$status" STUB_URL="$url" STUB_DESCRIPTION="$description" \
@@ -214,13 +218,27 @@ expect_nothing_started "missing template: nothing started"
 # ---- 5. seed the typed shell would expand -----------------------------------------------------
 
 # shellcheck disable=SC2016  # literal $( ) and backticks on purpose
-for seed in '/security-check x --ticket {{KEY}} "$(id)"' '/x `id`' '/x a\b' '/x hi!' "$(printf '/x a\nb')"; do
+for seed in '/security-check x --ticket {{KEY}} "$(id)"' '/x $(id)' '/x `id`' '/x a\b' '/x hi!' \
+            "$(printf '/x a\nb')" "$(printf '/x a\rb')"; do
   run_case badseed TASK_SEED="$seed"
   expect_eq "bad seed $(printf '%q' "$seed"): exit 1" 1 "$rc"
   expect_has "bad seed: error says why" "ERROR: TASK_SEED must not contain" "$out"
   expect_nothing_started "bad seed: nothing started"
   rm -rf "$tmp/badseed"
 done
+
+# ---- 6. one session per ticket ----------------------------------------------------------------
+
+# The shape of "agtermctl tree --json": result.tree.workspaces[].sessions[].
+tree_with() { printf '{"result":{"tree":{"workspaces":[{"sessions":[{"id":"SID-9","name":"%s","cwd":"/w"}]}]}}}' "$1"; }
+
+run_case other STUB_TREE="$(tree_with "PROJ-1234 Another ticket")"
+expect_eq "open session of PROJ-1234: PROJ-123 still starts" 0 "$rc"
+
+run_case same STUB_TREE="$(tree_with "$key Earlier try")"
+expect_eq "open session of the same ticket: exit 1" 1 "$rc"
+expect_has "open session of the same ticket: says so" "an agterm session for $key already exists (sid=SID-9)" "$out"
+expect_nothing_started "open session of the same ticket: nothing started"
 
 echo
 if [ "$fails" -eq 0 ]; then

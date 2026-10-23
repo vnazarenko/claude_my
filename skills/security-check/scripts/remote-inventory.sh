@@ -13,7 +13,12 @@
 # - pm2, nvm, npm and systemctl are never run: they can start daemons or write files
 # - process facts come only from the /proc/<pid>/exe link: no process arguments,
 #   no process environment, no app config files
+# - a file under a folder other users can write (nvm, pm2, deploys) is read only when it is a
+#   regular file and not a symlink, and only a value of the expected shape is passed on
+#   (a version, a pid, a git sha): root never follows a link to another file, and never
+#   waits on a FIFO
 # - a missing tool or file gives null or [], never an error
+# The test also runs this script in a container and checks that no file changed.
 #
 # Keep the style simple, the test reads this file line by line: one command per line,
 # no heredocs, no backticks, no "case", no multi-line $( ... ).
@@ -24,6 +29,9 @@ die() { printf 'remote-inventory: %s\n' "$*" >&2; exit 2; }
 
 # A path from the command line: absolute, plain characters, no "..".
 safe_path() { [[ $1 == /* && $1 != *..* && $1 =~ ^[A-Za-z0-9_./@+-]+$ ]]; }
+
+# A file root may read in a folder that other users can write: a regular file, not a symlink.
+plain_file() { [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ]; }
 
 pm2_homes=()
 rev_files=()
@@ -144,7 +152,8 @@ fi
 # A dry run lists each upgrade as
 #   Inst <pkg> [<installed>] (<candidate> <Label>:<release>/<archive>, ... [<arch>])
 # The label is the repo's name (Ubuntu, Docker CE, ...). It can be missing for vendor repos.
-# The cache options stop apt from writing its binary cache; NoLocking leaves the dpkg lock alone.
+# The cache options stop apt from writing its binary cache; the empty Planner log stops it from
+# rewriting /var/log/apt/eipp.log.xz; NoLocking leaves the dpkg lock alone.
 upg_json=null
 if command -v apt-get >/dev/null 2>&1; then
   upg=()
@@ -176,21 +185,29 @@ if command -v apt-get >/dev/null 2>&1; then
     done
     src=${dpkg_src[$name]:-$name}
     upg+=("{\"package\":$(js "$name"),\"source\":$(js "$src"),\"installed\":$(js "$installed"),\"candidate\":$(js "$candidate"),\"origin\":$(js "$origin"),\"archives\":$(jarr ${archives[@]+"${archives[@]}"})}")
-  done < <(apt-get --simulate -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= -o Debug::NoLocking=1 dist-upgrade 2>/dev/null)
+  done < <(apt-get --simulate -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= -o Dir::Log::Planner= -o Debug::NoLocking=1 dist-upgrade 2>/dev/null)
   upg_json=$(jarr ${upg[@]+"${upg[@]}"})
 fi
 
 # ---- running binaries, from /proc/<pid>/exe links only -----------------------------------------
 
-declare -A running=() deleted=()
-while IFS= read -r exe; do
+# The link of a process in a container names the path INSIDE the container. When the link's
+# target is not the host file at that path ("-ef" compares device and inode), the process is
+# counted as a container process, not as the host binary.
+declare -A running=() deleted=() in_container=()
+while IFS=$'\t' read -r dir exe; do
   [ -n "$exe" ] || continue
+  pid=${dir##*/}
+  [[ $pid =~ ^[0-9]+$ ]] || continue
   if [[ $exe == *' (deleted)' ]]; then
     exe=${exe% (deleted)}
     deleted[$exe]=1
+  elif [ ! "/proc/$pid/exe" -ef "$exe" ]; then
+    [ -d "/proc/$pid" ] && in_container[$exe]=$(( ${in_container[$exe]:-0} + 1 ))
+    continue
   fi
   running[$exe]=$(( ${running[$exe]:-0} + 1 ))
-done < <(find /proc/[0-9]*/exe -maxdepth 0 -printf '%l\n' 2>/dev/null)
+done < <(find /proc/[0-9]*/exe -maxdepth 0 -printf '%h\t%l\n' 2>/dev/null)
 
 # A binary replaced on disk but still running: the old code runs until a restart.
 deleted_json=()
@@ -202,57 +219,50 @@ done < <(printf '%s\n' "${!deleted[@]}" | sort)
 
 # "v24.21.0" from an nvm path; the nodejs package version for the system binary; else empty.
 node_version() {
-  if [[ $1 =~ /versions/node/(v[0-9][^/]*)/bin/node$ ]]; then
+  if [[ $1 =~ /versions/node/(v[0-9]+\.[0-9]+\.[0-9]+)/bin/node$ ]]; then
     printf '%s' "${BASH_REMATCH[1]}"
   elif [ "$1" = /usr/bin/node ] || [ "$1" = /usr/bin/nodejs ]; then
     printf '%s' "${dpkg_ver[nodejs]:-}"
   fi
 }
 
-declare -A node_paths=() node_default=()
+declare -A node_paths=() node_in_container=()
 nvm_json=()
 for nvm in /root/.nvm /home/*/.nvm /usr/local/nvm /opt/nvm; do
   [ -d "$nvm/versions/node" ] || continue
+  # The "default" alias as written ("22", "lts/*", ...). nvm resolves it; Claude does too.
   dflt=""
-  if [ -r "$nvm/alias/default" ]; then read -r dflt < "$nvm/alias/default"; fi
+  if plain_file "$nvm/alias/default"; then read -r dflt < "$nvm/alias/default"; fi
+  [[ $dflt =~ ^[A-Za-z0-9._/*-]{1,32}$ ]] || dflt=""
   nvm_json+=("{\"nvm_dir\":$(js "$nvm"),\"default_alias\":$(js "$dflt")}")
-  vers=()
   for bin in "$nvm"/versions/node/*/bin/node; do
-    [ -e "$bin" ] || continue
-    node_paths[$bin]=1
-    v=${bin%/bin/node}
-    vers+=("${v##*/}")
+    [ -e "$bin" ] && node_paths[$bin]=1
   done
-  # nvm reads "22", "v22.2" or "v22.2.0" as the newest install that matches.
-  # Other aliases (lts/*, node) are only reported in nvm_json.
-  want=${dflt#v}
-  if [ ${#vers[@]} -gt 0 ] && [[ $want =~ ^[0-9]+(\.[0-9]+)?(\.[0-9]+)?$ ]]; then
-    while IFS= read -r v; do
-      if [ "${v#v}" = "$want" ] || [[ ${v#v} == "$want".* ]]; then
-        node_default["$nvm/versions/node/$v/bin/node"]=1
-        break
-      fi
-    done < <(printf '%s\n' "${vers[@]}" | sort -rV)
-  fi
 done
 for exe in "${!running[@]}"; do
   [[ ${exe##*/} == node || ${exe##*/} == nodejs ]] && node_paths[$exe]=1
+done
+for exe in "${!in_container[@]}"; do
+  [[ ${exe##*/} == node || ${exe##*/} == nodejs ]] && node_in_container[$exe]=1
 done
 
 node_json=()
 while IFS= read -r p; do
   [ -n "$p" ] || continue
-  d=false
-  [ -n "${node_default[$p]:-}" ] && d=true
-  node_json+=("{\"path\":$(js "$p"),\"version\":$(js "$(node_version "$p")"),\"running\":${running[$p]:-0},\"default_alias\":$d}")
+  node_json+=("{\"path\":$(js "$p"),\"version\":$(js "$(node_version "$p")"),\"running\":${running[$p]:-0},\"container\":false}")
 done < <(printf '%s\n' "${!node_paths[@]}" | sort)
+# A container's Node: its version is the image's, not the host package's.
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  node_json+=("{\"path\":$(js "$p"),\"version\":null,\"running\":${in_container[$p]},\"container\":true}")
+done < <(printf '%s\n' "${!node_in_container[@]}" | sort)
 
 # ---- pm2: the daemon's Node and the pm2 version, read from files -------------------------------
 
-# The top "version" of a package.json.
+# The top "version" of a package.json, when it looks like a version.
 json_version() {
-  local line re='^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)"'
-  [ -r "$1" ] || return 0
+  local line re='^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([0-9][0-9A-Za-z.+-]{0,31})"'
+  plain_file "$1" || return 0
   while IFS= read -r line; do
     if [[ $line =~ $re ]]; then printf '%s' "${BASH_REMATCH[1]}"; return 0; fi
   done < "$1"
@@ -261,7 +271,7 @@ json_version() {
 pm2_json=()
 for home in ${pm2_homes[@]+"${pm2_homes[@]}"}; do
   pid="" exe="" nver="" pver="" pidfile=false up=false
-  if [ -r "$home/pm2.pid" ]; then
+  if plain_file "$home/pm2.pid"; then
     pidfile=true
     read -r pid < "$home/pm2.pid"
   fi
@@ -337,7 +347,7 @@ fi
 revs=()
 for f in ${rev_files[@]+"${rev_files[@]}"}; do
   sha=""
-  if [ -r "$f" ]; then read -r sha < "$f"; fi
+  if plain_file "$f"; then read -r sha < "$f"; fi
   [[ $sha =~ ^[0-9a-f]{7,40}$ ]] || sha=""
   revs+=("$(js "$f"):$(js "$sha")")
 done

@@ -13,7 +13,12 @@
 #   connection, so the server gets no way back to the user's keys
 # - accepts only absolute paths made of plain characters, without "..", because the
 #   remote shell reads the arguments again
-# - checks that the answer is valid JSON and sets "host" to <ssh_host>
+# - stops a connection that hangs (ServerAlive: about 1 minute without an answer)
+# - treats the answer as untrusted data, because other users on the server can write the files
+#   it comes from: it must be valid JSON; a revision that is not a git sha becomes null; every
+#   other string keeps only plain characters (A-Z a-z 0-9 . _ : + ~ / @ * , - and space; others
+#   become "?") and at most 200 of them
+# - sets "host" to <ssh_host>
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd -P)"
@@ -44,11 +49,24 @@ done
 
 out=$(ssh -a -x -T \
   -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes \
-  -o BatchMode=yes -o ConnectTimeout=20 \
+  -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
   -o ControlMaster=no -o ControlPath=none -o PermitLocalCommand=no \
   -- "$host" bash -s -- ${args[@]+"${args[@]}"} < "$remote")
 rc=$?
 [ "$rc" -eq 0 ] || die "inventory on $host failed (ssh exit $rc)"
 
-jq -e --arg host "$host" '.host = $host' <<< "$out" 2>/dev/null \
-  || die "$host did not return valid JSON"
+# shellcheck disable=SC2016 # $host is a jq variable
+clean='
+  def plain: if type == "string" then gsub("[^A-Za-z0-9._:+~/@*, -]"; "?") | .[0:200] else . end;
+  def walk_plain:
+    if type == "object" then with_entries(.key |= plain | .value |= walk_plain)
+    elif type == "array" then map(walk_plain)
+    else plain end;
+  if type != "object" then error("not an object") else . end
+  | .revisions |= (if type == "object"
+                   then with_entries(.value |= (if type == "string" and test("^[0-9a-f]{7,40}$") then . else null end))
+                   else {} end)
+  | walk_plain
+  | .host = $host'
+jq -e --arg host "$host" "$clean" <<< "$out" 2>/dev/null \
+  || die "$host did not return a valid inventory (JSON object)"

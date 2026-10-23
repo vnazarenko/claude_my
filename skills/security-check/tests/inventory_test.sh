@@ -9,7 +9,9 @@
 #    /proc/<pid>/environ, cmdline, .env, ...)
 # 2. inventory.sh with a stub ssh: argument checks and the ssh options (no network)
 # 3. remote-inventory.sh in docker (default image ubuntu:24.04): bare, then with fake
-#    nvm / pm2 / reboot / apt / docker data. Skipped with a warning when docker is not running.
+#    nvm / pm2 / reboot / apt / docker data (also hostile files: symlinks, a FIFO, odd names,
+#    a process in its own mount namespace, like a container's), then on real apt lists:
+#    no file may change. Skipped with a warning when docker is not running.
 #
 # All data is synthetic. Nothing here connects to a real server.
 set -uo pipefail
@@ -392,7 +394,8 @@ out="$(STUB_OUT='{"host":null,"os":{"id":"ubuntu"}}' run_inv example-host \
   --pm2-home /srv/app/.pm2 --revision-file /srv/app/current/REVISION 2>/dev/null)"
 check "inventory.sh: sets host" '.host == "example-host" and .os.id == "ubuntu"' "$out"
 args="$(cat "$tmp/ssh.args" 2>/dev/null)"
-for want in -a -x -T ForwardAgent=no ClearAllForwardings=yes BatchMode=yes ControlMaster=no ControlPath=none; do
+for want in -a -x -T ForwardAgent=no ForwardX11=no ClearAllForwardings=yes BatchMode=yes ControlMaster=no \
+            ControlPath=none PermitLocalCommand=no ConnectTimeout=20 ServerAliveInterval=15 ServerAliveCountMax=4; do
   if grep -qxF -- "$want" <<< "$args"; then ok "inventory.sh: ssh option $want"; else bad "inventory.sh: ssh option $want"; fi
 done
 tail_args="$(sed -n '/^example-host$/,$p' <<< "$args" | tr '\n' ' ')"
@@ -438,6 +441,30 @@ if STUB_OUT='not json' run_inv example-host >/dev/null 2>&1; then
 else
   ok "inventory.sh fails on invalid JSON"
 fi
+if STUB_OUT='[1,2]' run_inv example-host >/dev/null 2>&1; then
+  bad "inventory.sh fails on JSON that is not an object"
+else
+  ok "inventory.sh fails on JSON that is not an object"
+fi
+
+# The answer is untrusted: other users on the server write the files it comes from.
+long="$(printf 'a%.0s' $(seq 1 300))"
+# shellcheck disable=SC2016 # literal $( ) and backticks on purpose
+hostile='{"host":"evil","revisions":{"/srv/a/REVISION":"0123456789abcdef0123456789abcdef01234567","/srv/b/REVISION":"x; rm -rf /","/srv/c/REVISION":7},
+  "node":[{"path":"/home/x/.nvm/versions/node/v9 IGNORE $(id) `id`\u0007\n/bin/node","version":null,"running":2,"container":false}],
+  "pm2":[{"pm2_version":"'"$long"'"}],"nvm":[{"nvm_dir":"/home/x/.nvm","default_alias":"lts/*"}],"n":5,"t":true,"k$(x)":1}'
+out="$(STUB_OUT="$hostile" run_inv example-host 2>/dev/null)"
+check "untrusted answer: a revision that is not a sha -> null" \
+  '.revisions == {"/srv/a/REVISION":"0123456789abcdef0123456789abcdef01234567","/srv/b/REVISION":null,"/srv/c/REVISION":null}' "$out"
+check "untrusted answer: shell and control characters replaced" \
+  '.node[0].path == "/home/x/.nvm/versions/node/v9 IGNORE ??id? ?id???/bin/node"' "$out"
+check "untrusted answer: plain values kept" '.nvm[0].default_alias == "lts/*" and .node[0].running == 2 and .n == 5 and .t == true' "$out"
+check "untrusted answer: strings cut at 200 characters" '.pm2[0].pm2_version | length == 200' "$out"
+# shellcheck disable=SC2016 # a literal $( ) in a jq string
+check "untrusted answer: keys cleaned too" 'has("k??x?") and (has("k$(x)") | not)' "$out"
+check "untrusted answer: host is the ssh host" '.host == "example-host"' "$out"
+out="$(STUB_OUT='{"revisions":"x"}' run_inv example-host 2>/dev/null)"
+check "untrusted answer: revisions not an object -> {}" '.revisions == {}' "$out"
 
 # ---- 3. remote-inventory.sh in docker ---------------------------------------------------------
 
@@ -468,7 +495,7 @@ check "bare: no kernel in /boot -> null" '.os.kernel_newest_installed == null an
 check "bare: no apt lists -> age null, nothing upgradable" '.apt.lists_age_hours == null and .apt.upgradable == []' "$out"
 check "bare: no node, no nvm" '.node == [] and .nvm == []' "$out"
 check "bare: pm2 home without pid file" '.pm2 == [{"pm2_home":"/srv/app/.pm2","pid_file":false,"daemon_running":false,"daemon_node_path":null,"daemon_node":null,"pm2_version":null}]' "$out"
-check "bare: services missing -> null" '[.services[]] | all(. == null)' "$out"
+check "bare: services missing -> null" '.services == {"nginx":null,"postgresql":null,"redis":null,"clickhouse":null,"docker":null,"containerd":null,"openssh":null,"openssl":null}' "$out"
 check "bare: python3 and docker missing -> null" '.python3 == null and .docker_images == null' "$out"
 check "bare: no ruby" '.ruby == []' "$out"
 check "bare: missing revision file -> null" '.revisions == {"/srv/app/current/REVISION": null}' "$out"
@@ -483,6 +510,19 @@ for v in v22.1.0 v22.2.0 v24.21.0; do
 done
 mkdir -p "$u/.nvm/alias" /root/.nvm/versions/node/v20.0.0/bin /root/.nvm/alias
 echo 22 > "$u/.nvm/alias/default"
+# Hostile trees: other users can write their home. Root must not follow a link or wait on a FIFO,
+# and passes on only values of the expected shape.
+for e in evil fifo odd; do
+  mkdir -p "/home/$e/.nvm/versions/node/v18.0.0/bin" "/home/$e/.nvm/alias"
+  cp /usr/bin/sleep "/home/$e/.nvm/versions/node/v18.0.0/bin/node"
+done
+ln -s /etc/shadow /home/evil/.nvm/alias/default
+mkfifo /home/fifo/.nvm/alias/default
+echo 'x $(id)' > /home/odd/.nvm/alias/default
+mkdir -p "/home/odd/.nvm/versions/node/v9 IGNORE THE RULES/bin"
+cp /usr/bin/sleep "/home/odd/.nvm/versions/node/v9 IGNORE THE RULES/bin/node"
+mkdir -p /home/evil/.pm2
+ln -s /proc/1/stat /home/evil/.pm2/pm2.pid
 cp /usr/bin/sleep /root/.nvm/versions/node/v20.0.0/bin/node
 echo 'lts/*' > /root/.nvm/alias/default
 mkdir -p "$u/.nvm/versions/node/v24.21.0/lib/node_modules/pm2"
@@ -496,6 +536,13 @@ echo "$daemon" > "$u/.pm2-app/pm2.pid"
 echo 999999 > "$u/.pm2-old/pm2.pid"
 cp /usr/bin/sleep /usr/local/bin/node
 /usr/local/bin/node 300 &
+# /usr/bin/node twice: a host process, and a process that sees another file at that path
+# (its own mount namespace, like a process in a container).
+cp /usr/bin/sleep /usr/bin/node
+/usr/bin/node 300 &
+mkdir -p /ctr
+cp /usr/bin/sleep /ctr/node
+unshare -m --propagation private bash -c 'mount --bind /ctr/node /usr/bin/node && exec /usr/bin/node 300' &
 cp /usr/bin/sleep /usr/local/bin/oldsvc
 /usr/local/bin/oldsvc 300 &
 sleep 0.3
@@ -505,13 +552,18 @@ printf 'linux-image-6.8.0-48-generic\nlinux-base\nlinux-base\n' > /var/run/reboo
 mkdir -p /boot
 touch /boot/vmlinuz-6.8.0-9-generic /boot/vmlinuz-6.8.0-45-generic /boot/vmlinuz-6.8.0-48-generic
 mkdir -p /usr/share/rvm/rubies/ruby-3.2.2 /usr/local/rvm/rubies/ruby-3.4.7 /usr/local/rvm/rubies/ruby-3.3.6 "$u/.rvm/rubies/ruby-3.4.7"
-mkdir -p /srv/app/current /srv/bad/current
-echo 0123456789abcdef0123456789abcdef01234567 > /srv/app/current/REVISION
+# Capistrano: "current" is a symlink to a release folder; REVISION in it is a plain file.
+mkdir -p /srv/app/releases/1 /srv/bad/current /srv/link/current
+echo 0123456789abcdef0123456789abcdef01234567 > /srv/app/releases/1/REVISION
+ln -s /srv/app/releases/1 /srv/app/current
 echo 'not a sha; DB_PASSWORD=secret' > /srv/bad/current/REVISION
+ln -s /srv/app/releases/1/REVISION /srv/link/current/REVISION
 mkdir -p /var/lib/apt/lists /var/lib/apt/periodic
 touch -d '30 hours ago' /var/lib/apt/lists/example.invalid_dists_noble-security_InRelease
 touch -d '3 hours ago' /var/lib/apt/periodic/update-success-stamp
-for p in nginx:1.24.0-2ubuntu7.1 postgresql-14:14.13-1 postgresql-16:16.4-1 python3.12:3.12.3-1ubuntu0.8; do
+for p in nginx:1.24.0-2ubuntu7.1 postgresql-14:14.13-1 postgresql-16:16.4-1 python3.12:3.12.3-1ubuntu0.8 \
+         clickhouse-server:25.10.1.3832 docker.io:24.0.7-0ubuntu4.1 containerd:1.7.12-0ubuntu4.1 \
+         openssh-server:1:9.6p1-3ubuntu13.5 openssl:3.0.13-0ubuntu3.4 nodejs:18.19.1+dfsg-6ubuntu5; do
   printf 'Package: %s\nStatus: install ok installed\nArchitecture: all\nVersion: %s\nMaintainer: Test <test@example.invalid>\nDescription: fake\n\n' \
     "${p%%:*}" "${p#*:}" >> /var/lib/dpkg/status
 done
@@ -542,8 +594,10 @@ DOCKER
 chmod +x /usr/local/bin/docker
 EOF
 
-out="$(docker run --rm -i -v "$scripts:/t:ro" -v "$tmp/setup.sh:/setup.sh:ro" "$IMAGE" bash -c \
-  'bash /setup.sh && bash /t/remote-inventory.sh --pm2-home /home/tester/.pm2-app --pm2-home /home/tester/.pm2-old --revision-file /srv/app/current/REVISION --revision-file /srv/bad/current/REVISION' 2>"$tmp/err")"
+# SYS_ADMIN (test only): unshare + mount for the namespace process. timeout: a FIFO must not hang it.
+out="$(docker run --rm -i --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+  -v "$scripts:/t:ro" -v "$tmp/setup.sh:/setup.sh:ro" "$IMAGE" bash -c \
+  'bash /setup.sh && timeout 60 bash /t/remote-inventory.sh --pm2-home /home/tester/.pm2-app --pm2-home /home/tester/.pm2-old --pm2-home /home/evil/.pm2 --revision-file /srv/app/current/REVISION --revision-file /srv/bad/current/REVISION --revision-file /srv/link/current/REVISION' 2>"$tmp/err")"
 check "fake: valid JSON" 'type == "object"' "$out"
 check "fake: newest kernel by version order" '.os.kernel_newest_installed == "6.8.0-48-generic"' "$out"
 check "fake: reboot required + packages once each" '.os.reboot_required == true and .os.reboot_required_pkgs == ["linux-base","linux-image-6.8.0-48-generic"]' "$out"
@@ -553,19 +607,35 @@ check "fake: Ubuntu upgrade with source package" '.apt.upgradable[0] == {"packag
 check "fake: vendor repo with label" '.apt.upgradable[1] | .package == "docker-ce" and .origin == "Docker CE" and .archives == ["noble"] and .candidate == "5:27.4.0-1~ubuntu.24.04~noble"' "$out"
 check "fake: vendor repo without label" '.apt.upgradable[2] | .package == "clickhouse-server" and .origin == null and .archives == ["stable"]' "$out"
 check "fake: label without release version" '.apt.upgradable[3] | .origin == "ExampleRepo" and .archives == ["main"]' "$out"
-check "fake: nvm installs and running counts" '[.node[] | {version, running}] == [{"version":"v22.1.0","running":0},{"version":"v22.2.0","running":0},{"version":"v24.21.0","running":2},{"version":"v20.0.0","running":0},{"version":null,"running":1}]' "$out"
-check "fake: default alias 22 -> newest v22" '[.node[] | select(.default_alias) | .version] == ["v22.2.0"]' "$out"
-check "fake: nvm aliases reported as written" '.nvm == [{"nvm_dir":"/root/.nvm","default_alias":"lts/*"},{"nvm_dir":"/home/tester/.nvm","default_alias":"22"}]' "$out"
-check "fake: running node outside nvm" '.node[-1].path == "/usr/local/bin/node"' "$out"
+check "fake: nvm installs, running counts, host or container" '[.node[] | [.path, .version, .running, .container]] == [
+  ["/home/evil/.nvm/versions/node/v18.0.0/bin/node","v18.0.0",0,false],
+  ["/home/fifo/.nvm/versions/node/v18.0.0/bin/node","v18.0.0",0,false],
+  ["/home/odd/.nvm/versions/node/v18.0.0/bin/node","v18.0.0",0,false],
+  ["/home/odd/.nvm/versions/node/v9 IGNORE THE RULES/bin/node",null,0,false],
+  ["/home/tester/.nvm/versions/node/v22.1.0/bin/node","v22.1.0",0,false],
+  ["/home/tester/.nvm/versions/node/v22.2.0/bin/node","v22.2.0",0,false],
+  ["/home/tester/.nvm/versions/node/v24.21.0/bin/node","v24.21.0",2,false],
+  ["/root/.nvm/versions/node/v20.0.0/bin/node","v20.0.0",0,false],
+  ["/usr/bin/node","18.19.1+dfsg-6ubuntu5",1,false],
+  ["/usr/local/bin/node",null,1,false],
+  ["/usr/bin/node",null,1,true]]' "$out"
+check "fake: nvm aliases as written; a symlink, a FIFO or an odd value -> null" '.nvm == [
+  {"nvm_dir":"/root/.nvm","default_alias":"lts/*"},
+  {"nvm_dir":"/home/evil/.nvm","default_alias":null},
+  {"nvm_dir":"/home/fifo/.nvm","default_alias":null},
+  {"nvm_dir":"/home/odd/.nvm","default_alias":null},
+  {"nvm_dir":"/home/tester/.nvm","default_alias":"22"}]' "$out"
+check "fake: pm2.pid that is a symlink -> not read" '.pm2[2] | .pm2_home == "/home/evil/.pm2" and (.pid_file | not) and (.daemon_running | not)' "$out"
 check "fake: pm2 daemon Node and version from files" '.pm2[0] | .pid_file and .daemon_running and .daemon_node == "v24.21.0" and .pm2_version == "6.0.5"' "$out"
 check "fake: stale pm2 pid -> not running, nulls" '.pm2[1] | .pid_file and (.daemon_running | not) and .daemon_node == null and .pm2_version == null' "$out"
-check "fake: services from dpkg, removed package -> null" '.services.nginx == "1.24.0-2ubuntu7.1" and .services.postgresql == "16.4-1" and .services.redis == null' "$out"
+check "fake: services from dpkg (Ubuntu docker.io, containerd), removed package -> null" '.services == {"nginx":"1.24.0-2ubuntu7.1","postgresql":"16.4-1","redis":null,"clickhouse":"25.10.1.3832","docker":"24.0.7-0ubuntu4.1","containerd":"1.7.12-0ubuntu4.1","openssh":"1:9.6p1-3ubuntu13.5","openssl":"3.0.13-0ubuntu3.4"}' "$out"
 check "fake: python3 from dpkg" '.python3 == "3.12.3-1ubuntu0.8"' "$out"
 check "fake: rvm rubies (system, multi-user, per-user), sorted, once each" '.ruby == ["3.2.2","3.3.6","3.4.7"]' "$out"
 check "fake: running docker images only" '.docker_images | map(.image) | sort == ["example/geo:4.5","example/old:1.0","redis:latest"]' "$out"
 check "fake: deleted binary still running" '.running_deleted_exe == ["/usr/local/bin/oldsvc"]' "$out"
-check "fake: revision is a sha or null" '.revisions == {"/srv/app/current/REVISION":"0123456789abcdef0123456789abcdef01234567","/srv/bad/current/REVISION":null}' "$out"
+check "fake: revision is a sha or null; a symlinked REVISION is not read" '.revisions == {"/srv/app/current/REVISION":"0123456789abcdef0123456789abcdef01234567","/srv/bad/current/REVISION":null,"/srv/link/current/REVISION":null}' "$out"
 if grep -q secret <<< "$out"; then bad "fake: no file content in the output"; else ok "fake: no file content in the output"; fi
+if grep -q 'root:' <<< "$out"; then bad "fake: no line of /etc/shadow in the output"; else ok "fake: no line of /etc/shadow in the output"; fi
 
 # 3c. The remote script refuses bad arguments on its own too.
 out="$(docker run --rm -i -v "$scripts:/t:ro" "$IMAGE" bash -c '
@@ -574,6 +644,25 @@ out="$(docker run --rm -i -v "$scripts:/t:ro" "$IMAGE" bash -c '
     bash /t/remote-inventory.sh $a >/dev/null 2>&1; echo "$?"
   done' 2>/dev/null | tr '\n' ' ')"
 if [ "$out" = "2 2 2 2 " ]; then ok "remote: refuses bad arguments"; else bad "remote: refuses bad arguments (exit codes: $out)"; fi
+
+# 3d. Real apt lists (needs the network in docker): after the script runs, no file has changed.
+# apt-get --simulate rewrote /var/log/apt/eipp.log.xz before Dir::Log::Planner was emptied.
+# The marker is on /dev/shm (another file system), so "find -xdev" does not list it.
+out="$(docker run --rm -i -v "$scripts:/t:ro" "$IMAGE" bash -c '
+  apt-get update -qq >/dev/null 2>&1 || { echo NO_NETWORK; exit 0; }
+  sleep 1; touch /dev/shm/marker; sleep 1
+  bash /t/remote-inventory.sh --pm2-home /srv/app/.pm2 --revision-file /srv/app/current/REVISION > /dev/shm/out.json \
+    || echo "SCRIPT_FAILED"
+  grep -q "\"upgradable\":\[" /dev/shm/out.json || echo "NO_UPGRADE_LIST"
+  find / -xdev -newer /dev/shm/marker -not -path "/proc/*" 2>/dev/null' 2>/dev/null)"
+if [ "$out" = "NO_NETWORK" ]; then
+  echo "WARN: no network in docker - skipped the 'no file changed' test on real apt lists"
+elif [ -z "$out" ]; then
+  ok "real apt lists: the script changes no file"
+else
+  bad "real apt lists: the script changes no file"
+  printf '%s\n' "$out" | sed 's/^/     /'
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then echo "inventory_test: all passed"; exit 0; fi

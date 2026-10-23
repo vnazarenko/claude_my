@@ -57,9 +57,9 @@ Nothing critical. No Critical, High or exploited fix is missing for anything tha
 
 ### Node.js
 
-<Only when Node needs an update. The steps from references/sources.md, filled in: the new
-version, the files to change in the repo, the pm2 restart, the startup unit, the check, the
-rollback.>
+<Only when Node needs an update. The steps from the app's ours[].deploy_doc when it has one,
+else from references/sources.md, filled in: the new version, the files to change in the repo,
+the pm2 restart, the boot unit, the check, the rollback.>
 
 ## Not ours (needs owner)
 

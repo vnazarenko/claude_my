@@ -11,6 +11,7 @@ Each command prints one JSON object on stdout.
 node  For each Node.js version on the server: the security releases of the same major line
       that are newer than ours, the version that fixes them all, the newest release of the
       line, and whether the line is still supported.
+      A Node process in a container is listed, not checked: check the container's image.
       Data: the nodejs.org release index and the Node.js release schedule.
 usn   For each upgradable package from an Ubuntu repo: the CVEs that are fixed after the
       installed version, with Ubuntu's priority, the fixed version and the USN ids.
@@ -25,7 +26,8 @@ Every pending fix is listed, of any age. "in_window" marks the ones published in
 --since-days days (default 14) before --today (default: today, UTC).
 
 Network: only HTTPS GET requests to the sources above, all through Fetcher, which keeps a
-disk cache (default ~/.cache/security-check, or $SECURITY_CHECK_CACHE).
+disk cache (default ~/.cache/security-check, or $SECURITY_CHECK_CACHE). A cached answer is
+used for 6 hours, for every source.
 Exit codes: 0 ok, 1 a source could not be fetched, 2 bad input.
 """
 
@@ -50,12 +52,7 @@ UBUNTU_CVES_URL = "https://ubuntu.com/security/cves.json"
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 
 HOUR = 3600
-MAX_AGE = {
-    NODE_INDEX_URL: 6 * HOUR,
-    NODE_SCHEDULE_URL: 7 * 24 * HOUR,
-    KEV_URL: 12 * HOUR,
-}
-UBUNTU_MAX_AGE = 12 * HOUR
+CACHE_MAX_AGE = 6 * HOUR  # for every URL
 PAGE_SIZE = 20   # the most the Ubuntu API gives per page
 MAX_PAGES = 15   # per source package, so at most 300 CVEs
 TIMEOUT = 60
@@ -141,8 +138,8 @@ def default_cache_dir():
 class Fetcher:
     """Get a JSON document by URL, with a disk cache.
 
-    A cached copy younger than max_age seconds is used without a request.
-    Only a valid JSON answer is written to the cache.
+    A cached copy younger than CACHE_MAX_AGE seconds is used without a request.
+    A cached copy that is not valid JSON is ignored. Only a valid JSON answer is written.
     """
 
     def __init__(self, cache_dir, opener=None, now=time.time):
@@ -154,12 +151,16 @@ class Fetcher:
         name = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
         return os.path.join(self.cache_dir, name + ".json")
 
-    def get_json(self, url, max_age):
+    def get_json(self, url, valid=lambda data: True):
+        """The JSON at url. Only an answer that passes valid() is cached or taken from the cache;
+        the caller still checks the shape and names the error."""
         path = self.cache_path(url)
         try:
-            if self.now() - os.stat(path).st_mtime < max_age:
+            if self.now() - os.stat(path).st_mtime < CACHE_MAX_AGE:
                 with open(path, "rb") as f:
-                    return json.loads(f.read())
+                    cached = json.loads(f.read())
+                if valid(cached):
+                    return cached
         except (OSError, ValueError):
             pass
         try:
@@ -174,7 +175,8 @@ class Fetcher:
             data = json.loads(body)
         except ValueError:
             raise FetchError(f"could not fetch {url}: the answer is not JSON") from None
-        self._save(path, body)
+        if valid(data):
+            self._save(path, body)
         return data
 
     def _save(self, path, body):
@@ -290,23 +292,29 @@ def header(command, today, since_days, sources):
 # ---- node ------------------------------------------------------------------------------------
 
 def node_installs(inv):
-    """Every Node binary in the inventory, with the pm2 homes whose daemon runs it."""
+    """Every Node binary in the inventory, with the pm2 homes whose daemon runs it.
+
+    One path can be there twice: the host file, and a process in a container
+    (container: true) that runs another file at the same path. They stay apart.
+    """
     installs = {}
     for n in inv.get("node") or []:
         path = n.get("path")
         if not path:
             continue
-        installs[path] = {"path": path, "version": n.get("version"),
-                          "running": n.get("running") or 0,
-                          "default_alias": bool(n.get("default_alias")), "pm2_homes": []}
+        container = n.get("container") is True
+        installs[(path, container)] = {"path": path, "version": n.get("version"),
+                                       "running": n.get("running") or 0,
+                                       "container": container, "pm2_homes": []}
     for p in inv.get("pm2") or []:
         path = p.get("daemon_node_path")
         if not path:
             continue
-        if path not in installs:
-            installs[path] = {"path": path, "version": p.get("daemon_node"), "running": 0,
-                              "default_alias": False, "pm2_homes": []}
-        installs[path]["pm2_homes"].append(p.get("pm2_home"))
+        key = (path, False)  # a pm2 daemon found on the host runs a host file
+        if key not in installs:
+            installs[key] = {"path": path, "version": p.get("daemon_node"), "running": 0,
+                             "container": False, "pm2_homes": []}
+        installs[key]["pm2_homes"].append(p.get("pm2_home"))
     return [installs[k] for k in sorted(installs)]
 
 
@@ -352,7 +360,7 @@ def node_report(inv, fetcher, today, since_days):
         out["notes"].append("no Node.js found in the inventory")
         return out
 
-    index = fetcher.get_json(NODE_INDEX_URL, MAX_AGE[NODE_INDEX_URL])
+    index = fetcher.get_json(NODE_INDEX_URL, valid=lambda d: isinstance(d, list))
     if not isinstance(index, list):
         raise FetchError(f"unexpected answer from {NODE_INDEX_URL}: not a list")
     releases = []
@@ -369,7 +377,7 @@ def node_report(inv, fetcher, today, since_days):
                              "lts": r.get("lts") or None, "security": r.get("security") is True})
 
     try:
-        schedule = fetcher.get_json(NODE_SCHEDULE_URL, MAX_AGE[NODE_SCHEDULE_URL])
+        schedule = fetcher.get_json(NODE_SCHEDULE_URL, valid=lambda d: isinstance(d, dict))
     except FetchError as e:
         schedule = None
         out["notes"].append(f"release schedule not checked ({e}); line support is unknown")
@@ -390,8 +398,13 @@ def node_report(inv, fetcher, today, since_days):
         upstream = upstream_node_version(version)
         if not upstream:
             entry["status"] = "not_checked"
-            entry["reason"] = ("not an upstream Node.js version (a distro package? see the usn command)"
-                               if version else "version unknown")
+            if version:
+                entry["reason"] = ("not an upstream Node.js version "
+                                   "(a distro package? see the usn command)")
+            elif all(i["container"] for i in group):
+                entry["reason"] = "runs in a container: check the container's image"
+            else:
+                entry["reason"] = "version unknown"
             continue
         if upstream != version:
             entry["upstream_version"] = upstream
@@ -427,21 +440,29 @@ def is_ubuntu_origin(origin):
 
 
 def ubuntu_cves(fetcher, source, codename):
-    """All CVEs with a released fix for `source` in `codename`. Returns (cves, truncated)."""
+    """All CVEs with a released fix for `source` in `codename`. Returns (cves, truncated).
+
+    Pages are read until total_results is reached. When an answer has no total_results,
+    until a page that is not full. At most MAX_PAGES pages; more means truncated.
+    """
     found, offset = [], 0
     for _ in range(MAX_PAGES):
         query = urllib.parse.urlencode([("package", source), ("version", codename),
                                         ("status", "released"), ("limit", PAGE_SIZE),
                                         ("offset", offset)])
         url = f"{UBUNTU_CVES_URL}?{query}"
-        data = fetcher.get_json(url, UBUNTU_MAX_AGE)
+        data = fetcher.get_json(url, valid=lambda d: isinstance(d, dict) and isinstance(d.get("cves"), list))
         if not isinstance(data, dict) or not isinstance(data.get("cves"), list):
             raise FetchError(f"unexpected answer from {url}: no 'cves' list")
         page = data["cves"]
         found.extend(c for c in page if isinstance(c, dict))
         offset += len(page)
         total = data.get("total_results")
-        if not page or not isinstance(total, int) or offset >= total:
+        if not page:
+            return found, False
+        if isinstance(total, int) and offset >= total:
+            return found, False
+        if not isinstance(total, int) and len(page) < PAGE_SIZE:
             return found, False
     return found, True
 
@@ -591,7 +612,8 @@ def kev_report(ids, fetcher):
            "date_released": None, "checked": len(ids), "hits": [], "not_listed": []}
     if not ids:
         return out
-    data = fetcher.get_json(KEV_URL, MAX_AGE[KEV_URL])
+    data = fetcher.get_json(KEV_URL, valid=lambda d: isinstance(d, dict)
+                            and isinstance(d.get("vulnerabilities"), list))
     vulns = data.get("vulnerabilities") if isinstance(data, dict) else None
     if not isinstance(vulns, list):
         raise FetchError(f"unexpected answer from {KEV_URL}: no 'vulnerabilities' list")

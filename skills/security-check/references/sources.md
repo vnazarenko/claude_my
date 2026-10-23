@@ -45,6 +45,9 @@ A binary that is installed but does not run is still listed when it is used by a
 
 - Affects us: a running Node (`running` > 0) or a pm2 daemon's Node → `yes` for most CVEs. Read
   each CVE: some are only for Windows, the permission model, or a module we do not use.
+- **A project deploy doc wins.** When the app has `ours[].deploy_doc`, take the update and
+  rollback steps from it: it knows how this server boots the app. The steps below are the
+  generic case, for apps without one.
 - Update proposal (as the app's user, never as root):
   1. `nvm install <fixed_in>` — this does **not** move the `default` alias. Do not move it when
      other apps use it.
@@ -52,11 +55,14 @@ A binary that is installed but does not run is still listed when it is used by a
      config), then deploy.
   3. pm2 in cluster mode runs workers on the **daemon's** Node. `pm2 reload` cannot change it.
      The daemon must restart: `pm2 kill`, start the app again, `pm2 save` — a few seconds of
-     outage. Then regenerate `pm2 startup` from the new Node, because the boot unit names the
-     old Node's path.
-  4. check: the pm2 daemon's Node in the next inventory (`pm2[].daemon_node`).
-- Rollback: keep the old version installed. Revert the pin, deploy, `pm2 kill` and start on the
-  old Node, regenerate `pm2 startup`.
+     outage. Then the boot unit must name the new Node's path: regenerate it with
+     `pm2 startup`, or edit its Node paths when the unit was written by hand.
+  4. a custom `PM2_HOME`: `pm2 startup` can write a unit with two `Environment=PM2_HOME=`
+     lines, and systemd uses the last one (often the shared `~/.pm2`). Check that the unit has
+     exactly one, and that it is yours.
+  5. check: the pm2 daemon's Node in the next inventory (`pm2[].daemon_node`).
+- Rollback: keep the old version installed. Revert the pin, deploy, restart the daemon on the
+  old Node, and point the boot unit back at it.
 
 A distro Node (`/usr/bin/node`, a dpkg version such as `18.19.1+dfsg-…`):
 
@@ -69,8 +75,9 @@ A distro Node (`/usr/bin/node`, a dpkg version such as `18.19.1+dfsg-…`):
 - Compare with upstream: when its major line is end of life, every Node security release since
   then says "End-of-Life versions are always affected".
 - `running` counts `/proc/<pid>/exe` links. For a process inside a container, the link is the path
-  **inside** the container, so a running `/usr/bin/node` may be a container process, not the
-  host package. When `docker_images[]` is not empty, write "host package or a container".
+  **inside** the container. The inventory compares the link's target with the host file at that
+  path: a container's process is listed apart, with `container: true` and `version: null`. Its
+  Node is the image's: check the image (`docker_images[]`), not the host package.
 
 ## pm2
 
@@ -78,7 +85,8 @@ A distro Node (`/usr/bin/node`, a dpkg version such as `18.19.1+dfsg-…`):
 - Advisories: `https://github.com/Unitech/pm2/security/advisories` and
   `https://github.com/advisories?query=pm2`. `pnpm audit` does not see a global pm2.
 - Update: `npm i -g pm2@<version>` under the same Node, then `pm2 update` — this restarts the
-  daemon. Propose it together with a Node update when there is one.
+  daemon. Propose it together with a Node update when there is one. When systemd owns the daemon
+  (a boot unit), restart it through the unit instead, and follow `ours[].deploy_doc` when set.
 
 ## Ubuntu packages (OpenSSL, OpenSSH, nginx, PostgreSQL, Redis, Python, libraries)
 

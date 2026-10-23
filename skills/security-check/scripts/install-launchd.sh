@@ -16,10 +16,10 @@
 #   - log: ~/Library/Logs/security-check-<server>.log
 # Checks it with plutil -lint, then reloads it: launchctl bootout (an error is fine: not loaded)
 # and launchctl bootstrap gui/<uid>. Running it again replaces the job.
+# The first run starts 14 days after the newest report of <server> on origin's default branch
+# (or at once when there is none): the due script decides.
 #
 # Environment (optional):
-#   PLIST_DIR      default ~/Library/LaunchAgents
-#   LAUNCHCTL      default launchctl
 #   AGTERM_SOCKET  default ~/Library/Application Support/agterm/agterm.sock
 #
 # Exit: 0 installed, 1 failed, 2 bad usage.
@@ -30,8 +30,7 @@ repo_in="${1:-}"
 server="${2:-}"
 project="${3:-}"
 
-PLIST_DIR="${PLIST_DIR:-$HOME/Library/LaunchAgents}"
-LAUNCHCTL="${LAUNCHCTL:-launchctl}"
+plist_dir="$HOME/Library/LaunchAgents"
 sock="${AGTERM_SOCKET:-$HOME/Library/Application Support/agterm/agterm.sock}"
 due="$HOME/.claude/skills/security-check/scripts/security-check-due.sh"
 logs="$HOME/Library/Logs"
@@ -55,7 +54,7 @@ repo="$(cd "$repo_in" 2>/dev/null && pwd -P)" || usage "repo '$repo_in' does not
 command -v plutil >/dev/null 2>&1 || die "plutil not found: this needs macOS"
 
 label="local.security-check.$server"
-plist="$PLIST_DIR/$label.plist"
+plist="$plist_dir/$label.plist"
 log_file="$logs/security-check-$server.log"
 uid="$(id -u)"
 
@@ -68,7 +67,7 @@ xml() {
   printf '%s' "$s"
 }
 
-mkdir -p "$PLIST_DIR" "$logs" || die "cannot create $PLIST_DIR or $logs"
+mkdir -p "$plist_dir" "$logs" || die "cannot create $plist_dir or $logs"
 tmp="$plist.tmp.$$"
 trap 'rm -f "$tmp"' EXIT
 cat > "$tmp" <<EOF || die "cannot write $tmp"
@@ -118,16 +117,17 @@ echo "wrote $plist"
 
 # Reload: bootout fails when the job is not loaded, which is fine. Right after a bootout,
 # bootstrap can fail for a moment ("Input/output error"), so it gets three tries.
-"$LAUNCHCTL" bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
 ok=0
 for try in 1 2 3; do
-  if "$LAUNCHCTL" bootstrap "gui/$uid" "$plist"; then ok=1; break; fi
+  if launchctl bootstrap "gui/$uid" "$plist"; then ok=1; break; fi
   [ "$try" = 3 ] || sleep 1
 done
 [ "$ok" = 1 ] || die "launchctl bootstrap gui/$uid $plist failed"
 
 cat <<EOF
 loaded $label: every day at 10:00, a run every 14 days
+first: 14 days after the newest $server report on origin (at once when there is none)
 check: launchctl print gui/$uid/$label
 log:   $log_file
 state: ~/.local/state/security-check/$server.state

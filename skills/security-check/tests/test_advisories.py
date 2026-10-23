@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -188,9 +189,50 @@ class TestNode(Base):
         self.assertEqual(len(v["missed_security_releases"]), 1)  # still reported
         self.assertFalse(v["new_in_window"])
 
+    def test_release_on_window_start_is_in_window(self):
+        data = self.run_report("node", extra=("--since-days", "3"))
+        self.assertEqual(data["window_start"], "2026-10-20")
+        v = self.versions(data)["v24.21.0"]
+        self.assertEqual(v["missed_security_releases"],
+                         [{"version": "v24.22.1", "date": "2026-10-20", "in_window": True}])
+        self.assertTrue(v["new_in_window"])
+
+    def support(self, version, today):
+        """The support state of one install of `version` on the day `today`."""
+        inv = {"node": [{"path": "/opt/x/bin/node", "version": version, "running": 1,
+                         "container": False}]}
+        rc, data, err = self.run_main(["node", self.write_inventory(inv), "--today", today])
+        self.assertEqual(rc, 0, err)
+        return data["versions"][0]["support"]
+
+    def check_support(self, cases):
+        for version, today, want in cases:
+            with self.subTest(version=version, today=today):
+                self.assertEqual(self.support(version, today), want)
+
+    def test_support_before_and_on_start(self):
+        # v26: start 2026-05-05, lts 2026-10-28
+        self.check_support([("v26.0.0", "2026-05-04", "not_released"),
+                            ("v26.0.0", "2026-05-05", "current"),
+                            ("v26.0.0", TODAY, "current")])
+
+    def test_support_on_lts_and_maintenance_days(self):
+        # v26: lts 2026-10-28. v24: maintenance 2026-10-20. v25 (no LTS): maintenance 2026-04-01
+        self.check_support([("v26.0.0", "2026-10-27", "current"),
+                            ("v26.0.0", "2026-10-28", "active_lts"),
+                            ("v24.21.0", "2026-10-19", "active_lts"),
+                            ("v24.21.0", "2026-10-20", "maintenance_lts"),
+                            ("v25.8.0", "2026-03-31", "current"),
+                            ("v25.8.0", "2026-04-01", "maintenance")])
+
+    def test_end_day_is_not_end_of_life(self):
+        # v25: end 2026-06-01; end of life starts the day after
+        self.check_support([("v25.8.0", "2026-06-01", "maintenance"),
+                            ("v25.8.0", "2026-06-02", "end_of_life")])
+
     def test_up_to_date_is_empty(self):
         inv = {"node": [{"path": "/home/app/.nvm/versions/node/v24.22.1/bin/node",
-                         "version": "v24.22.1", "running": 1, "default_alias": True}]}
+                         "version": "v24.22.1", "running": 1, "container": False}]}
         v = self.versions(self.run_report("node", inv))["v24.22.1"]
         self.assertEqual(v["status"], "up_to_date")
         self.assertEqual(v["missed_security_releases"], [])
@@ -217,7 +259,29 @@ class TestNode(Base):
         self.assertEqual(v["18.19.1+dfsg-6ubuntu5"]["status"], "not_checked")
         self.assertIn("distro package", v["18.19.1+dfsg-6ubuntu5"]["reason"])
         self.assertEqual(v[None]["status"], "not_checked")
+        # a host binary with no version, and a process in a container
         self.assertEqual(v[None]["reason"], "version unknown")
+        self.assertEqual(v[None]["installs"], 2)
+
+    def test_same_path_on_host_and_in_container(self):
+        inv = inventory()
+        inv["pm2"].append({"pm2_home": "/srv/sys/.pm2", "daemon_running": True,
+                           "daemon_node_path": "/usr/bin/node", "daemon_node": "18.19.1"})
+        data = self.run_report("node", inv)
+        for i in data["installs"]:
+            self.assertNotIn("default_alias", i)
+        usr = [i for i in data["installs"] if i["path"] == "/usr/bin/node"]
+        self.assertEqual([(i["container"], i["version"], i["running"], i["pm2_homes"]) for i in usr],
+                         [(False, "18.19.1+dfsg-6ubuntu5", 0, ["/srv/sys/.pm2"]),
+                          (True, None, 1, [])])
+
+    def test_container_processes_not_checked(self):
+        inv = {"node": [{"path": "/usr/bin/node", "version": None, "running": 2, "container": True},
+                        {"path": "/app/bin/node", "version": None, "running": 1, "container": True}]}
+        v = self.versions(self.run_report("node", inv))[None]
+        self.assertEqual(v["status"], "not_checked")
+        self.assertEqual(v["reason"], "runs in a container: check the container's image")
+        self.assertEqual((v["installs"], v["running"]), (2, 3))
 
     def test_nodesource_package_is_checked(self):
         inv = {"node": [{"path": "/usr/bin/node", "version": "22.11.0-1nodesource1", "running": 1}]}
@@ -297,6 +361,27 @@ class TestFetch(Base):
         fetcher = adv.Fetcher(self.cache)
         self.assertFalse(os.path.exists(fetcher.cache_path(adv.KEV_URL)))
 
+    def test_wrong_shape_is_an_error_and_not_cached(self):
+        bad = FakeWeb(override={adv.KEV_URL: b'{"vulnerabilities": "maintenance"}'})
+        rc, _, err = self.run_main(["kev", "CVE-2026-0101"], bad)
+        self.assertEqual(rc, 1)
+        self.assertIn("no 'vulnerabilities' list", err)
+        self.assertFalse(os.path.exists(adv.Fetcher(self.cache).cache_path(adv.KEV_URL)))
+        good = FakeWeb()
+        rc, data, err = self.run_main(["kev", "CVE-2026-0101"], good)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(good.calls, [adv.KEV_URL])
+
+    def test_cached_wrong_shape_is_fetched_again(self):
+        path = adv.Fetcher(self.cache).cache_path(adv.NODE_INDEX_URL)
+        os.makedirs(self.cache)
+        with open(path, "w") as f:
+            f.write('{"error": "rate limited"}')  # valid JSON, wrong shape; the file is new
+        web = FakeWeb()
+        rc, data, err = self.run_main(["node", self.write_inventory(inventory()), "--today", TODAY], web)
+        self.assertEqual(rc, 0, err)
+        self.assertIn(adv.NODE_INDEX_URL, web.calls)
+
     def test_cache_hit_skips_fetch(self):
         first = FakeWeb()
         data1 = self.run_report("usn", web=first)
@@ -306,16 +391,37 @@ class TestFetch(Base):
         self.assertEqual(second.calls, [])
         self.assertEqual(data1, data2)
 
-    def test_old_cache_is_fetched_again(self):
+    def test_one_cache_age_for_every_url(self):
+        self.assertEqual(adv.CACHE_MAX_AGE, 6 * 3600)
+        for url in (adv.NODE_INDEX_URL, adv.NODE_SCHEDULE_URL, adv.KEV_URL):
+            with self.subTest(url=url):
+                web = FakeWeb()
+                fetcher = adv.Fetcher(self.cache, opener=web)
+                fetcher.get_json(url)
+                path = fetcher.cache_path(url)
+                young = time.time() - adv.CACHE_MAX_AGE + 60
+                os.utime(path, (young, young))
+                fetcher.get_json(url)
+                self.assertEqual(len(web.calls), 1)  # still fresh
+                old = time.time() - adv.CACHE_MAX_AGE - 60
+                os.utime(path, (old, old))
+                fetcher.get_json(url)
+                self.assertEqual(len(web.calls), 2)  # too old: fetched again
+                fetcher.get_json(url)
+                self.assertEqual(len(web.calls), 2)  # fresh again
+
+    def test_corrupt_cache_is_fetched_again(self):
         web = FakeWeb()
-        fetcher = adv.Fetcher(self.cache, opener=web)
-        fetcher.get_json(adv.KEV_URL, 3600)
-        two_hours_ago = time.time() - 7200
-        os.utime(fetcher.cache_path(adv.KEV_URL), (two_hours_ago, two_hours_ago))
-        fetcher.get_json(adv.KEV_URL, 3600)
-        self.assertEqual(len(web.calls), 2)
-        fetcher.get_json(adv.KEV_URL, 3600)
-        self.assertEqual(len(web.calls), 2)  # fresh again
+        path = adv.Fetcher(self.cache).cache_path(adv.KEV_URL)
+        os.makedirs(self.cache)
+        with open(path, "w") as f:
+            f.write('{"vulnerabilities": [')  # cut short; the file is new
+        rc, data, err = self.run_main(["kev", "CVE-2026-0101"], web)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(web.calls, [adv.KEV_URL])
+        self.assertEqual([h["cve"] for h in data["hits"]], ["CVE-2026-0101"])
+        with open(path, "rb") as f:
+            self.assertEqual(json.loads(f.read()), json.loads(fixture("kev.json")))
 
     def test_cache_dir_from_env(self):
         with mock.patch.dict(os.environ, {"SECURITY_CHECK_CACHE": "/srv/cache-x"}):
@@ -341,6 +447,26 @@ class TestFetch(Base):
         rc, _, err = self.run_main(["usn", path, "--today", TODAY], web)
         self.assertEqual(rc, 1)
         self.assertIn("no 'cves' list", err)
+
+    def test_node_index_not_a_list(self):
+        web = FakeWeb(override={adv.NODE_INDEX_URL: b'{"error": "rate limited"}'})
+        path = self.write_inventory(inventory())
+        rc, data, err = self.run_main(["node", path, "--today", TODAY], web)
+        self.assertEqual(rc, 1)
+        self.assertIsNone(data)
+        self.assertIn("unexpected answer from " + adv.NODE_INDEX_URL + ": not a list", err)
+
+    def test_kev_unexpected_shape(self):
+        for body in (b'{"vulnerabilities": {"CVE-2026-0101": {}}}',
+                     b'[{"cveID": "CVE-2026-0101"}]'):
+            with self.subTest(body=body):
+                shutil.rmtree(self.cache, ignore_errors=True)
+                web = FakeWeb(override={adv.KEV_URL: body})
+                rc, data, err = self.run_main(["kev", "CVE-2026-0101"], web)
+                self.assertEqual(web.calls, [adv.KEV_URL])
+                self.assertEqual(rc, 1)
+                self.assertIsNone(data)
+                self.assertIn("no 'vulnerabilities' list", err)
 
 
 class FakeContext:
@@ -419,6 +545,18 @@ class TestSslContext(unittest.TestCase):
         self.assertEqual(ctx.verify_mode, adv.ssl.CERT_REQUIRED)
         self.assertTrue(ctx.check_hostname)
 
+    def test_real_context_from_bundle_keeps_verification_on(self):
+        # A real context with no CA certificates, like the python.org build: the fallback
+        # loads a real CA bundle (fixtures/test-ca.pem, a synthetic self-signed CA).
+        bare = adv.ssl.SSLContext(adv.ssl.PROTOCOL_TLS_CLIENT)
+        self.assertEqual(bare.cert_store_stats()["x509_ca"], 0)
+        ctx = self.context(bare, [os.path.join(self.dir, "missing.pem"),
+                                  os.path.join(FIXTURES, "test-ca.pem")])
+        self.assertIs(ctx, bare)
+        self.assertGreaterEqual(ctx.cert_store_stats()["x509_ca"], 1)
+        self.assertEqual(ctx.verify_mode, adv.ssl.CERT_REQUIRED)
+        self.assertTrue(ctx.check_hostname)
+
     def test_http_get_passes_the_context(self):
         seen = {}
 
@@ -466,6 +604,31 @@ class TestUsn(Base):
         self.assertTrue(g["new_in_window"])
         self.assertFalse(g["truncated"])
 
+    def test_binaries_grouped_by_source(self):
+        # libssl3t64: 3.4 -> 3.5, openssl: 3.5 -> 3.6. The group takes the lowest installed
+        # and the highest candidate, in any order of the list.
+        for order in ("as listed", "reversed"):
+            with self.subTest(order=order):
+                inv = inventory()
+                if order == "reversed":
+                    inv["apt"]["upgradable"].reverse()
+                g = self.packages(self.run_report("usn", inv))["openssl"]
+                self.assertEqual((g["installed"], g["candidate"]),
+                                 ("3.0.13-0ubuntu3.4", "3.0.13-0ubuntu3.6"))
+                c = {c["id"]: c for c in g["cves"]}
+                # fixed in 3.5: in openssl already, not in libssl3t64
+                self.assertIn("CVE-2025-0103", c)
+                # fixed in 3.6: in openssl's candidate, newer than libssl3t64's
+                self.assertTrue(c["CVE-2026-0101"]["in_candidate"])
+
+    def test_notice_on_window_start_is_in_window(self):
+        data = self.run_report("usn", extra=("--since-days", "8"))
+        self.assertEqual(data["window_start"], "2026-10-15")
+        g = self.packages(data)["openssl"]
+        self.assertEqual([(u["id"], u["in_window"]) for u in g["usns"]],
+                         [("USN-9001-1", True), ("USN-8001-1", False)])
+        self.assertTrue(g["new_in_window"])
+
     def test_usn_list_only_for_our_release(self):
         g = self.packages(self.run_report("usn"))["openssl"]
         self.assertEqual([(u["id"], u["published"], u["in_window"]) for u in g["usns"]],
@@ -507,11 +670,73 @@ class TestUsn(Base):
         data = self.run_report("usn", inv)
         self.assertIn("curl", self.packages(data))
 
+    @staticmethod
+    def nginx_page(first, count):
+        """A cves.json answer with `count` pending nginx fixes and no total_results."""
+        cves = [{"id": f"CVE-2026-{n}", "priority": "low",
+                 "packages": [{"name": "nginx", "statuses": [
+                     {"release_codename": "noble", "status": "released",
+                      "description": "1.24.0-2ubuntu7.2", "pocket": "security"}]}],
+                 "notices_ids": [], "notices": []} for n in range(first, first + count)]
+        return json.dumps({"cves": cves}).encode()
+
+    def test_pages_without_total_results(self):
+        size = adv.PAGE_SIZE
+        web = FakeWeb(override={("nginx", "0"): self.nginx_page(1000, size),
+                                ("nginx", str(size)): self.nginx_page(2000, 3)})
+        data = self.run_report("usn", web=web)
+        offsets = [FakeWeb.key(u)[1] for u in web.calls if "package=nginx" in u]
+        self.assertEqual(offsets, ["0", str(size)])  # a full page, then a short one
+        g = self.packages(data)["nginx"]
+        self.assertEqual(len(g["cves"]), size + 3)
+        self.assertFalse(g["truncated"])
+
+    def test_pages_without_total_results_are_capped(self):
+        size = adv.PAGE_SIZE
+        full = {("nginx", str(i * size)): self.nginx_page(1000 + 100 * i, size) for i in range(3)}
+        web = FakeWeb(override=full)
+        with mock.patch.object(adv, "MAX_PAGES", 2):
+            g = self.packages(self.run_report("usn", web=web))["nginx"]
+        self.assertEqual(web.packages_asked().count("nginx"), 2)
+        self.assertEqual(len(g["cves"]), 2 * size)
+        self.assertTrue(g["truncated"])
+
     def test_truncated_when_too_many_pages(self):
         with mock.patch.object(adv, "MAX_PAGES", 1):
             g = self.packages(self.run_report("usn"))["openssl"]
         self.assertTrue(g["truncated"])
         self.assertEqual([c["id"] for c in g["cves"]], ["CVE-2026-0101", "CVE-2026-0102"])
+
+    def test_truncated_without_pending_fix_is_a_note(self):
+        page = json.loads(fixture("ubuntu-cves-nginx.json"))
+        page["total_results"] = 50  # only the first page is read
+        web = FakeWeb(override={("nginx", "0"): json.dumps(page).encode()})
+        with mock.patch.object(adv, "MAX_PAGES", 1):
+            data = self.run_report("usn", web=web)
+        self.assertEqual([p["source"] for p in data["no_security_fix"]], ["nginx"])
+        self.assertIn(f"nginx: more than {adv.PAGE_SIZE} CVEs; list cut", data["notes"])
+
+    def test_missing_version_is_a_note(self):
+        inv = inventory()
+        for p in inv["apt"]["upgradable"]:
+            if p["source"] == "nginx":
+                p["candidate"] = None
+        web = FakeWeb()
+        data = self.run_report("usn", inv, web)
+        self.assertIn("nginx: installed or candidate version missing; not checked", data["notes"])
+        self.assertNotIn("nginx", web.packages_asked())
+        self.assertEqual(data["no_security_fix"], [])
+
+    def test_unknown_priority_is_counted(self):
+        page = json.loads(fixture("ubuntu-cves-curl.json"))
+        page["cves"][0]["priority"] = "untriaged"  # CVE-2026-0201
+        web = FakeWeb(override={("curl", "0"): json.dumps(page).encode()})
+        data = self.run_report("usn", web=web)
+        cves = data["counts"]["cves"]
+        self.assertEqual(list(cves.items()), [("critical", 1), ("high", 1), ("medium", 1),
+                                              ("low", 1), ("unknown", 1)])
+        g = self.packages(data)["curl"]
+        self.assertEqual([c["id"] for c in g["cves"]], ["CVE-2026-0202", "CVE-2026-0201"])
 
     def test_empty_upgrade_list(self):
         inv = inventory()
@@ -597,12 +822,21 @@ class TestInput(Base):
     def test_inventory_from_stdin(self):
         rc, data, _ = self.run_main(["node", "-", "--today", TODAY], stdin=fixture("inventory.json").decode())
         self.assertEqual(rc, 0)
-        self.assertEqual(len(data["installs"]), 5)
+        self.assertEqual(len(data["installs"]), 6)
 
     def test_bad_today(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
             adv.main(["node", "x.json", "--today", "yesterday"], opener=FakeWeb())
         self.assertEqual(cm.exception.code, 2)
+
+    def test_since_days_must_be_positive(self):
+        for bad in ("0", "two"):
+            with self.subTest(bad=bad):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    adv.main(["usn", "x.json", "--since-days", bad], opener=FakeWeb())
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("not a whole number of days", err.getvalue())
 
     def test_cli_runs_without_network(self):
         script = os.path.join(SCRIPTS, "advisories.py")

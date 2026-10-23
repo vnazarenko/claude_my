@@ -83,13 +83,15 @@ optional env vars. Unset or empty means the default, so a normal new-task run do
 
 | env | default | the scheduled security-check run sets |
 |---|---|---|
-| `TASK_SEED` | `/planning:make {{KEY}}: {{SUMMARY}}. First read the task brief {{BRIEF}} and follow it for the whole task.` | `/security-check <server> --ticket {{KEY}}. First read the task brief {{BRIEF}} and follow it for the whole run.` |
+| `TASK_SEED` | `/planning:make {{KEY}}: {{SUMMARY}}. First read the task brief {{BRIEF}} and follow it for the whole task.` | `/security-check <server> --ticket <KEY> (first read the task brief {{BRIEF}} and follow it for the whole run)` — the due script writes the real key; only `{{BRIEF}}` is left for this script |
 | `TASK_BRIEF_TEMPLATE` | `references/brief-template.md` | `security-check/references/run-brief.md` |
 | `TASK_NEXT` | `an implementation plan (planning:make). The plan summary will be posted here.` | `a security report (/security-check). The report summary will be posted here.` |
 
 - `TASK_SEED` is the first prompt of the new Claude. `{{KEY}}`, `{{SUMMARY}}` and `{{BRIEF}}` (the
-  brief's path) are filled in. It is typed into a shell inside double quotes, so a seed with
-  `"`, `$`, a backtick, `\`, `!` or a line break is refused before anything starts.
+  brief's path) are filled in; `{{SUMMARY}}` last, so text from Jira is never read as a
+  placeholder. It is typed into a shell inside double quotes, so a seed with `"`, `$`, a
+  backtick, `\`, `!` or a line break is refused before anything starts. The Jira summary loses
+  the same characters (and `'`) before it goes into the typed command.
 - `TASK_BRIEF_TEMPLATE` gets the same `{{…}}` placeholders as the default template. A missing file
   is refused before the worktree or the session is created.
 - `TASK_NEXT` is the text after `- Next: ` in the "work started" Jira comment.

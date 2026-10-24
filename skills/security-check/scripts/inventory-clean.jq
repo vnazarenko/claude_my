@@ -9,7 +9,8 @@ def PKG: "^[a-z0-9][a-z0-9.+-]{1,63}$";
 def WORD: "^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$";
 def ALIAS: "^(v?[0-9]{1,3}(\\.[0-9]{1,4}){0,2}|lts/(\\*|-?[0-9]{1,2}|[a-z]{2,12})|node|stable|unstable|system|iojs)$";
 def IMAGE: "^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,127}$";
-def IMAGE_ID: "^(sha256:)?[0-9a-f]{12,64}$";
+def IMAGE_ID: "^sha256:[0-9a-f]{64}$";
+def DIGEST: "^sha256:[0-9a-f]{64}$";
 def NVM: "^(/root/\\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\\.nvm|/usr/local/nvm|/opt/nvm)$";
 def NVM_NODE: "^(/root/\\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\\.nvm|/usr/local/nvm|/opt/nvm)/versions/node/v[0-9]{1,3}\\.[0-9]{1,4}\\.[0-9]{1,4}/bin/node$";
 def SHA: "^[0-9a-f]{7,40}$";
@@ -97,7 +98,8 @@ if length != 1 or (.[0] | type) != "object" then error("not one JSON object") el
 | ($r.ruby | list(50; chk(RUBY))) as $ruby
 | ($r.python3 | chk(VER)) as $py
 | ($r.docker_images | if . == null then {v: null, b: 0, t: false}
-                      else list(50; entry({image: IMAGE, id: IMAGE_ID, created: DATE}; "image")) end) as $img
+                      else list(50; entry({image: IMAGE, digest: DIGEST, id: IMAGE_ID, created: DATE,
+                                           tag_moved: "bool"}; "image")) end) as $img
 | ($r.running_deleted_exe | arr | map(select(unnamed("named") | not)) | list(50; chk("named"))) as $del
 | ($r.revisions | revs($R)) as $rev
 | ({collected_at: $ca.b, os: $os.b, reboot_required_pkgs: $rpk.b, apt: ($age.b + $ast.b + $upg.b),

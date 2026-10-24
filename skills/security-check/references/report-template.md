@@ -75,7 +75,7 @@ the pm2 restart, the boot unit, the check, the rollback.>
 | <apt packages, when `apt.status` is not `ok`> | — | <apt-get failed on the server (`error`) or is missing (`null`): pending upgrades unknown> | for the user: `apt-get --simulate dist-upgrade` on the server |
 | <inventory field from `filtered.dropped`> | — | <N values left out: wrong shape, or over the cap (`filtered.truncated`)> | for the user, not this skill: look at that field on the server |
 | <inventory field from `filtered.other_paths`> | — | <N binaries in a folder a user may name (for example `/tmp` or a home folder), or a container's: the path is not shown> | for the user, not this skill: `ps -eo user,pid,exe` on the server |
-| <running image without a tag, when `filtered.dropped.docker_images` > 0> | — | <docker lists it as `<none>:<none>`: the inventory cannot name it> | for the user: `docker ps`, then `docker image inspect <id>` |
+| <running images left out, when `filtered.dropped.docker_images` > 0> | — | <N running images left out: a name of an odd form, or over the cap> | for the user: `docker ps --no-trunc --format '{{.Image}}'` on the server |
 
 ## Reboot needed
 
@@ -112,7 +112,7 @@ Versions only. No file contents.
 | openssh / openssl | `<dpkg version>` / `<dpkg version>` | dpkg |
 | python3 | `<dpkg version>` | dpkg |
 | ruby | `<versions>` | rvm |
-| images | `<image>` (built `<created>`) | docker images |
+| images | `<image>` (built `<created>`), or `<image>` (built `<created>`, older than its tag: `tag_moved`) | docker ps, docker images |
 | <app> | deployed `<sha>` | REVISION |
 | still running after an update | `<running_deleted_exe>`, or none (executables only, not libraries) | /proc |
 

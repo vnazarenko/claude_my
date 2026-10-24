@@ -111,6 +111,8 @@ def strip_redirections(toks, lineno):
     while i < len(toks):
         t = toks[i]
         nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        if (t in OUT_REDIR or t in DUP_REDIR or t == "<") and res and res[-1].isdigit():
+            res.pop()  # the fd number of "2>/dev/null": not an argument
         if t in OUT_REDIR:
             if nxt != "/dev/null":
                 err(lineno, f"writes to a file: {t} {nxt}")
@@ -137,6 +139,49 @@ def strip_redirections(toks, lineno):
 def is_sep(t):
     return t != "" and all(ch in PUNCT for ch in t)
 
+# docker runs only "ps" and "images", each with these flags and a --format of these fields only.
+# The fields never hold container env, labels, mounts, the command or names; "json" and any
+# other template action are refused.
+DOCKER = {
+    "ps": ({"--no-trunc"}, {"Image"}),
+    "images": ({"-a", "--no-trunc", "--digests"}, {"Repository", "Tag", "Digest", "ID", "CreatedAt"}),
+}
+
+def check_docker(args, lineno):
+    if not args or args[0] not in DOCKER:
+        err(lineno, f"docker only runs 'ps' and 'images', got: {' '.join(args)}")
+        return
+    flags, fields = DOCKER[args[0]]
+    fmts, i = [], 1
+    while i < len(args):
+        a = args[i]
+        if a == "--format" and i + 1 < len(args):
+            fmts.append(args[i + 1])
+            i += 2
+            continue
+        if a.startswith("--format="):
+            fmts.append(a[len("--format="):])
+        elif a not in flags:
+            err(lineno, f"docker {args[0]} may not use: {a}")
+        i += 1
+    if len(fmts) != 1:
+        err(lineno, f"docker {args[0]} needs one --format with named fields")
+        return
+    fmt = fmts[0]
+    if VAR in fmt or PSUB in fmt:
+        err(lineno, f"docker {args[0]} --format from a variable")
+        return
+    actions = re.findall(r"\{\{(.*?)\}\}", fmt)
+    rest = re.sub(r"\{\{.*?\}\}", "", fmt)
+    if not actions or "{{" in rest or "}}" in rest:
+        err(lineno, f"docker {args[0]} --format is not a list of fields: {fmt}")
+    for act in actions:
+        act = act.strip()
+        m = re.fullmatch(r"\.([A-Za-z]+)", act)
+        if re.fullmatch(r'"[^"{}]*"', act) or (m and m.group(1) in fields):
+            continue
+        err(lineno, f"docker {args[0]} --format may not use: {{{{{act}}}}}")
+
 def check_command(cmd, args, lineno):
     if VAR in cmd:
         err(lineno, f"command from a variable: {cmd}")
@@ -158,7 +203,6 @@ def check_command(cmd, args, lineno):
         err(lineno, f"command not on the allowlist: {cmd}")
         return
     FOUND.add(cmd)
-    words = [a for a in args if not a.startswith("-")]
     if cmd == "timeout":
         rest, k = list(args), 0
         while k < len(rest) and rest[k].startswith("-"):
@@ -167,8 +211,7 @@ def check_command(cmd, args, lineno):
         if rest:
             check_command(rest[0], rest[1:], lineno)
     elif cmd == "docker":
-        if not words or words[0] not in ("ps", "images"):
-            err(lineno, f"docker only runs 'ps' and 'images', got: {' '.join(args)}")
+        check_docker(args, lineno)
     elif cmd == "apt-get":
         if "--simulate" not in args:
             err(lineno, "apt-get runs only with --simulate")

@@ -9,7 +9,8 @@
 #
 # Read-only by construction. tests/inventory_test.sh checks these rules on every run:
 # - external commands come only from the allowlist in the test
-# - apt-get runs only with --simulate, docker only "ps" and "images", dd only reads (with
+# - apt-get runs only with --simulate, docker only "ps" and "images" with a --format of named
+#   safe fields (no env, labels, mounts or command), dd only reads (with
 #   iflag=nofollow,nonblock, no of=); nothing writes a file
 # - pm2, nvm, npm and systemctl are never run: they can start daemons or write files
 # - process facts come only from the /proc/<pid>/exe link: no process arguments,
@@ -51,6 +52,7 @@ MAX_APT=2000    # pending upgrades
 MAX_ARCH=8      # archives per upgrade
 MAX_PATH=128    # characters in a path
 MAX_PS=500      # lines of "docker ps" (one per running container)
+MAX_IMG=5000    # lines of "docker images" (one per image name), read to find the running images
 MAX_SORT=1000   # entries of a list other users can fill, before "sort" (see bounded)
 # The shapes. inventory.sh has the same ones.
 VER_RE='^v?([0-9]{1,5}:)?[0-9][A-Za-z0-9.+~-]{0,63}$'
@@ -59,13 +61,15 @@ PKG_RE='^[a-z0-9][a-z0-9.+-]{1,63}$'
 WORD_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$'
 ALIAS_RE='^(v?[0-9]{1,3}(\.[0-9]{1,4}){0,2}|lts/(\*|-?[0-9]{1,2}|[a-z]{2,12})|node|stable|unstable|system|iojs)$'
 IMAGE_RE='^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,127}$'
-IMAGE_ID_RE='^(sha256:)?[0-9a-f]{12,64}$'
+IMAGE_ID_RE='^sha256:[0-9a-f]{64}$'     # an image id, as "docker ps/images --no-trunc" print it
+DIGEST_RE='^sha256:[0-9a-f]{64}$'       # a repo digest (name@sha256:...)
+RAW_IMAGE_RE='^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$'   # a "docker ps" image, before it is shortened
+HEX_RE='^[0-9a-f]{4,64}$'               # an image id prefix, as a container can be started with
 NVM_RE='^(/root/\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\.nvm|/usr/local/nvm|/opt/nvm)$'
 NVM_NODE_RE='^(/root/\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\.nvm|/usr/local/nvm|/opt/nvm)/versions/node/v[0-9]{1,3}\.[0-9]{1,4}\.[0-9]{1,4}/bin/node$'
 DOCKER_DATE_RE='^([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-9]{2}:[0-9]{2}:[0-9]{2}) ([+-][0-9]{4})'
 SHA_RE='^[0-9a-f]{7,40}$'      # a git sha in a REVISION file
 PID_RE='^[0-9]+$'              # a process id (a /proc folder, a pm2.pid file)
-SHORT_ID_RE='^[0-9a-f]{12}$'   # a short docker image id, as "docker ps" prints it
 # System folders: only root writes them. An nvm tree is not one, even inside them: its group
 # may write it, so a path there must have the strict nvm form.
 SYS_RE='^/(usr|bin|sbin|lib|lib32|lib64|libx32|opt|snap)/'
@@ -505,11 +509,49 @@ done < <(printf '%s\n' ${rubies[@]+"${rubies[@]}"} | sort -uV)
 
 # ---- Docker: running images only (no "inspect": it prints container env) -----------------------
 
-# "docker ps" is read as a stream (no copy in memory, no temp file), at most MAX_PS lines. It
-# failed (no daemon, no access) → null, not an empty list.
+# "docker ps --no-trunc" prints each running container's image the way it was started ("app",
+# "docker.io/library/redis:7", "app@sha256:<digest>"), as long as that name still points to the
+# image the container runs. When the name points to another image now (a newer pull or build) or
+# to none, it prints the id of the image the container runs ("sha256:<64 hex>"). Without
+# --no-trunc docker drops the digest ("app@sha256:..." -> "app"), and "app" would then match
+# the newest "app:latest", not the image the container runs.
+# "docker images -a" gives each image's names (repo:tag, repo@digest), its id and build date. -a
+# also lists images without a name (docker 29 hides them without it).
+# Both are read as a stream (no copy in memory, no temp file): at most MAX_PS and MAX_IMG lines.
+# "docker ps" failed (no daemon, no access) → null, not an empty list.
+
+# familiar <image>: sets "fam" to the short name "docker images" prints: no "docker.io/", and no
+# "library/" for an official image ("docker.io/library/redis:7" -> "redis:7").
+familiar() {
+  local name=${1%%@*} rest="" first
+  [ "$name" = "$1" ] || rest="@${1#*@}"
+  first=${name%%/*}
+  if [ "$first" != "$name" ] && [[ $first == docker.io || $first == index.docker.io ]]; then
+    name=${name#*/}
+  elif [ "$first" != "$name" ] && [[ $first == *[.:]* || $first == localhost ]]; then
+    fam=$name$rest
+    return 0
+  fi
+  if [[ $name == library/* && ${name#library/} != */* ]]; then name=${name#library/}; fi
+  fam=$name$rest
+}
+
+# by_prefix <hex>: sets "id" to the one image id that starts with it, else empty.
+by_prefix() {
+  local i n=0
+  id=""
+  for i in "${!made[@]}"; do
+    [[ $i == "sha256:$1"* ]] || continue
+    id=$i
+    n=$((n + 1))
+  done
+  [ "$n" -eq 1 ] || id=""
+}
+
 docker_json=null
 if command -v docker >/dev/null 2>&1; then
-  declare -A in_use=()
+  declare -A ps_seen=()
+  ps_refs=()
   ps_ok=false
   n_ps=0
   while IFS= read -r ref; do
@@ -517,38 +559,79 @@ if command -v docker >/dev/null 2>&1; then
     [ -n "$ref" ] || continue
     room docker_images $n_ps $MAX_PS || continue
     n_ps=$((n_ps + 1))
-    [[ ${ref##*/} == *:* || $ref == *@* || $ref =~ $SHORT_ID_RE ]] || ref="$ref:latest"
-    shaped docker_images "$IMAGE_RE" "$ref" || continue
-    in_use[$ref]=1
-  done < <(timeout 20 docker ps --format '{{.Image}}' 2>/dev/null && printf '%s\n' "$END_MARK")
+    shaped docker_images "$RAW_IMAGE_RE" "$ref" || continue
+    [ -z "${ps_seen[$ref]:-}" ] || continue
+    ps_seen[$ref]=1
+    ps_refs+=("$ref")
+  done < <(timeout 20 docker ps --no-trunc --format '{{.Image}}' 2>/dev/null && printf '%s\n' "$END_MARK")
   if [ "$ps_ok" = true ]; then
+    # Per image id: its build date, and one repo@digest name (for an image whose tag moved on).
+    declare -A tag_id=() digest_id=() made=() id_repo=() id_digest=()
+    n_img=0
+    while IFS=$'\t' read -r repo tag digest id created; do
+      if [ "$n_img" -ge "$MAX_IMG" ]; then truncated=true; continue; fi
+      n_img=$((n_img + 1))
+      [[ $id =~ $IMAGE_ID_RE ]] || continue
+      made[$id]=$created
+      [[ $repo =~ $IMAGE_RE ]] || continue
+      if [ "$tag" != "<none>" ] && [ -n "$tag" ]; then tag_id[$repo:$tag]=$id; fi
+      [[ $digest =~ $DIGEST_RE ]] || continue
+      digest_id[$repo@$digest]=$id
+      if [ -z "${id_repo[$id]:-}" ]; then id_repo[$id]=$repo; id_digest[$id]=$digest; fi
+    done < <(timeout 20 docker images -a --no-trunc --digests --format '{{.Repository}}{{"\t"}}{{.Tag}}{{"\t"}}{{.Digest}}{{"\t"}}{{.ID}}{{"\t"}}{{.CreatedAt}}' 2>/dev/null)
+    # Per running image: "image" (the short name; the image id when it has no repo@digest name),
+    # "digest" (the container was started by digest), "id" (the image the container runs),
+    # "created" (its build date) and "tag_moved": true when the name the container was started
+    # with points to another image now, or to none. null: not known.
+    declare -A img_seen=()
     imgs=()
-    # "created" as 2026-01-02T10:00:00+0000 (docker prints "2026-01-02 10:00:00 +0000 UTC").
-    while IFS=$'\t' read -r ref id created; do
-      short=${id#sha256:}
-      short=${short:0:12}
-      if [ -n "${in_use[$ref]:-}" ]; then
-        unset "in_use[$ref]"
-      elif [ -n "$short" ] && [ -n "${in_use[$short]:-}" ]; then
-        unset "in_use[$short]"
+    for ref in ${ps_refs[@]+"${ps_refs[@]}"}; do
+      id="" digest="" moved=false
+      if [[ $ref =~ $IMAGE_ID_RE ]]; then
+        # docker prints the id: the container's name points to another image now, or to none.
+        id=$ref
+        name=${id_repo[$id]:-$id}
+        digest=${id_digest[$id]:-}
+        moved=true
       else
-        continue
+        familiar "$ref"
+        name=${fam%%@*}
+        [ "$name" = "$fam" ] || digest=${fam#*@}
+        if [ -n "$digest" ]; then
+          # started by digest: the digest names the image; a tag next to it may have moved on.
+          bare=$name
+          if [[ ${name##*/} == *:* ]]; then bare=${name%:*}; fi
+          id=${digest_id[$bare@$digest]:-}
+          if [ -z "$id" ]; then
+            moved=null
+          elif [ "$bare" != "$name" ] && [ "${tag_id[$name]:-}" != "$id" ]; then
+            moved=true
+          fi
+        else
+          # docker still finds this name: it points to the image the container runs.
+          if [[ ${name##*/} != *:* ]]; then name=$name:latest; fi
+          id=${tag_id[$name]:-}
+          if [ -z "$id" ] && [[ $ref =~ $HEX_RE ]]; then
+            by_prefix "$ref"
+            [ -z "$id" ] || name=$id
+          fi
+        fi
       fi
-      shaped docker_images "$IMAGE_RE" "$ref" || continue
+      shaped docker_images "$IMAGE_RE" "$name" || continue
+      shaped docker_images "$DIGEST_RE" "$digest" || continue
+      [ -z "${img_seen[$name@$digest]:-}" ] || continue
+      img_seen[$name@$digest]=1
       room docker_images ${#imgs[@]} $MAX_LIST || continue
-      shaped docker_images "$IMAGE_ID_RE" "$id" || id=""
+      created=""
+      [ -z "$id" ] || created=${made[$id]:-}
+      # "created" as 2026-01-02T10:00:00+0000 (docker prints "2026-01-02 10:00:00 +0000 UTC").
       if [[ $created =~ $DOCKER_DATE_RE ]]; then
         created="${BASH_REMATCH[1]}T${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
       else
         created=""
       fi
-      imgs+=("{\"image\":$(js "$ref"),\"id\":$(js "$id"),\"created\":$(js "$created")}")
-    done < <(timeout 20 docker images --no-trunc --format '{{.Repository}}:{{.Tag}}{{"\t"}}{{.ID}}{{"\t"}}{{.CreatedAt}}' 2>/dev/null)
-    while IFS= read -r ref; do
-      [ -n "$ref" ] || continue
-      room docker_images ${#imgs[@]} $MAX_LIST || continue
-      imgs+=("{\"image\":$(js "$ref"),\"id\":null,\"created\":null}")
-    done < <(printf '%s\n' "${!in_use[@]}" | sort)
+      imgs+=("{\"image\":$(js "$name"),\"digest\":$(js "$digest"),\"id\":$(js "$id"),\"created\":$(js "$created"),\"tag_moved\":$moved}")
+    done
     docker_json=$(jarr ${imgs[@]+"${imgs[@]}"})
   fi
 fi

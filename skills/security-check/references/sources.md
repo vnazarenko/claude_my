@@ -188,7 +188,13 @@ in `usn.vendor[]`. Check the vendor page instead:
 
 ## Docker images
 
-- `docker_images[]`: the image tag and its build date. There is no API here.
+- `docker_images[]`: per running image, its name, the id the container runs and that image's
+  build date. There is no API here.
+- `tag_moved: true`: the container runs an older image than its tag names now (a newer image was
+  pulled or built under that name, or the name was removed). `image` is then the image's
+  repo@digest name (`image` + `digest`) or its id. The container runs the old code until it is
+  recreated. Check the old image (its `created`), and put "recreate the container" in the update
+  proposal.
 - Check the image's own releases (its GitHub page or registry page) for a newer tag with security
   fixes, and the upstream app's advisories.
 - A scanner (`trivy`, `grype`), if installed locally, can scan a public image by tag on the local

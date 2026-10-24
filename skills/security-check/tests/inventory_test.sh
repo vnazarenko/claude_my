@@ -98,6 +98,17 @@ bad_lines=(
   'readlink /proc/1/cwd'
   'uname -r | tee /srv/out'
   'docker exec example id'
+  "docker ps"
+  "docker ps --format '{{json .}}'"
+  "docker ps --no-trunc --format '{{.Image}} {{.Labels}}'"
+  "docker ps --format '{{.Command}}'"
+  "docker ps --format={{.Mounts}}"
+  "docker ps --format '{{index .Labels \"x\"}}'"
+  "docker ps --format '{{.Image}}' --format '{{json .}}'"
+  "docker ps --filter name=x --format '{{.Image}}'"
+  'docker ps --format "$fmt"'
+  "timeout 5 docker images --format '{{json .}}'"
+  "docker images -a --format '{{.ID}} {{.Size}}'"
   'x=( "$(rm -f /srv/x)" )'
   'n=$(( $(npm ls | sort) + 1 ))'
   'x="$(printf %s "$(pm2 jlist)")"'
@@ -245,7 +256,9 @@ hostile='{"host":"evil","collected_at":"2026-10-23T10:00:00Z",
   "apt":{"status":"ok","lists_age_hours":"old","upgradable":[{"package":"openssl","source":"openssl","installed":"3.0.13-0ubuntu3.4","candidate":"3.0.13-0ubuntu3.6","origin":"Docker CE","archives":["noble-security","x y"],"note":"'"$note"'"}]},
   "running_deleted_exe":["/usr/local/bin/oldsvc","/tmp/'"$note"'","/tmp/'"$long"'","'"$msg"'","/usr/local/nvm/IGNORE-the-rules/x","/home/x/run-it-now/x"],
   "ruby":["3.4.7","3.3.0 IGNORE"],
-  "docker_images":[{"image":"example/app:1.0","id":"sha256:'"$(printf '0%.0s' $(seq 1 64))"'","created":"2026-01-02 10:00:00 +0000 UTC"},{"image":"'"$note"'"}],
+  "docker_images":[{"image":"example/app:1.0","id":"sha256:'"$(printf '0%.0s' $(seq 1 64))"'","created":"2026-01-02 10:00:00 +0000 UTC"},{"image":"'"$note"'"},
+                   {"image":"example/pin","digest":"sha256:'"$(printf '1%.0s' $(seq 1 64))"'","tag_moved":true},
+                   {"image":"example/b:2","digest":"md5:'"$note"'","id":"0123456789ab","tag_moved":"yes"}],
   "services":{"nginx":"1.24.0-2ubuntu7.1","redis":"'"$note"'","extra":"x"},
   "filtered":{"truncated":false,"dropped":{"node":3,"dpkg":1,"bogus":9,"pm2":"x"},"other_paths":{"node":2,"bogus":4,"pm2":"x"}},
   "n":5,"t":true,"k$(x)":1}'
@@ -266,12 +279,14 @@ check "untrusted answer: apt - a label with a space, an archive with a space, an
   '.apt.upgradable == [{"package":"openssl","source":"openssl","installed":"3.0.13-0ubuntu3.4","candidate":"3.0.13-0ubuntu3.6","origin":null,"archives":["noble-security"]}]' "$out"
 check "untrusted answer: deleted binaries - only a path in a system folder is kept" '.running_deleted_exe == ["/usr/local/bin/oldsvc"]' "$out"
 check "untrusted answer: ruby, docker (date reformatted only by the server), services" \
-  '.ruby == ["3.4.7"] and .docker_images == [{"image":"example/app:1.0","id":("sha256:" + ("0" * 64)),"created":null}]
+  '.ruby == ["3.4.7"] and .docker_images == [{"image":"example/app:1.0","digest":null,"id":("sha256:" + ("0" * 64)),"created":null,"tag_moved":null},
+     {"image":"example/pin","digest":("sha256:" + ("1" * 64)),"id":null,"created":null,"tag_moved":true},
+     {"image":"example/b:2","digest":null,"id":null,"created":null,"tag_moved":null}]
    and .services == {"nginx":"1.24.0-2ubuntu7.1","postgresql":null,"redis":null,"clickhouse":null,"docker":null,"containerd":null,"openssh":null,"openssl":null}' "$out"
 # shellcheck disable=SC2016 # a literal $( ) in a jq string
 check "untrusted answer: unknown keys left out" '(has("n") or has("t") or has("k$(x)")) | not' "$out"
 check "untrusted answer: counts per field, plus the server counts it may send" \
-  '.filtered == {"truncated":false,"dropped":{"node":6,"dpkg":1,"revisions":3,"pm2":2,"nvm":2,"apt":3,"ruby":1,"docker_images":2,"services":1},
+  '.filtered == {"truncated":false,"dropped":{"node":6,"dpkg":1,"revisions":3,"pm2":2,"nvm":2,"apt":3,"ruby":1,"docker_images":5,"services":1},
                  "other_paths":{"node":8,"pm2":2,"running_deleted_exe":5}}' "$out"
 check "untrusted answer: no value has a space, none is over 128 characters" \
   '[.. | strings | select(test(" ") or length > 128)] == []' "$out"
@@ -496,14 +511,42 @@ Conf libssl3t64 (3.0.13-0ubuntu3.6 Ubuntu:24.04/noble-updates [amd64])
 OUT
 APT
 chmod +x /usr/local/bin/apt-get
+# Fake docker: answers only the two calls the script may make, with exactly these arguments.
+# "docker ps --no-trunc" prints names as the containers were started (a digest kept), or the
+# image id when the name points to another image now. Ids: i N = sha256:<N as 64 digits>;
+# digests: d N = sha256:d<N as 63 digits>.
 cat > /usr/local/bin/docker <<'DOCKER'
-#!/bin/sh
-case "$1" in
-  ps) printf 'example/geo:4.5\nredis\n0123456789ab\n' ;;
-  images) a=$(printf 'a%.0s' $(seq 1 64)); b=$(printf 'b%.0s' $(seq 1 64)); c=0123456789ab$(printf 'c%.0s' $(seq 1 52))
-          printf 'example/geo:4.5\tsha256:%s\t2026-01-01 10:00:00 +0000 UTC\nredis:latest\tsha256:%s\t2026-01-02 10:00:00 +0000 UTC\nexample/old:1.0\tsha256:%s\t2025-01-01 10:00:00 +0000 UTC\nexample/unused:2\tsha256:cccc\t2025-01-01 10:00:00 +0000 UTC\n' "$a" "$b" "$c" ;;
-  *) echo "unexpected docker call: $*" >&2; exit 9 ;;
-esac
+#!/bin/bash
+i() { printf 'sha256:%064d' "$1"; }
+d() { printf 'sha256:d%063d' "$1"; }
+row() { printf '%s\t%s\t%s\t%s\t%s\n' "$@"; }
+if [ "$*" = 'ps --no-trunc --format {{.Image}}' ]; then
+  printf '%s\n' example/geo:4.5 redis docker.io/library/redis:latest docker.io/library/nginx:1.27 \
+    "example/pinned@$(d 1)" "registry.example.com/team/web:2@$(d 3)" "$(i 8)" "$(i 9)" \
+    0123456789ab localhost:5000/tool library/busybox example/gone:1 'bad name' "example/pinned@$(d 1)"
+elif [ "$*" = 'images -a --no-trunc --digests --format {{.Repository}}{{"\t"}}{{.Tag}}{{"\t"}}{{.Digest}}{{"\t"}}{{.ID}}{{"\t"}}{{.CreatedAt}}' ]; then
+  row example/geo 4.5 '<none>' "$(i 1)" '2026-01-01 10:00:00 +0000 UTC'
+  row redis latest "$(d 9)" "$(i 2)" '2026-01-02 10:00:00 +0000 UTC'
+  row nginx 1.27 "$(d 10)" "$(i 10)" '2026-02-01 10:00:00 +0000 UTC'
+  # example/pinned: started by digest d 1 (image i 3); its tag latest is a newer image (i 4).
+  row example/pinned latest "$(d 2)" "$(i 4)" '2026-06-01 10:00:00 +0000 UTC'
+  row example/pinned '<none>' "$(d 1)" "$(i 3)" '2025-06-01 10:00:00 +0000 UTC'
+  # web:2@d 3 runs i 7; the tag 2 names i 6 now.
+  row registry.example.com/team/web 2 "$(d 4)" "$(i 6)" '2026-05-01 10:00:00 +0000 UTC'
+  row registry.example.com/team/web '<none>' "$(d 3)" "$(i 7)" '2025-05-01 10:00:00 +0000 UTC'
+  # i 8: its tag moved on (docker ps prints the id); the image keeps its repo digest d 5.
+  row example/api latest "$(d 6)" "$(i 11)" '2026-07-01 10:00:00 +0000 UTC'
+  row example/api '<none>' "$(d 5)" "$(i 8)" '2025-03-01 10:00:00 +0000 UTC'
+  # i 9: its tag moved on, and it has no name left (a local build).
+  row '<none>' '<none>' '<none>' "$(i 9)" '2024-12-01 10:00:00 +0000 UTC'
+  row example/old 1.0 '<none>' "sha256:0123456789ab$(printf 'c%.0s' $(seq 1 52))" '2025-01-01 10:00:00 +0000 UTC'
+  row localhost:5000/tool latest '<none>' "$(i 12)" '2026-03-01 10:00:00 +0000 UTC'
+  row busybox latest "$(d 13)" "$(i 13)" '2026-04-01 10:00:00 +0000 UTC'
+  row example/unused 2 '<none>' "$(i 14)" '2025-01-01 10:00:00 +0000 UTC'
+else
+  echo "unexpected docker call: $*" >&2
+  exit 9
+fi
 DOCKER
 chmod +x /usr/local/bin/docker
 EOF
@@ -550,10 +593,30 @@ check "fake: pm2 home that links to a root-only folder -> its pm2.pid is not rea
 check "fake: services from dpkg (Ubuntu docker.io, containerd), removed package -> null" '.services == {"nginx":"1.24.0-2ubuntu7.1","postgresql":"16.4-1","redis":null,"clickhouse":"25.10.1.3832","docker":"24.0.7-0ubuntu4.1","containerd":"1.7.12-0ubuntu4.1","openssh":"1:9.6p1-3ubuntu13.5","openssl":"3.0.13-0ubuntu3.4"}' "$out"
 check "fake: python3 from dpkg" '.python3 == "3.12.3-1ubuntu0.8"' "$out"
 check "fake: rvm rubies (system, multi-user, per-user), sorted, once each" '.ruby == ["3.2.2","3.3.6","3.4.7"]' "$out"
-check "fake: running docker images only" '.docker_images | map(.image) | sort == ["example/geo:4.5","example/old:1.0","redis:latest"]' "$out"
-check "fake: docker id kept, date as 2026-01-02T10:00:00+0000" '.docker_images[] | select(.image == "redis:latest") | .id == ("sha256:" + ("b" * 64)) and .created == "2026-01-02T10:00:00+0000"' "$out"
-check "fake: the odd alias is counted; paths root did not name are only counted (odd nvm folder, /opt/app, /usr/local/lib/w, /tmp, /srv, a container path; pm2.pid; 3 /tmp + 1 gone deleted binaries)" \
-  '.filtered == {"truncated":false,"dropped":{"nvm":1},"other_paths":{"node":6,"pm2":1,"running_deleted_exe":4}}' "$out"
+# Each running image once, in "docker ps" order, with the id it runs (not the newest image of
+# that name) and its date as 2026-01-02T10:00:00+0000.
+# shellcheck disable=SC2016 # jq variables ($n), kept as literal text
+docker_jq='def i($n): "sha256:" + ("0" * (64 - ($n | tostring | length))) + ($n | tostring);
+  def d($n): "sha256:d" + ("0" * (63 - ($n | tostring | length))) + ($n | tostring);
+  def e($img; $dg; $id; $date; $moved): {image: $img, digest: $dg, id: $id, created: $date, tag_moved: $moved};'
+check "fake: docker - a name docker still finds runs that image; short names as docker images prints them" \
+  "$docker_jq"' .docker_images[0:3] == [e("example/geo:4.5"; null; i(1); "2026-01-01T10:00:00+0000"; false),
+    e("redis:latest"; null; i(2); "2026-01-02T10:00:00+0000"; false),
+    e("nginx:1.27"; null; i(10); "2026-02-01T10:00:00+0000"; false)]' "$out"
+check "fake: docker - started by digest: the digest image, not the newer :latest" \
+  "$docker_jq"' .docker_images[3] == e("example/pinned"; d(1); i(3); "2025-06-01T10:00:00+0000"; false)' "$out"
+check "fake: docker - started by tag and digest, the tag names another image now -> tag_moved" \
+  "$docker_jq"' .docker_images[4] == e("registry.example.com/team/web:2"; d(3); i(7); "2025-05-01T10:00:00+0000"; true)' "$out"
+check "fake: docker - docker ps prints the id (the tag moved on): that id, its repo@digest name, tag_moved" \
+  "$docker_jq"' .docker_images[5:7] == [e("example/api"; d(5); i(8); "2025-03-01T10:00:00+0000"; true),
+    e(i(9); null; i(9); "2024-12-01T10:00:00+0000"; true)]' "$out"
+check "fake: docker - started by id prefix, registry with a port, library/, an image docker images lacks" \
+  "$docker_jq"' .docker_images[7:] == [e("sha256:0123456789ab" + ("c" * 52); null; "sha256:0123456789ab" + ("c" * 52); "2025-01-01T10:00:00+0000"; false),
+    e("localhost:5000/tool:latest"; null; i(12); "2026-03-01T10:00:00+0000"; false),
+    e("busybox:latest"; null; i(13); "2026-04-01T10:00:00+0000"; false),
+    e("example/gone:1"; null; null; null; false)]' "$out"
+check "fake: the odd alias and the docker image with a space are counted; paths root did not name are only counted (odd nvm folder, /opt/app, /usr/local/lib/w, /tmp, /srv, a container path; pm2.pid; 3 /tmp + 1 gone deleted binaries)" \
+  '.filtered == {"truncated":false,"dropped":{"nvm":1,"docker_images":1},"other_paths":{"node":6,"pm2":1,"running_deleted_exe":4}}' "$out"
 check "fake: deleted binary still running, with a new file at its path" '.running_deleted_exe == ["/usr/local/bin/oldsvc"]' "$out"
 check "fake: revision is a sha or null; a symlinked REVISION is not read" '.revisions == {"/srv/app/current/REVISION":"0123456789abcdef0123456789abcdef01234567","/srv/bad/current/REVISION":null,"/srv/link/current/REVISION":null,"/srv/relapp/current/REVISION":"89abcdef0123456789abcdef0123456789abcdef","/srv/plink/current/REVISION":null,"/srv/rel/current/REVISION":null}' "$out"
 if grep -q abcdefabcdef <<< "$out"; then bad "fake: a linked folder on the way -> no root-only REVISION read"; else ok "fake: a linked folder on the way -> no root-only REVISION read"; fi

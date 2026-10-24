@@ -517,7 +517,12 @@ done < <(printf '%s\n' ${rubies[@]+"${rubies[@]}"} | sort -uV)
 # the newest "app:latest", not the image the container runs.
 # "docker images -a" gives each image's names (repo:tag, repo@digest), its id and build date. -a
 # also lists images without a name (docker 29 hides them without it).
-# Both are read as a stream (no copy in memory, no temp file): at most MAX_PS and MAX_IMG lines.
+# "docker ps" has no field with the image id, so a name it prints is matched to an id with
+# "docker images". A pull or build between the two calls moves the tag: the name would then match
+# the new image, not the one the container runs. So "docker images" is read before AND after
+# "docker ps": a tag the two reads do not agree on gives id, created and tag_moved null (not
+# known). Only a tag that moves away and back within those seconds would still pass.
+# All are read as a stream (no copy in memory, no temp file): at most MAX_PS and MAX_IMG lines.
 # "docker ps" failed (no daemon, no access) → null, not an empty list.
 
 # familiar <image>: sets "fam" to the short name "docker images" prints: no "docker.io/", and no
@@ -548,8 +553,38 @@ by_prefix() {
   [ "$n" -eq 1 ] || id=""
 }
 
+# read_images: reads "docker images -a" (at most MAX_IMG lines) into tag_id (repo:tag -> id),
+# digest_id (repo@digest -> id), made (id -> build date) and id_repo / id_digest (id -> one
+# repo@digest name, for an image whose tag moved on).
+read_images() {
+  local repo tag digest id created n=0
+  tag_id=()
+  digest_id=()
+  made=()
+  id_repo=()
+  id_digest=()
+  while IFS=$'\t' read -r repo tag digest id created; do
+    if [ "$n" -ge "$MAX_IMG" ]; then truncated=true; continue; fi
+    n=$((n + 1))
+    [[ $id =~ $IMAGE_ID_RE ]] || continue
+    made[$id]=$created
+    [[ $repo =~ $IMAGE_RE ]] || continue
+    if [ "$tag" != "<none>" ] && [ -n "$tag" ]; then tag_id[$repo:$tag]=$id; fi
+    [[ $digest =~ $DIGEST_RE ]] || continue
+    digest_id[$repo@$digest]=$id
+    if [ -z "${id_repo[$id]:-}" ]; then id_repo[$id]=$repo; id_digest[$id]=$digest; fi
+  done < <(timeout 20 docker images -a --no-trunc --digests --format '{{.Repository}}{{"\t"}}{{.Tag}}{{"\t"}}{{.Digest}}{{"\t"}}{{.ID}}{{"\t"}}{{.CreatedAt}}' 2>/dev/null)
+}
+
 docker_json=null
 if command -v docker >/dev/null 2>&1; then
+  declare -A tag_id=() digest_id=() made=() id_repo=() id_digest=() tag_before=()
+  # 1. The tags before "docker ps".
+  read_images
+  for k in "${!tag_id[@]}"; do
+    tag_before[$k]=${tag_id[$k]}
+  done
+  # 2. The running containers.
   declare -A ps_seen=()
   ps_refs=()
   ps_ok=false
@@ -565,24 +600,13 @@ if command -v docker >/dev/null 2>&1; then
     ps_refs+=("$ref")
   done < <(timeout 20 docker ps --no-trunc --format '{{.Image}}' 2>/dev/null && printf '%s\n' "$END_MARK")
   if [ "$ps_ok" = true ]; then
-    # Per image id: its build date, and one repo@digest name (for an image whose tag moved on).
-    declare -A tag_id=() digest_id=() made=() id_repo=() id_digest=()
-    n_img=0
-    while IFS=$'\t' read -r repo tag digest id created; do
-      if [ "$n_img" -ge "$MAX_IMG" ]; then truncated=true; continue; fi
-      n_img=$((n_img + 1))
-      [[ $id =~ $IMAGE_ID_RE ]] || continue
-      made[$id]=$created
-      [[ $repo =~ $IMAGE_RE ]] || continue
-      if [ "$tag" != "<none>" ] && [ -n "$tag" ]; then tag_id[$repo:$tag]=$id; fi
-      [[ $digest =~ $DIGEST_RE ]] || continue
-      digest_id[$repo@$digest]=$id
-      if [ -z "${id_repo[$id]:-}" ]; then id_repo[$id]=$repo; id_digest[$id]=$digest; fi
-    done < <(timeout 20 docker images -a --no-trunc --digests --format '{{.Repository}}{{"\t"}}{{.Tag}}{{"\t"}}{{.Digest}}{{"\t"}}{{.ID}}{{"\t"}}{{.CreatedAt}}' 2>/dev/null)
+    # 3. The images after "docker ps".
+    read_images
     # Per running image: "image" (the short name; the image id when it has no repo@digest name),
     # "digest" (the container was started by digest), "id" (the image the container runs),
     # "created" (its build date) and "tag_moved": true when the name the container was started
-    # with points to another image now, or to none. null: not known.
+    # with points to another image now, or to none. null: not known (then id is null too, unless
+    # a digest names the image).
     declare -A img_seen=()
     imgs=()
     for ref in ${ps_refs[@]+"${ps_refs[@]}"}; do
@@ -608,13 +632,17 @@ if command -v docker >/dev/null 2>&1; then
             moved=true
           fi
         else
-          # docker still finds this name: it points to the image the container runs.
+          # "docker ps" found this name: then it pointed to the image the container runs. Both
+          # reads of "docker images" must give the same id for it, else it moved: not known.
           if [[ ${name##*/} != *:* ]]; then name=$name:latest; fi
           id=${tag_id[$name]:-}
-          if [ -z "$id" ] && [[ $ref =~ $HEX_RE ]]; then
+          if [ "${tag_before[$name]:-}" != "$id" ]; then
+            id=""
+          elif [ -z "$id" ] && [[ $ref =~ $HEX_RE ]]; then
             by_prefix "$ref"
             [ -z "$id" ] || name=$id
           fi
+          [ -n "$id" ] || moved=null
         fi
       fi
       shaped docker_images "$IMAGE_RE" "$name" || continue

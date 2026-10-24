@@ -112,7 +112,7 @@ Versions only. No file contents.
 | openssh / openssl | `<dpkg version>` / `<dpkg version>` | dpkg |
 | python3 | `<dpkg version>` | dpkg |
 | ruby | `<versions>` | rvm |
-| images | `<image>` (built `<created>`), or `<image>` (built `<created>`, older than its tag: `tag_moved`) | docker ps, docker images |
+| images | `<image>` (built `<created>`), or `<image>` (built `<created>`, older than its tag: `tag_moved`), or `<image>` (not known: `tag_moved` null) | docker ps, docker images |
 | <app> | deployed `<sha>` | REVISION |
 | still running after an update | `<running_deleted_exe>`, or none (executables only, not libraries) | /proc |
 

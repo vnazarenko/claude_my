@@ -18,7 +18,8 @@
 #    a folder on the way that links to a root-only folder: nothing in it is read), then hostile
 #    names and 500 entries on the server; read_plain on a symlink, a FIFO, a file swapped with a
 #    symlink, a linked folder on the way (also one swapped in while reading) and Capistrano's
-#    current -> releases/<name>; apt-get and docker that fail, 600 running containers; 1200 nvm
+#    current -> releases/<name>; apt-get and docker that fail, 600 running containers, tags that
+#    move while docker is read (images read before and after ps); 1200 nvm
 #    installs and rubies (at most 1000 go to sort; no file changed); then on real apt lists: no
 #    file may change. Skipped with a warning when docker is not running.
 #
@@ -610,11 +611,11 @@ check "fake: docker - started by tag and digest, the tag names another image now
 check "fake: docker - docker ps prints the id (the tag moved on): that id, its repo@digest name, tag_moved" \
   "$docker_jq"' .docker_images[5:7] == [e("example/api"; d(5); i(8); "2025-03-01T10:00:00+0000"; true),
     e(i(9); null; i(9); "2024-12-01T10:00:00+0000"; true)]' "$out"
-check "fake: docker - started by id prefix, registry with a port, library/, an image docker images lacks" \
+check "fake: docker - started by id prefix, registry with a port, library/, an image docker images lacks (not known)" \
   "$docker_jq"' .docker_images[7:] == [e("sha256:0123456789ab" + ("c" * 52); null; "sha256:0123456789ab" + ("c" * 52); "2025-01-01T10:00:00+0000"; false),
     e("localhost:5000/tool:latest"; null; i(12); "2026-03-01T10:00:00+0000"; false),
     e("busybox:latest"; null; i(13); "2026-04-01T10:00:00+0000"; false),
-    e("example/gone:1"; null; null; null; false)]' "$out"
+    e("example/gone:1"; null; null; null; null)]' "$out"
 check "fake: the odd alias and the docker image with a space are counted; paths root did not name are only counted (odd nvm folder, /opt/app, /usr/local/lib/w, /tmp, /srv, a container path; pm2.pid; 3 /tmp + 1 gone deleted binaries)" \
   '.filtered == {"truncated":false,"dropped":{"nvm":1,"docker_images":1},"other_paths":{"node":6,"pm2":1,"running_deleted_exe":4}}' "$out"
 check "fake: deleted binary still running, with a new file at its path" '.running_deleted_exe == ["/usr/local/bin/oldsvc"]' "$out"
@@ -807,6 +808,63 @@ out="$(docker run --rm -i -v "$scripts:/t:ro" -v "$tmp/failing.sh:/failing.sh:ro
   'bash /failing.sh many && timeout 60 bash /t/remote-inventory.sh' 2>"$tmp/err")"
 check "600 running containers: 500 lines read, 50 images passed on, the rest counted" \
   '(.docker_images | length) == 50 and .filtered.truncated == true and .filtered.dropped.docker_images == 550' "$out"
+
+# 3i. Tags that move while docker is read (a pull or build at that moment). The fake docker
+# answers call 1 "images", call 2 "ps", call 3 "images" - any other order fails - and its
+# second "images" answer differs from the first. Mode "fail1": the first "images" fails.
+cat > "$tmp/race.sh" <<'EOF'
+set -e
+echo "$1" > /dev/shm/docker-mode
+cat > /usr/local/bin/docker <<'DOCKER'
+#!/bin/bash
+i() { printf 'sha256:%064d' "$1"; }
+d() { printf 'sha256:d%063d' "$1"; }
+row() { printf '%s\t%s\t%s\t%s\t%s\n' "$@"; }
+n=$(( $(cat /dev/shm/docker-calls 2>/dev/null || echo 0) + 1 ))
+echo "$n" > /dev/shm/docker-calls
+printf '%s ' "$1" >> /dev/shm/docker-log
+images='images -a --no-trunc --digests --format {{.Repository}}{{"\t"}}{{.Tag}}{{"\t"}}{{.Digest}}{{"\t"}}{{.ID}}{{"\t"}}{{.CreatedAt}}'
+if [ "$n" = 1 ] && [ "$*" = "$images" ]; then
+  [ "$(cat /dev/shm/docker-mode)" != fail1 ] || exit 1
+  row example/app latest '<none>' "$(i 1)" '2025-01-01 10:00:00 +0000 UTC'
+  row example/same 1 '<none>' "$(i 5)" '2025-05-05 10:00:00 +0000 UTC'
+  row example/late latest "$(d 3)" "$(i 3)" '2025-03-03 10:00:00 +0000 UTC'
+  row example/td 2 "$(d 7)" "$(i 7)" '2025-07-07 10:00:00 +0000 UTC'
+elif [ "$n" = 2 ] && [ "$*" = 'ps --no-trunc --format {{.Image}}' ]; then
+  # app and same: names that point to the running image now. late: its tag moved before this
+  # call, so docker prints the id. td: started by tag and digest. fresh: a new tag.
+  printf '%s\n' example/app example/same:1 "$(i 3)" "example/td:2@$(d 7)" example/fresh
+elif [ "$n" = 3 ] && [ "$*" = "$images" ]; then
+  # A pull after "docker ps": app:latest names a new image; the old one keeps running.
+  row example/app latest '<none>' "$(i 2)" '2026-09-01 10:00:00 +0000 UTC'
+  row '<none>' '<none>' '<none>' "$(i 1)" '2025-01-01 10:00:00 +0000 UTC'
+  row example/same 1 '<none>' "$(i 5)" '2025-05-05 10:00:00 +0000 UTC'
+  row example/late latest "$(d 4)" "$(i 4)" '2026-08-01 10:00:00 +0000 UTC'
+  row example/late '<none>' "$(d 3)" "$(i 3)" '2025-03-03 10:00:00 +0000 UTC'
+  row example/td 2 "$(d 8)" "$(i 8)" '2026-08-08 10:00:00 +0000 UTC'
+  row example/td '<none>' "$(d 7)" "$(i 7)" '2025-07-07 10:00:00 +0000 UTC'
+  row example/fresh latest '<none>' "$(i 9)" '2026-09-09 10:00:00 +0000 UTC'
+else
+  echo "unexpected docker call $n: $*" >&2
+  exit 9
+fi
+DOCKER
+chmod +x /usr/local/bin/docker
+EOF
+for mode in move fail1; do
+  out="$(docker run --rm -i -v "$scripts:/t:ro" -v "$tmp/race.sh:/race.sh:ro" "$IMAGE" bash -c \
+    "bash /race.sh $mode && timeout 60 bash /t/remote-inventory.sh && echo && echo \"CALLS: \$(cat /dev/shm/docker-log)\"" 2>"$tmp/err")"
+  expect_eq "docker read while tags move ($mode): images, then ps, then images" "CALLS: images ps images " "$(grep '^CALLS: ' <<< "$out")"
+  out="$(grep -v '^CALLS: ' <<< "$out")"
+  if [ "$mode" = move ]; then same='e("example/same:1"; null; i(5); "2025-05-05T10:00:00+0000"; false)'; else same='e("example/same:1"; null; null; null; null)'; fi
+  check "docker read while tags move ($mode): a tag the two reads disagree on (or a failed read) -> not known, never the new image; an id or a digest still names the image" \
+    "$docker_jq"' .docker_images == [e("example/app:latest"; null; null; null; null),
+      '"$same"',
+      e("example/late"; d(3); i(3); "2025-03-03T10:00:00+0000"; true),
+      e("example/td:2"; d(7); i(7); "2025-07-07T10:00:00+0000"; true),
+      e("example/fresh:latest"; null; null; null; null)]' "$out"
+  expect_not_has "docker read while tags move ($mode): the new image of a moved tag is not reported" "$(printf 'sha256:%064d' 2)" "$out"
+done
 
 # 3h. Lists that other users can fill: 1200 nvm installs and 1200 rubies in a home folder. At
 # most MAX_SORT (1000) entries go to "sort", 50 are passed on, the rest is counted. No file

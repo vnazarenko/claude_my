@@ -195,6 +195,9 @@ in `usn.vendor[]`. Check the vendor page instead:
   repo@digest name (`image` + `digest`) or its id. The container runs the old code until it is
   recreated. Check the old image (its `created`), and put "recreate the container" in the update
   proposal.
+- `tag_moved: null` and `id: null`: not known. The tag moved while the script read docker (a pull
+  or build at that moment), or docker did not list it. Report the image as not checked, and run
+  the check again later.
 - Check the image's own releases (its GitHub page or registry page) for a newer tag with security
   fixes, and the upstream app's advisories.
 - A scanner (`trivy`, `grype`), if installed locally, can scan a public image by tag on the local

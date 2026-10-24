@@ -13,10 +13,16 @@
 #   safe fields (no env, labels, mounts or command), dd only reads (with
 #   iflag=nofollow,nonblock, no of=); nothing writes a file
 # - pm2, nvm, npm and systemctl are never run: they can start daemons or write files
-# - process facts come only from the /proc/<pid>/exe link and the /proc/<pid>/ns/mnt link (which
-#   mount namespace: the host's, or a container's): no process arguments, no process
-#   environment, no app config files. /proc/self/cwd is read too: the script's own folder
-#   (read_plain)
+# - docker runs only when a dockerd of the host already runs as root (from the /proc scan).
+#   Socket activation: Docker's socket unit (docker.socket, in Docker CE and Ubuntu's docker.io)
+#   keeps /run/docker.sock open while the daemon is stopped, and the first docker call starts
+#   it again, and with it every container set to restart. docker is never run when it is the
+#   podman shim (podman-docker): podman as root writes lock and runtime files. Then
+#   docker_images is null and docker_status says why
+# - process facts come only from the /proc/<pid>/exe link (its target, and its owner: the
+#   process's user) and the /proc/<pid>/ns/mnt link (which mount namespace: the host's, or a
+#   container's): no process arguments, no process environment, no app config files.
+#   /proc/self/cwd is read too: the script's own folder (read_plain)
 # - a file under a folder other users can write (nvm, pm2, deploys) is read only through
 #   read_plain: it goes into the folder and checks with the kernel that it is the folder named
 #   (no link on the way), then dd opens the file there once, with O_NOFOLLOW and O_NONBLOCK,
@@ -374,8 +380,10 @@ host_ns() {
   ns=$(readlink "/proc/$p/ns/mnt" 2>/dev/null)
   [ -n "$host_mnt" ] && [ "$ns" = "$host_mnt" ]
 }
-declare -A running=() deleted=() in_container=()
-while IFS=$'\t' read -r dir exe; do
+# root_dockerd: the paths of host "dockerd" binaries that run as root (the exe link's owner is
+# the process's user). Docker is called only when one runs (see the Docker part below).
+declare -A running=() deleted=() in_container=() root_dockerd=()
+while IFS=$'\t' read -r dir uid exe; do
   [ -n "$exe" ] || continue
   pid=${dir##*/}
   [[ $pid =~ $PID_RE ]] || continue
@@ -391,7 +399,8 @@ while IFS=$'\t' read -r dir exe; do
     continue
   fi
   running[$exe]=$(( ${running[$exe]:-0} + 1 ))
-done < <(find /proc/[0-9]*/exe -maxdepth 0 -printf '%h\t%l\n' 2>/dev/null)
+  if [ "$uid" = 0 ] && [ "${exe##*/}" = dockerd ]; then root_dockerd[$exe]=1; fi
+done < <(find /proc/[0-9]*/exe -maxdepth 0 -printf '%h\t%U\t%l\n' 2>/dev/null)
 
 # A binary replaced on disk but still running, in the host's mount namespace: the old code runs
 # until a restart. "named" wants a file at that path now (the update put a new one there).
@@ -543,7 +552,33 @@ done < <(printf '%s\n' ${rubies[@]+"${rubies[@]}"} | sort -uV)
 # "docker ps": a tag the two reads do not agree on gives id, created and tag_moved null (not
 # known). Only a tag that moves away and back within those seconds would still pass.
 # All are read as a stream (no copy in memory, no temp file): at most MAX_PS and MAX_IMG lines.
-# "docker ps" failed (no daemon, no access) → null, not an empty list.
+# "docker ps" failed (no access, ...) → null, not an empty list.
+# docker runs only when its daemon already runs. With socket activation (docker.socket) a stopped
+# daemon still has its socket open, and any docker call starts it, and every container set to
+# restart with it. "docker_status" says what happened:
+#   ok           docker_images is the full list
+#   error        "docker ps" failed: docker_images null (not checked)
+#   not_running  no dockerd of the host runs as root (a dockerd of a user or of a container does
+#                not count): docker not called, docker_images null (not checked)
+#   podman       "docker" is the podman shim (the podman-docker package, or the podman file
+#                itself): not called, docker_images null (not checked)
+#   null         no docker command
+
+# A host dockerd runs as root, at a path root chose (named: a user cannot name it).
+dockerd_up=false
+for exe in "${!root_dockerd[@]}"; do
+  if named "$exe"; then dockerd_up=true; break; fi
+done
+docker_state=""
+docker_cli=$(command -v docker 2>/dev/null)
+podman_cli=$(command -v podman 2>/dev/null)
+if [ -n "$docker_cli" ]; then
+  if [ -n "${dpkg_ver[podman-docker]:-}" ] || { [ -n "$podman_cli" ] && [ "$docker_cli" -ef "$podman_cli" ]; }; then
+    docker_state=podman
+  elif [ "$dockerd_up" != true ]; then
+    docker_state=not_running
+  fi
+fi
 
 # familiar <image>: sets "fam" to the short name "docker images" prints: no "docker.io/", and no
 # "library/" for an official image ("docker.io/library/redis:7" -> "redis:7").
@@ -600,7 +635,8 @@ read_images() {
 }
 
 docker_json=null
-if command -v docker >/dev/null 2>&1; then
+if [ -n "$docker_cli" ] && [ -z "$docker_state" ]; then
+  docker_state=error
   declare -A tag_id=() tag_digest=() digest_id=() made=() id_repo=() id_digest=() tag_before=()
   # 1. The tags before "docker ps".
   read_images
@@ -691,6 +727,7 @@ if command -v docker >/dev/null 2>&1; then
       imgs+=("{\"image\":$(js "$name"),\"digest\":$(js "$digest"),\"id\":$(js "$id"),\"created\":$(js "$created"),\"tag_moved\":$moved}")
     done
     docker_json=$(jarr ${imgs[@]+"${imgs[@]}"})
+    docker_state=ok
   fi
 fi
 
@@ -717,6 +754,7 @@ out+="\"pm2\":$(jarr ${pm2_json[@]+"${pm2_json[@]}"}),"
 out+="\"services\":$services_json,"
 out+="\"ruby\":$(jarr ${ruby_json[@]+"${ruby_json[@]}"}),"
 out+="\"python3\":$(js "$python_ver"),"
+out+="\"docker_status\":$(js "$docker_state"),"
 out+="\"docker_images\":$docker_json,"
 out+="\"running_deleted_exe\":$(jarr ${deleted_json[@]+"${deleted_json[@]}"}),"
 out+="\"revisions\":{$(IFS=,; printf '%s' "${revs[*]:-}")},"

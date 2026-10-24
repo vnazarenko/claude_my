@@ -15,6 +15,7 @@ def NVM: "^(/root/\\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\\.nvm|/usr/loca
 def NVM_NODE: "^(/root/\\.nvm|/home/[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}/\\.nvm|/usr/local/nvm|/opt/nvm)/versions/node/v[0-9]{1,3}\\.[0-9]{1,4}\\.[0-9]{1,4}/bin/node$";
 def SHA: "^[0-9a-f]{7,40}$";
 def APT_STATUS: "^(ok|error)$";
+def DOCKER_STATUS: "^(ok|error|not_running|podman)$";
 def DATE: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{4})$";
 def SYS: "^/(usr|bin|sbin|lib|lib32|lib64|libx32|opt|snap)/";
 def NVM_TREE: "/versions/node/|^/(usr/local|opt)/nvm/";
@@ -97,14 +98,16 @@ if length != 1 or (.[0] | type) != "object" then error("not one JSON object") el
                       containerd: VER, openssh: VER, openssl: VER})) as $svc
 | ($r.ruby | list(50; chk(RUBY))) as $ruby
 | ($r.python3 | chk(VER)) as $py
-| ($r.docker_images | if . == null then {v: null, b: 0, t: false}
+| ($r.docker_status | chk(DOCKER_STATUS)) as $dst
+# The image list counts only when docker was called and worked ("ok"). Else null: not checked.
+| ($r.docker_images | if . == null or $dst.v != "ok" then {v: null, b: 0, t: false}
                       else list(50; entry({image: IMAGE, digest: DIGEST, id: IMAGE_ID, created: DATE,
                                            tag_moved: "bool"}; "image")) end) as $img
 | ($r.running_deleted_exe | arr | map(select(unnamed("named") | not)) | list(50; chk("named"))) as $del
 | ($r.revisions | revs($R)) as $rev
 | ({collected_at: $ca.b, os: $os.b, reboot_required_pkgs: $rpk.b, apt: ($age.b + $ast.b + $upg.b),
     node: $node.b, nvm: $nvm.b, pm2: $pm2.b, services: $svc.b, ruby: $ruby.b, python3: $py.b,
-    docker_images: $img.b, running_deleted_exe: $del.b, revisions: $rev.b, dpkg: 0}) as $here
+    docker_images: ($dst.b + $img.b), running_deleted_exe: $del.b, revisions: $rev.b, dpkg: 0}) as $here
 | ({node: ($r.node | arr | map(select(node_unnamed)) | length),
     pm2: ($r.pm2 | arr | map(select(pm2_unnamed)) | length),
     running_deleted_exe: ($r.running_deleted_exe | arr | map(select(unnamed("named"))) | length)}) as $here_paths
@@ -113,7 +116,7 @@ if length != 1 or (.[0] | type) != "object" then error("not one JSON object") el
    os: ($os.v + {reboot_required_pkgs: $rpk.v}),
    apt: {status: $ast.v, lists_age_hours: $age.v, upgradable: $upg.v},
    node: $node.v, nvm: $nvm.v, pm2: $pm2.v, services: $svc.v, ruby: $ruby.v, python3: $py.v,
-   docker_images: $img.v, running_deleted_exe: $del.v, revisions: $rev.v,
+   docker_status: $dst.v, docker_images: $img.v, running_deleted_exe: $del.v, revisions: $rev.v,
    filtered: {
      truncated: ($rf.truncated == true or ([$rpk, $upg, $node, $nvm, $pm2, $ruby, $img, $del] | any(.t))),
      dropped: counts($here; $rf.dropped | o),

@@ -21,7 +21,9 @@
 #    names and 500 entries on the server; read_plain on a symlink, a FIFO, a file swapped with a
 #    symlink, a linked folder on the way (also one swapped in while reading) and Capistrano's
 #    current -> releases/<name>; apt-get and docker that fail, 600 running containers, tags that
-#    move while docker is read (images read before and after ps); 1200 nvm
+#    move while docker is read (images read before and after ps); docker called only when a
+#    root dockerd of the host runs (not with none, a user's, a container's, one in /tmp, or the
+#    podman shim: the stub must never be called); 1200 nvm
 #    installs and rubies (at most 1000 go to sort; no file changed); then on real apt lists: no
 #    file may change. Skipped with a warning when docker is not running.
 #
@@ -262,6 +264,7 @@ hostile='{"host":"evil","collected_at":"2026-10-23T10:00:00Z","os":{"id":"ubuntu
   "apt":{"status":"ok","lists_age_hours":"old","upgradable":[{"package":"openssl","source":"openssl","installed":"3.0.13-0ubuntu3.4","candidate":"3.0.13-0ubuntu3.6","origin":"Docker CE","archives":["noble-security","x y"],"note":"'"$note"'"}]},
   "running_deleted_exe":["/usr/local/bin/oldsvc","/tmp/'"$note"'","/tmp/'"$long"'","'"$msg"'","/usr/local/nvm/IGNORE-the-rules/x","/home/x/run-it-now/x"],
   "ruby":["3.4.7","3.3.0 IGNORE"],
+  "docker_status":"ok",
   "docker_images":[{"image":"example/app:1.0","id":"sha256:'"$(printf '0%.0s' $(seq 1 64))"'","created":"2026-01-02 10:00:00 +0000 UTC"},{"image":"'"$note"'"},
                    {"image":"example/pin","digest":"sha256:'"$(printf '1%.0s' $(seq 1 64))"'","tag_moved":true},
                    {"image":"example/b:2","digest":"md5:'"$note"'","id":"0123456789ab","tag_moved":"yes"}],
@@ -311,6 +314,18 @@ check "apt status missing: no list" '.apt.status == null and .apt.upgradable == 
   "$(STUB_OUT='{"apt":{'"$apt_list"'}}' run_inv example-host 2>/dev/null)"
 out="$(STUB_OUT='{"apt":{"status":"'"$note"'",'"$apt_list"'}}' run_inv example-host 2>/dev/null)"
 check "apt status of free text: null, no list, counted" '.apt.status == null and .apt.upgradable == null and .filtered.dropped.apt == 1' "$out"
+# The same for docker: an image list counts only with docker_status "ok".
+img_list='"docker_images":[{"image":"example/app:1"}]'
+check "docker status ok: the list is kept" '.docker_status == "ok" and (.docker_images | length) == 1' \
+  "$(STUB_OUT='{"docker_status":"ok",'"$img_list"'}' run_inv example-host 2>/dev/null)"
+for st in not_running podman error; do
+  check "docker status $st: no list, status kept" '.docker_status == "'"$st"'" and .docker_images == null and .filtered.dropped == {}' \
+    "$(STUB_OUT='{"docker_status":"'"$st"'",'"$img_list"'}' run_inv example-host 2>/dev/null)"
+done
+check "docker status missing: no list" '.docker_status == null and .docker_images == null' \
+  "$(STUB_OUT='{'"$img_list"'}' run_inv example-host 2>/dev/null)"
+out="$(STUB_OUT='{"docker_status":"'"$note"'",'"$img_list"'}' run_inv example-host 2>/dev/null)"
+check "docker status of free text: null, no list, counted" '.docker_status == null and .docker_images == null and .filtered.dropped.docker_images == 1' "$out"
 
 # 500 entries per list: at most the cap is kept, the rest is counted, truncated is true.
 python3 -c '
@@ -321,6 +336,7 @@ print(json.dumps({
   "nvm": [{"nvm_dir": "/home/u%d/.nvm" % i} for i in range(n)],
   "pm2": [{"pm2_home": "/srv/app/.pm2"} for i in range(n)],
   "ruby": ["3.%d.0" % (i % 100) for i in range(n)],
+  "docker_status": "ok",
   "docker_images": [{"image": "example/a%d:1" % i} for i in range(n)],
   "running_deleted_exe": ["/usr/local/bin/s%d" % i for i in range(n)],
   "os": {"reboot_required_pkgs": ["pkg%d" % i for i in range(n)]},
@@ -380,7 +396,7 @@ check "bare: no apt lists -> age null, nothing upgradable" '.apt == {"status":"o
 check "bare: no node, no nvm" '.node == [] and .nvm == []' "$out"
 check "bare: pm2 home without pid file" '.pm2 == [{"pm2_home":"/srv/app/.pm2","pid_file":false,"daemon_running":false,"daemon_node_path":null,"daemon_node":null,"pm2_version":null}]' "$out"
 check "bare: services missing -> null" '.services == {"nginx":null,"postgresql":null,"redis":null,"clickhouse":null,"docker":null,"containerd":null,"openssh":null,"openssl":null}' "$out"
-check "bare: python3 and docker missing -> null" '.python3 == null and .docker_images == null' "$out"
+check "bare: python3 and docker missing -> null" '.python3 == null and .docker_status == null and .docker_images == null' "$out"
 check "bare: no ruby" '.ruby == []' "$out"
 check "bare: missing revision file -> null" '.revisions == {"/srv/app/current/REVISION": null}' "$out"
 check "bare: nothing filtered" '.filtered == {"truncated":false,"dropped":{},"other_paths":{}}' "$out"
@@ -469,6 +485,9 @@ for i in 1 2 3; do
   cp /usr/bin/sleep "$d/x"
   "$d/x" 300 &
 done
+# A dockerd of the host, as root: only then is docker called.
+cp /usr/bin/sleep /usr/bin/dockerd
+/usr/bin/dockerd 300 &
 sleep 0.3
 # oldsvc: an update put a new file at the same path. gonesvc and the /tmp binaries: gone.
 rm /usr/local/bin/oldsvc /usr/local/bin/gonesvc /tmp/msg*/x /ctr/node-old
@@ -617,6 +636,7 @@ check "fake: rvm rubies (system, multi-user, per-user), sorted, once each" '.rub
 docker_jq='def i($n): "sha256:" + ("0" * (64 - ($n | tostring | length))) + ($n | tostring);
   def d($n): "sha256:d" + ("0" * (63 - ($n | tostring | length))) + ($n | tostring);
   def e($img; $dg; $id; $date; $moved): {image: $img, digest: $dg, id: $id, created: $date, tag_moved: $moved};'
+check "fake: docker - a root dockerd of the host runs: docker called, status ok" '.docker_status == "ok"' "$out"
 check "fake: docker - a name docker still finds runs that image, with the tag's repo digest (none for a local build); short names as docker images prints them" \
   "$docker_jq"' .docker_images[0:3] == [e("example/geo:4.5"; null; i(1); "2026-01-01T10:00:00+0000"; false),
     e("redis:latest"; d(9); i(2); "2026-01-02T10:00:00+0000"; false),
@@ -806,6 +826,8 @@ fi
 # at most MAX_PS lines are read, at most 50 images passed on, the rest counted.
 cat > "$tmp/failing.sh" <<'EOF'
 set -e
+cp /usr/bin/sleep /usr/bin/dockerd
+/usr/bin/dockerd 300 &
 printf '#!/bin/sh\necho "Inst libssl3t64 [3.0.13-0ubuntu3.4] (3.0.13-0ubuntu3.6 Ubuntu:24.04/noble-security [amd64])"\necho "E: The package lists are broken" >&2\nexit 100\n' > /usr/local/bin/apt-get
 if [ "$1" = many ]; then
   printf '#!/bin/sh\n[ "$1" = ps ] && seq 1 600 | sed "s|^|example/a|; s|$|:1|"\nexit 0\n' > /usr/local/bin/docker
@@ -817,7 +839,7 @@ EOF
 out="$(docker run --rm -i -v "$scripts:/t:ro" -v "$tmp/failing.sh:/failing.sh:ro" "$IMAGE" bash -c \
   'bash /failing.sh down && timeout 60 bash /t/remote-inventory.sh' 2>"$tmp/err")"
 check "apt-get fails: status error, upgradable null" '.apt.status == "error" and .apt.upgradable == null' "$out"
-check "docker ps fails: docker_images null" '.docker_images == null' "$out"
+check "docker ps fails: docker_images null, status error" '.docker_images == null and .docker_status == "error"' "$out"
 expect_not_has "tools that fail: no text of theirs in the output" "NOTE" "$out"
 printf '%s' "$out" > "$tmp/failing_out.json"
 check "apt-get fails, then inventory.sh: still not checked" '.apt.status == "error" and .apt.upgradable == null' \
@@ -825,13 +847,15 @@ check "apt-get fails, then inventory.sh: still not checked" '.apt.status == "err
 out="$(docker run --rm -i -v "$scripts:/t:ro" -v "$tmp/failing.sh:/failing.sh:ro" "$IMAGE" bash -c \
   'bash /failing.sh many && timeout 60 bash /t/remote-inventory.sh' 2>"$tmp/err")"
 check "600 running containers: 500 lines read, 50 images passed on, the rest counted" \
-  '(.docker_images | length) == 50 and .filtered.truncated == true and .filtered.dropped.docker_images == 550' "$out"
+  '.docker_status == "ok" and (.docker_images | length) == 50 and .filtered.truncated == true and .filtered.dropped.docker_images == 550' "$out"
 
 # 3i. Tags that move while docker is read (a pull or build at that moment). The fake docker
 # answers call 1 "images", call 2 "ps", call 3 "images" - any other order fails - and its
 # second "images" answer differs from the first. Mode "fail1": the first "images" fails.
 cat > "$tmp/race.sh" <<'EOF'
 set -e
+cp /usr/bin/sleep /usr/bin/dockerd
+/usr/bin/dockerd 300 &
 echo "$1" > /dev/shm/docker-mode
 cat > /usr/local/bin/docker <<'DOCKER'
 #!/bin/bash
@@ -883,6 +907,100 @@ for mode in move fail1; do
       e("example/fresh:latest"; null; null; null; null)]' "$out"
   expect_not_has "docker read while tags move ($mode): the new image of a moved tag is not reported" "$(printf 'sha256:%064d' 2)" "$out"
   expect_not_has "docker read while tags move ($mode): nor its digest" "$(printf 'sha256:d%063d' 2)" "$out"
+done
+
+# 3j. docker is called only when a dockerd of the host already runs as root. With socket
+# activation (docker.socket) any docker call starts a stopped daemon, and its containers with it.
+# The stub docker logs every call. Modes:
+#   none        no dockerd                                   -> not called, not_running
+#   root        root dockerd at /usr/bin/dockerd             -> called, ok
+#   deleted     root dockerd at /usr/sbin/dockerd, replaced on disk (an update, not restarted) -> called, ok
+#   user        dockerd of a user (rootless docker)          -> not called, not_running
+#   container   dockerd of a container (its own mount namespace and file at that path) -> not called
+#   tmp         root dockerd at a path a user may name       -> not called, not_running
+#   podman_pkg  root dockerd, the podman-docker package      -> not called, podman
+#   podman_link root dockerd, "docker" is the podman file    -> not called, podman
+cat > "$tmp/gate.sh" <<'EOF'
+set -e
+mode=$1
+mkdir -p /usr/local/bin
+cat > /usr/local/bin/docker <<'DOCKER'
+#!/bin/bash
+printf '%s ' "$1" >> /dev/shm/docker-log
+if [ "$1" = ps ]; then
+  printf '%s\n' example/app:1
+elif [ "$1" = images ]; then
+  printf '%s\t%s\t%s\t%s\t%s\n' example/app 1 "sha256:d$(printf '%063d' 1)" "sha256:$(printf '%064d' 1)" '2026-01-01 10:00:00 +0000 UTC'
+else
+  exit 9
+fi
+DOCKER
+chmod +x /usr/local/bin/docker
+cp /usr/bin/sleep /usr/bin/dockerd
+pid=""
+if [ "$mode" = root ] || [ "$mode" = podman_pkg ] || [ "$mode" = podman_link ]; then
+  /usr/bin/dockerd 300 &
+  pid=$!
+elif [ "$mode" = deleted ]; then
+  cp /usr/bin/sleep /usr/sbin/dockerd
+  /usr/sbin/dockerd 300 &
+  pid=$!
+  sleep 0.3
+  rm /usr/sbin/dockerd
+  cp /usr/bin/sleep /usr/sbin/dockerd
+elif [ "$mode" = user ]; then
+  setpriv --reuid=65534 --regid=65534 --clear-groups /usr/bin/dockerd 300 &
+  pid=$!
+elif [ "$mode" = container ]; then
+  mkdir -p /ctr
+  cp /usr/bin/sleep /ctr/dockerd
+  unshare -m --propagation private bash -c 'mount --bind /ctr/dockerd /usr/bin/dockerd && exec /usr/bin/dockerd 300' &
+  pid=$!
+elif [ "$mode" = tmp ]; then
+  mkdir -p /tmp/d
+  cp /usr/bin/sleep /tmp/d/dockerd
+  /tmp/d/dockerd 300 &
+  pid=$!
+fi
+if [ "$mode" = podman_pkg ]; then
+  printf 'Package: podman-docker\nStatus: install ok installed\nArchitecture: all\nVersion: 4.9.3+ds1-1\nMaintainer: Test <test@example.invalid>\nDescription: fake\n\n' >> /var/lib/dpkg/status
+elif [ "$mode" = podman_link ]; then
+  mv /usr/local/bin/docker /usr/local/bin/podman
+  ln -s podman /usr/local/bin/docker
+fi
+sleep 0.3
+# The setup must really make the case: the dockerd runs, and root can read its link.
+if [ -n "$pid" ]; then
+  exe=$(readlink "/proc/$pid/exe")
+  [ "${exe##*/}" = dockerd ] || [ "${exe##*/}" = "dockerd (deleted)" ] || echo "SETUP: no dockerd link for $mode: $exe"
+fi
+if [ "$mode" = container ] && [ "/proc/$pid/exe" -ef /usr/bin/dockerd ]; then echo "SETUP: the container's dockerd is the host file"; fi
+if [ "$mode" = deleted ] && [ "$(readlink "/proc/$pid/exe")" != "/usr/sbin/dockerd (deleted)" ]; then echo "SETUP: not replaced"; fi
+exit 0
+EOF
+for mode in none root deleted user container tmp podman_pkg podman_link; do
+  # SYS_PTRACE: root reads the exe link of another user's process, as on a real host.
+  out="$(docker run --rm -i --cap-add SYS_ADMIN --cap-add SYS_PTRACE --security-opt apparmor=unconfined \
+    -v "$scripts:/t:ro" -v "$tmp/gate.sh:/gate.sh:ro" "$IMAGE" bash -c \
+    "bash /gate.sh $mode && timeout 60 bash /t/remote-inventory.sh && echo && echo \"CALLS: \$(cat /dev/shm/docker-log 2>/dev/null)\"" 2>"$tmp/err")"
+  expect_eq "docker gate ($mode): setup made the case" "" "$(grep '^SETUP: ' <<< "$out")"
+  calls="$(grep '^CALLS: ' <<< "$out")"
+  out="$(grep -v -e '^CALLS: ' -e '^SETUP: ' <<< "$out")"
+  if [ "$mode" = root ] || [ "$mode" = deleted ]; then
+    expect_eq "docker gate ($mode): a root dockerd of the host runs -> docker called as before" "CALLS: images ps images " "$calls"
+    check "docker gate ($mode): status ok, the image listed" \
+      "$docker_jq"' .docker_status == "ok" and .docker_images == [e("example/app:1"; d(1); i(1); "2026-01-01T10:00:00+0000"; false)]' "$out"
+  else
+    if [[ $mode == podman_* ]]; then want=podman; else want=not_running; fi
+    expect_eq "docker gate ($mode): docker never called" "CALLS: " "$calls"
+    check "docker gate ($mode): docker_images null, status $want" '.docker_images == null and .docker_status == "'"$want"'"' "$out"
+  fi
+  if [ "$mode" = none ]; then
+    printf '%s' "$out" > "$tmp/gate_out.json"
+    check "docker gate (none), then inventory.sh: status not_running kept, images null" \
+      '.docker_status == "not_running" and .docker_images == null' \
+      "$(STUB_OUT_FILE="$tmp/gate_out.json" run_inv example-host 2>/dev/null)"
+  fi
 done
 
 # 3h. Lists that other users can fill: 1200 nvm installs and 1200 rubies in a home folder. At

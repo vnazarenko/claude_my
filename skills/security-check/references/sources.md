@@ -199,6 +199,12 @@ in `usn.vendor[]`. Check the vendor page instead:
 
 ## Docker images
 
+- `docker_status` not `ok` → `docker_images` is `null`: images not checked. `not_running`: no
+  dockerd of the host runs as root, so the script did not call docker. With socket activation
+  (`docker.socket`, in Docker CE and Ubuntu's `docker.io`) any docker call starts a stopped
+  daemon, and every container set to restart with it. Report "not checked: Docker daemon not
+  running"; never start it to check. `podman`: `docker` is the podman shim (not called).
+  `error`: `docker ps` failed.
 - `docker_images[]`: per running image, its name, its repo `digest`, the id the container runs
   and that image's build date. There is no API here.
 - `tag_moved: true`: the container runs an older image than its tag names now (a newer image was

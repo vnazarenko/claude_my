@@ -24,8 +24,23 @@
 #   TASK_BRIEF_EXTRA  a file added to the end of the brief, after ../references/brief-template.md
 #                     and before the ticket text; same {{...}} placeholders as the template
 #   TASK_NEXT         text after "- Next: " in the "work started" Jira comment
+#
+# The claude command is TYPED into a shell. A control byte (Ctrl-A, ESC, ...) would edit that
+# line, so only allowlisted bytes are typed: TASK_SEED and the key are refused when they hold
+# anything else, and the Jira summary keeps only SUMMARY_OK (other bytes become spaces, so a
+# non-ASCII letter is lost there too; the brief keeps the full summary).
 set -uo pipefail
 shopt -u patsub_replacement 2>/dev/null || true   # bash 5.2+: keep '&' literal in ${v//p/r}
+
+# Exact ASCII sets. No ranges: in some locales a range like A-Z also matches other letters.
+UPPER=ABCDEFGHIJKLMNOPQRSTUVWXYZ
+LOWER=abcdefghijklmnopqrstuvwxyz
+DIGITS=0123456789
+# Bytes a typed seed may hold: printable ASCII without " $ ` \ ' !, so all of it stays literal
+# inside "..." in bash and zsh. \133 \135 are [ ], in octal so tr does not read a class.
+SEED_OK="$UPPER$LOWER$DIGITS #%&()*+,./:;<=>?@^_{|}~\\133\\135-"
+# Bytes the summary keeps in the typed command, the session name and the branch.
+SUMMARY_OK="$UPPER$LOWER$DIGITS .,:;()/_+#@&?={}-"
 
 repo_in="${1:?repo path required}"
 key="${2:?Jira key required (e.g. KAN-297)}"
@@ -44,23 +59,47 @@ default_next='an implementation plan (planning:make). The plan summary will be p
 next="${TASK_NEXT:-$default_next}"
 
 die() { echo "ERROR: $*"; exit 1; }
+# outside <tr set> <text>: how many bytes of <text> are not in the set (byte by byte, C locale).
+outside() { printf '%s' "$2" | LC_ALL=C tr -d "$1" | wc -c | tr -d ' '; }
+# valid_key <key>: PROJ-123 form, ASCII only.
+valid_key() {
+  local p="${1%-*}" n="${1##*-}"
+  [ "$p" != "$1" ] || return 1
+  case "$p" in "" | [!$UPPER]* | *[!$UPPER${DIGITS}_]*) return 1 ;; esac
+  case "$n" in "" | *[!$DIGITS]*) return 1 ;; esac
+}
+# trees: the tree of every open agterm window, one JSON document each. `agtermctl tree` alone
+# shows only the frontmost window, and the user may switch windows while this script runs.
+# Without a window list (an older agterm), the frontmost tree.
+trees() {
+  local w found=0
+  while IFS= read -r w; do
+    [ -n "$w" ] || continue
+    found=1
+    agtermctl tree --json --window "$w" 2>/dev/null
+  done < <(agtermctl window list --json 2>/dev/null \
+             | jq -r '.result.windows[]? | select(.open == true) | .id // empty' 2>/dev/null)
+  [ "$found" = 1 ] || agtermctl tree --json 2>/dev/null
+}
 [ "${AGTERM_ENABLED:-}" = "1" ] || die "not inside agterm (AGTERM_ENABLED != 1)"
 for c in agtermctl jq uuidgen python3; do command -v "$c" >/dev/null 2>&1 || die "$c not on PATH"; done
 [ -f "$JIRA_PY" ] || die "jira.py not found at $JIRA_PY (set JIRA_PY)"
 [ -x "$NEW_WT" ] || [ -f "$NEW_WT" ] || die "new-worktree.sh not found at $NEW_WT"
 [ -f "$brief_tpl" ] || die "brief template not found at $brief_tpl"
 [ -z "$brief_extra" ] || [ -f "$brief_extra" ] || die "extra brief not found at $brief_extra (TASK_BRIEF_EXTRA)"
-# The seed is typed into a shell inside double quotes: refuse what that shell would expand.
-case "$seed_tpl" in
-  *[\"\$\`\\!]* | *$'\n'* | *$'\r'*) die 'TASK_SEED must not contain " $ ` \ ! or a line break' ;;
-esac
-case "$key" in [A-Z]*-[0-9]*) : ;; *) die "'$key' is not a Jira key" ;; esac
+# The seed is typed into a shell inside double quotes: refuse what that shell would expand and
+# every control byte (a tab, a line break, Ctrl-A, ESC, DEL, C1) or non-ASCII byte.
+[ "$(outside "$SEED_OK" "$seed_tpl")" = 0 ] \
+  || die "TASK_SEED may hold only printable ASCII without \" \$ \` \\ ' ! (no control character, no line break)"
+valid_key "$key" || die "$(printf '%q' "$key") is not a Jira key"   # %q: no raw control byte in the output
 repo="$(cd "$repo_in" 2>/dev/null && pwd -P)" || die "repo '$repo_in' does not exist"
 [ -e "$repo/.git" ] || die "'$repo' is not a git repo"
 
-# One session per ticket. A second one would split the history in two places.
-existing="$(agtermctl tree --json 2>/dev/null | jq -r --arg k "$key " \
-  '[.. | objects | select(.cwd? and (.name? // "" | startswith($k))) | .id] | first // empty')"
+# One session per ticket, in any window. A second one would split the history in two places.
+# The name is "<KEY> <summary>", or only "<KEY>" when nothing of the summary is kept.
+existing="$(trees | jq -rs --arg k "$key" \
+  '[.. | objects | select(.cwd? and ((.name? // "") as $n | $n == $k or ($n | startswith($k + " ")))) | .id]
+   | first // empty' 2>/dev/null)"
 [ -z "$existing" ] || die "an agterm session for $key already exists (sid=$existing) — switch to it instead"
 
 ticket="$(python3 "$JIRA_PY" get "$key")" || die "could not read $key from Jira"
@@ -69,17 +108,19 @@ status="$(jq -r '.status' <<<"$ticket")"
 url="$(jq -r '.url' <<<"$ticket")"
 description="$(jq -r '.description // ""' <<<"$ticket")"
 
-# Text that goes into a typed shell command: drop quotes, $, backticks, backslashes, and "!"
-# (an interactive shell expands it inside double quotes: history).
+# Text that goes into a typed shell command. Quotes, $, backticks, backslashes and "!" are
+# dropped, as before (so "user's" stays "users"); every other byte outside SUMMARY_OK (control
+# bytes, other punctuation, non-ASCII) becomes a space. Then spaces are collapsed and trimmed.
 # ('…\\' ends the set with a backslash, then "'" adds the single quote; SC1003 is a false alarm.)
 # shellcheck disable=SC1003
-clean="$(printf '%s' "$summary" | tr -d '!"`$\\'"'" | tr -s ' ')"
+clean="$(printf '%s' "$summary" | LC_ALL=C tr -d '!"`$\\'"'" | LC_ALL=C tr -c "$SUMMARY_OK" ' ' \
+  | tr -s ' ' | sed 's/^ //; s/ $//')"
 name="$(printf '%s %s' "$key" "$clean" | cut -c1-60 | sed 's/ *$//')"
 
 if [ -z "$branch" ]; then
   slug="$(printf '%s' "$clean" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | tr -s '-' \
     | cut -d- -f1-6 | sed 's/^-//; s/-$//')"
-  branch="${key}-${slug}"
+  branch="${key}${slug:+-$slug}"
 fi
 
 # Root = the repo's parent, service = the repo dir. Two reasons: service "." makes paths like
@@ -109,13 +150,21 @@ fill() {
   printf '\n## The ticket (from Jira, %s)\n\n**%s** — status %s\n\n%s\n' "$(date +%F)" "$summary" "$status" "$description"
 } > "$brief"
 
+# SUMMARY goes last, so text from Jira is never searched for placeholders.
+seed="${seed_tpl//'{{KEY}}'/$key}"
+seed="${seed//'{{BRIEF}}'/$brief}"
+seed="${seed//'{{SUMMARY}}'/$clean}"
+# Last check of everything typed, before a session exists (the brief path comes from $HOME).
+[ "$(outside "$SEED_OK" "$seed$name$uuid")" = 0 ] \
+  || die "the claude command would hold a byte that is not safe to type: check the brief path (\$HOME)"
+
 ws_args=()
 case "$ws" in
   # Default: right after the caller's session. The shell's AGTERM_WORKSPACE_ID can be stale
-  # (the session was moved), so look the caller up in the live tree; if it is not there, the
-  # active workspace is used.
-  "")    if [ -n "${AGTERM_SESSION_ID:-}" ] && agtermctl tree --json 2>/dev/null \
-            | jq -e --arg id "$AGTERM_SESSION_ID" '[.. | objects | select(.id? == $id)] | length > 0' >/dev/null; then
+  # (the session was moved), so look the caller up in the live tree of every window; if it is
+  # not there, the active workspace is used.
+  "")    if [ -n "${AGTERM_SESSION_ID:-}" ] && trees \
+            | jq -se --arg id "$AGTERM_SESSION_ID" '[.. | objects | select(.id? == $id)] | length > 0' >/dev/null 2>&1; then
            ws_args=(--after "$AGTERM_SESSION_ID")
          fi ;;
   new:*) ws_args=(--workspace-name "${ws#new:}" --create-workspace) ;;
@@ -145,18 +194,14 @@ STARTED="$(date '+%F %T')"
 EOF
 : > "$briefs/$key.procs"
 
-# SUMMARY goes last, so text from Jira is never searched for placeholders.
-seed="${seed_tpl//'{{KEY}}'/$key}"
-seed="${seed//'{{BRIEF}}'/$brief}"
-seed="${seed//'{{SUMMARY}}'/$clean}"
 sleep 1
 agtermctl session type --target "$sid" "claude --session-id ${uuid} -n \"${name}\" \"${seed}\"" >/dev/null 2>&1
 agtermctl session type --target "$sid" $'\r' >/dev/null 2>&1
 
-# claude_runs: agterm's tree shows claude as the new session's foreground process.
+# claude_runs: agterm's tree shows claude as the new session's foreground process. All windows:
+# the new session stays in its window when the user brings another one to the front.
 claude_runs() {
-  agtermctl tree --json 2>/dev/null \
-    | jq -e --arg id "$sid" '[.. | objects | select(.id? == $id) | .foreground[0]?] | any(. == "claude")' >/dev/null 2>&1
+  trees | jq -se --arg id "$sid" '[.. | objects | select(.id? == $id) | .foreground[0]?] | any(. == "claude")' >/dev/null 2>&1
 }
 # Wait for Claude, about 20 s. One more Enter after the first miss: a shell that was still
 # starting can lose the first one. Typing can fail without an error, so only this check says

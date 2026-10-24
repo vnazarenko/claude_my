@@ -42,14 +42,16 @@ bash ~/.claude/skills/new-task/scripts/start-task.sh <repo_path> <KEY> [branch] 
 ```
 
 The script:
-1. refuses when an agterm session for this key already exists (one session per ticket);
+1. refuses when an agterm session for this key already exists, in any agterm window (one
+   session per ticket);
 2. creates the worktree with `parallel-issues/scripts/new-worktree.sh` (env files, gems, skills);
 3. writes the task brief `~/.claude/task-briefs/<KEY>.md` (from `references/brief-template.md`
    plus the ticket text) and the registry `~/.claude/task-briefs/<KEY>.env`;
 4. opens an agterm session named `<KEY> <summary>` in the worktree and starts
    `claude --session-id <uuid> -n "<name>" "/planning:make <KEY> … read the brief …"`
    (another skill can change the prompt and add to the brief: see "Overrides");
-5. waits until Claude runs in that session (about 20 s). When it does not, the script stops with
+5. waits until Claude runs in that session (about 20 s; it looks in every window, so bringing
+   another window to the front does not matter). When it does not, the script stops with
    `ERROR: Claude did not start …`, exit 1: no `TASK_STARTED` line, no Jira change, the session
    is marked blocked. Look at the session, close it, then run the script again (it reuses the
    worktree);
@@ -95,9 +97,14 @@ new-task run does not change. The defaults are at the top of `start-task.sh`.
 
 - `TASK_SEED`: `{{KEY}}`, `{{SUMMARY}}` and `{{BRIEF}}` (the brief's path) are filled in;
   `{{SUMMARY}}` last, so text from Jira is never read as a placeholder. The seed is typed into a
-  shell inside double quotes, so a seed with `"`, `$`, a backtick, `\`, `!` or a line break is
-  refused before anything starts. The Jira summary loses the same characters (and `'`) before it
-  goes into the typed command.
+  shell inside double quotes. It may hold only printable ASCII without `"`, `$`, a backtick,
+  `\`, `'` and `!`; anything else (a control character such as Ctrl-A or ESC, a tab, a line
+  break, a non-ASCII letter) is refused before anything starts. The key must be `PROJ-123`.
+- The Jira summary in the typed command, the session name and the branch: `"`, `$`, a backtick,
+  `\`, `'` and `!` are dropped, and every other byte that is not an ASCII letter, a digit, a space
+  or one of `.,:;()/_+#@&?={}-` becomes a space. So control characters never reach the shell, and
+  non-ASCII letters (Cyrillic, accents) are lost there. The brief keeps the full summary. When
+  nothing is left, the session name and the branch are the key alone.
 - `TASK_BRIEF_EXTRA` gets the same `{{…}}` placeholders as the template. The rules of the default
   brief stay; the extra part says where its task differs (for example: no plan). A missing file is
   refused before the worktree or the session is created.

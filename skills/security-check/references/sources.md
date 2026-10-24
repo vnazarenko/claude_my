@@ -60,18 +60,28 @@ A binary that is installed but does not run is still listed when it is used by a
        `nvm alias default <the noted version>`;
      - after the install: `nvm version default` must print the noted version;
      - moving the alias back (`nvm alias default 22`) is a later step, for the owners of those apps.
-  2. change the project's Node pins (`ours[].node_pin`, for example `.nvmrc` and the deploy
+  2. before the deploy, install what the deploy and the app run, under the new Node. A new nvm
+     install has no global packages: pm2 and the package manager stay with the old Node. A
+     deploy that runs them from the new pin fails, often after the release link has moved.
+     Run `npm` and `corepack` by their full path in the new Node's `bin` folder:
+     - pm2: `npm i -g pm2@<version>`, the same version as the running daemon
+       (`pm2[].pm2_version`), so the new pm2 can talk to the old daemon until it restarts;
+     - the package manager the project pins (`packageManager` in `package.json`), for example
+       pnpm: `corepack enable pnpm`, then `corepack install -g pnpm@<version>`;
+     - check: `<tool> -v` under the new Node prints those versions, and `nvm version default`
+       still prints the noted version.
+  3. change the project's Node pins (`ours[].node_pin`, for example `.nvmrc` and the deploy
      config), then deploy.
-  3. pm2 in cluster mode runs workers on the **daemon's** Node. `pm2 reload` cannot change it.
+  4. pm2 in cluster mode runs workers on the **daemon's** Node. `pm2 reload` cannot change it.
      The daemon must restart: `pm2 kill`, start the app again, `pm2 save` — a few seconds of
      outage. Then the boot unit must name the new Node's path: regenerate it with
      `pm2 startup`, or edit its Node paths when the unit was written by hand.
-  4. a custom `PM2_HOME`: `pm2 startup` can write a unit with two `Environment=PM2_HOME=`
+  5. a custom `PM2_HOME`: `pm2 startup` can write a unit with two `Environment=PM2_HOME=`
      lines, and systemd uses the last one (often the shared `~/.pm2`). Check that the unit has
      exactly one, and that it is yours.
-  5. check: the pm2 daemon's Node in the next inventory (`pm2[].daemon_node`).
-- Rollback: keep the old version installed. Revert the pin, deploy, restart the daemon on the
-  old Node, and point the boot unit back at it.
+  6. check: the pm2 daemon's Node in the next inventory (`pm2[].daemon_node`).
+- Rollback: keep the old version installed, with its pm2 and package manager. Revert the pin,
+  deploy, restart the daemon on the old Node, and point the boot unit back at it.
 
 A distro Node (`/usr/bin/node`, a dpkg version such as `18.19.1+dfsg-…`):
 

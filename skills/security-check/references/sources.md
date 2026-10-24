@@ -67,14 +67,16 @@ A binary that is installed but does not run is still listed when it is used by a
      - pm2: `npm i -g pm2@<version>`, the same version as the running daemon
        (`pm2[].pm2_version`), so the new pm2 can talk to the old daemon until it restarts;
      - the package manager the project pins (`packageManager` in `package.json`), for example
-       pnpm: `corepack enable pnpm`, then `corepack install -g --cache-only pnpm@<version>`.
-       Not `install -g` without `--cache-only`: it makes that version the user's default for
-       every Node install (`lastKnownGood.json` in the corepack home), so apps without a pin
-       switch;
+       pnpm: `corepack enable pnpm`, then
+       `COREPACK_DEFAULT_TO_LATEST=0 corepack install -g --cache-only pnpm@<version>`.
+       Leave out `--cache-only` or the variable, and that version can become the user's default
+       for every Node install (`lastKnownGood.json` in the corepack home), so apps without a pin
+       switch. `--cache-only` alone still moves a default of the same major to a newer download
+       (11.24.0 → 11.25.0); the variable stops that;
      - check: under the new Node, `lib/node_modules/pm2/package.json` names the daemon's pm2
        version (read the file: any `pm2` command can start a daemon), `pnpm -v` run in a folder
-       whose `package.json` pins the version prints it, and `nvm version default` still prints
-       the noted version.
+       whose `package.json` pins the version prints it, `lastKnownGood.json` is the same as
+       before the install, and `nvm version default` still prints the noted version.
   3. change the project's Node pins (`ours[].node_pin`, for example `.nvmrc` and the deploy
      config), then deploy.
   4. pm2 in cluster mode runs workers on the **daemon's** Node. `pm2 reload` cannot change it.

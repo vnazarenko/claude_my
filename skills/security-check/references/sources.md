@@ -67,9 +67,14 @@ A binary that is installed but does not run is still listed when it is used by a
      - pm2: `npm i -g pm2@<version>`, the same version as the running daemon
        (`pm2[].pm2_version`), so the new pm2 can talk to the old daemon until it restarts;
      - the package manager the project pins (`packageManager` in `package.json`), for example
-       pnpm: `corepack enable pnpm`, then `corepack install -g pnpm@<version>`;
-     - check: `<tool> -v` under the new Node prints those versions, and `nvm version default`
-       still prints the noted version.
+       pnpm: `corepack enable pnpm`, then `corepack install -g --cache-only pnpm@<version>`.
+       Not `install -g` without `--cache-only`: it makes that version the user's default for
+       every Node install (`lastKnownGood.json` in the corepack home), so apps without a pin
+       switch;
+     - check: under the new Node, `lib/node_modules/pm2/package.json` names the daemon's pm2
+       version (read the file: any `pm2` command can start a daemon), `pnpm -v` run in a folder
+       whose `package.json` pins the version prints it, and `nvm version default` still prints
+       the noted version.
   3. change the project's Node pins (`ours[].node_pin`, for example `.nvmrc` and the deploy
      config), then deploy.
   4. pm2 in cluster mode runs workers on the **daemon's** Node. `pm2 reload` cannot change it.
@@ -210,6 +215,10 @@ in `usn.vendor[]`. Check the vendor page instead:
   Never scan a tag (`:latest`, `:4.5`): the registry may name a newer image with it now, and the
   scan would be of an image the server does not run. Never report a scan of a tag as the running
   image.
+- Take `digest` only from the inventory's `docker_images` row: it belongs to the `id` the
+  container runs. Never look a digest up by a tag (a tag row of `docker images --digests`, a
+  registry page): after a pull, the tag names a newer image. An older inventory without `digest`
+  → rerun the inventory first.
 - With a scanner on the local machine (it does not touch the server):
   `trivy image --platform linux/amd64 <repository>@<digest>` (`grype` has `--platform` too). The
   platform is the server's: `os.machine` `x86_64` → `linux/amd64`, `aarch64` → `linux/arm64`. One

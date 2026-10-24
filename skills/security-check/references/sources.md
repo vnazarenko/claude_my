@@ -97,6 +97,10 @@ A distro Node (`/usr/bin/node`, a dpkg version such as `18.19.1+dfsg-…`):
   **inside** the container. The inventory compares the link's target with the host file at that
   path: a container's process is listed apart, with `container: true` and `version: null`. Its
   Node is the image's: check the image (`docker_images[]`), not the host package.
+- A binary replaced on disk (`<path> (deleted)`) cannot be compared: its file is gone. It counts
+  as the host's (with the dpkg version) only when its process is in the host's mount namespace.
+  Else it is listed with `container: true` and `version: null` too: a container's, or a service
+  with its own mounts. Its version is not known; do not take the host package's.
 - A Node binary in a folder a user may name (`/tmp`, a home folder outside nvm, a folder others
   can write) or a container's Node outside `/usr/bin` and `/usr/local/bin` is not listed: only
   counted in `filtered.other_paths.node`. Report the count under "Not checked".
@@ -188,8 +192,8 @@ in `usn.vendor[]`. Check the vendor page instead:
 
 ## Docker images
 
-- `docker_images[]`: per running image, its name, the id the container runs and that image's
-  build date. There is no API here.
+- `docker_images[]`: per running image, its name, its repo `digest`, the id the container runs
+  and that image's build date. There is no API here.
 - `tag_moved: true`: the container runs an older image than its tag names now (a newer image was
   pulled or built under that name, or the name was removed). `image` is then the image's
   repo@digest name (`image` + `digest`) or its id. The container runs the old code until it is
@@ -200,8 +204,20 @@ in `usn.vendor[]`. Check the vendor page instead:
   the check again later.
 - Check the image's own releases (its GitHub page or registry page) for a newer tag with security
   fixes, and the upstream app's advisories.
-- A scanner (`trivy`, `grype`), if installed locally, can scan a public image by tag on the local
-  machine. It does not touch the server. Without one, the base OS of the image is "Not checked".
+- Scan only the image the server runs, by its fixed name: `<repository>@<digest>`.
+  `<repository>` is `image` without its `:tag`, the `:` after the last `/` (`redis:7` +
+  `sha256:…` → `redis@sha256:…`; `localhost:5000/tool:1` → `localhost:5000/tool@sha256:…`).
+  Never scan a tag (`:latest`, `:4.5`): the registry may name a newer image with it now, and the
+  scan would be of an image the server does not run. Never report a scan of a tag as the running
+  image.
+- With a scanner on the local machine (it does not touch the server):
+  `trivy image --platform linux/amd64 <repository>@<digest>` (`grype` has `--platform` too). The
+  platform is the server's: `os.machine` `x86_64` → `linux/amd64`, `aarch64` → `linux/arm64`. One
+  digest can name an image per platform, and without `--platform` the scanner takes the Mac's.
+- `digest` is `null` (a local build, or `image` is an id): the image cannot be pulled by name
+  safely. Do not scan its tag. Put it under "Not checked": "not checked: no pullable digest".
+- No scanner installed: the image is "Not checked" ("no scanner"). Write what was checked
+  instead (the build date, the releases page), and the `<repository>@<digest>` to scan.
 - Update proposal: a new tag in the project's config, then recreate the container. Risk: the
   app's own upgrade notes.
 

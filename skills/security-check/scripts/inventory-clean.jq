@@ -79,7 +79,7 @@ if length != 1 or (.[0] | type) != "object" then error("not one JSON object") el
 | ($homes | split("\n") | map(select(length > 0))) as $H
 | ($rev_files | split("\n") | map(select(length > 0))) as $R
 | ($r.collected_at | chk(DATE)) as $ca
-| ($r.os | obj({id: WORD, version_id: WORD, codename: WORD, kernel_running: VER,
+| ($r.os | obj({id: WORD, version_id: WORD, codename: WORD, machine: WORD, kernel_running: VER,
                 kernel_newest_installed: VER, reboot_required: "bool"})) as $os
 | ($r.os | o | .reboot_required_pkgs | list(50; chk(PKG))) as $rpk
 | ($r.apt | o | .lists_age_hours | chk("num")) as $age

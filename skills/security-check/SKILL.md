@@ -114,17 +114,17 @@ What you get (one JSON object):
 
 | field | what |
 |---|---|
-| `os` | `id`, `version_id`, `codename`, `kernel_running`, `kernel_newest_installed`, `reboot_required`, `reboot_required_pkgs` |
+| `os` | `id`, `version_id`, `codename`, `machine` (`x86_64`, `aarch64`: the platform to scan images for), `kernel_running`, `kernel_newest_installed`, `reboot_required`, `reboot_required_pkgs` |
 | `apt.status` | `ok`: `upgradable` is the full list. `error` (apt-get failed) or `null` (no apt-get): `upgradable` is `null` and pending upgrades are **not checked**. Put that under "Not checked"; never write "nothing pending". |
 | `apt.lists_age_hours` | how old the server's package lists are. No `apt update` is run. Over 48 → say so in the report. |
 | `apt.upgradable[]` | `package`, `source`, `installed`, `candidate`, `origin` (repo label, a space as `_`: `Ubuntu`, `Docker_CE`, or `null`), `archives` |
-| `node[]` | every Node binary: nvm installs and running ones; `version`, `running` (process count), `container` (true: processes whose binary is not the host file at that path, so a container's; `version` is then `null`: check the image) |
+| `node[]` | every Node binary: nvm installs and running ones; `version`, `running` (process count), `container` (true: processes whose binary is not the host file at that path, so a container's; also a binary replaced on disk whose process is not in the host's mount namespace; `version` is then `null`: check the image) |
 | `nvm[]` | each nvm tree and its `default` alias as written (`22`, `lts/*`, …); nvm uses the newest install that matches it |
 | `pm2[]` | per `--pm2-home`: `daemon_running`, `daemon_node`, `daemon_node_path`, `pm2_version` |
 | `services` | dpkg versions of nginx, postgresql, redis, clickhouse, docker, containerd, openssh, openssl |
 | `ruby`, `python3` | rvm rubies; the newest `python3.x` dpkg version |
-| `docker_images[]` | images of running containers: `image` (the short name, or the image id when it has none), `digest` (the container was started by digest), `id` (the image the container runs), `created` (`2026-01-02T10:00:00+0000`), `tag_moved` (`true`: the name the container was started with points to another image now, or to none: the container still runs the old image until it is recreated; `null`: not known, with `id` `null` too unless a digest names the image: the tag moved while the script read docker, or docker did not list it) |
-| `running_deleted_exe` | binaries replaced on disk but still running: old code until a restart |
+| `docker_images[]` | images of running containers: `image` (the short name, or the image id when it has none), `digest` (the image's repo digest: the one the container was started by, else the one docker lists for its tag or id; `null`: none, as for a local build), `id` (the image the container runs), `created` (`2026-01-02T10:00:00+0000`), `tag_moved` (`true`: the name the container was started with points to another image now, or to none: the container still runs the old image until it is recreated; `null`: not known, with `id` `null` too unless a digest names the image: the tag moved while the script read docker, or docker did not list it). Scan only `<repository>@<digest>`, never a tag; no digest → "not checked: no pullable digest" (`references/sources.md`) |
+| `running_deleted_exe` | binaries replaced on disk but still running, in the host's mount namespace: old code until a restart |
 | `revisions` | `{<revision_file>: <git sha or null>}`. `null` also when a folder on the way is a link: root reads no file through a link a user may have put there. The one link it follows is Capistrano's `<deploy>/current` → `<deploy>/releases/<name>`. The same rule holds for `pm2.pid` and the nvm `default` alias |
 | `filtered` | `truncated` (a list was over its cap), `dropped` (`{<field>: <count>}`: values left out for a wrong shape or the cap) and `other_paths` (`{<field>: <count>}`: binary paths left out because a user may have named them: `/tmp`, a home folder, a folder others can write, a container path outside `/usr/bin` and `/usr/local/bin`, a deleted binary with no file at its path now) |
 

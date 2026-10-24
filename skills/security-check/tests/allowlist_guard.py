@@ -3,7 +3,8 @@
 checks that it runs only allowed external commands, and nothing that can write or start things.
 It also refuses here-strings ("<<<": bash before 5.1 writes them to a temp file) and "< $file"
 (a file named by a variable is read only through read_plain: no symlink, no FIFO wait).
-From /proc it allows only /proc/<pid>/exe and /proc/self/cwd (the script's own folder).
+From /proc it allows only /proc/<pid>/exe, /proc/<pid>/ns/mnt and /proc/1/ns/mnt (which mount
+namespace a process is in) and /proc/self/cwd (the script's own folder).
 
 Usage:
   allowlist_guard.py <script> "<allowed commands, space separated>" [--list]
@@ -313,8 +314,8 @@ for no, line in enumerate(lines, 1):
         if word in low:
             err(no, f"reads '{word}'")
     for p in re.findall(r"/proc/[^\s\"')]*", line):
-        if not re.fullmatch(r"/proc/(\[0-9\]\*|\$[A-Za-z_]+)(/exe)?|/proc/self/cwd", p):
-            err(no, f"reads {p} (only /proc/<pid>/exe and /proc/self/cwd are allowed)")
+        if not re.fullmatch(r"/proc/(\[0-9\]\*|\$[A-Za-z_]+)(/exe|/ns/mnt)?|/proc/1/ns/mnt|/proc/self/cwd", p):
+            err(no, f"reads {p} (only /proc/<pid>/exe, /proc/<pid>/ns/mnt and /proc/self/cwd are allowed)")
     norm = line
     while True:
         new = re.sub(r"\$\{[^{}]*\}", VAR, norm)

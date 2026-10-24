@@ -71,7 +71,8 @@ the pm2 restart, the boot unit, the check, the rollback.>
 
 | component | version | why not | how to check by hand |
 |---|---|---|---|
-| <Go binary / image base OS / a source that was down> | <version> | <reason> | <page or command> |
+| <Go binary / a source that was down> | <version> | <reason> | <page or command> |
+| image `<image>` | built `<created>` | <not checked: no pullable digest (`digest` null) / no scanner / `tag_moved` null>; what was checked (releases page) | <`trivy image --platform linux/<arch> <repository>@<digest>`, never a tag> |
 | <apt packages, when `apt.status` is not `ok`> | — | <apt-get failed on the server (`error`) or is missing (`null`): pending upgrades unknown> | for the user: `apt-get --simulate dist-upgrade` on the server |
 | <inventory field from `filtered.dropped`> | — | <N values left out: wrong shape, or over the cap (`filtered.truncated`)> | for the user, not this skill: look at that field on the server |
 | <inventory field from `filtered.other_paths`> | — | <N binaries in a folder a user may name (for example `/tmp` or a home folder), or a container's: the path is not shown> | for the user, not this skill: `ps -eo user,pid,exe` on the server |
@@ -112,7 +113,7 @@ Versions only. No file contents.
 | openssh / openssl | `<dpkg version>` / `<dpkg version>` | dpkg |
 | python3 | `<dpkg version>` | dpkg |
 | ruby | `<versions>` | rvm |
-| images | `<image>` (built `<created>`), or `<image>` (built `<created>`, older than its tag: `tag_moved`), or `<image>` (not known: `tag_moved` null) | docker ps, docker images |
+| images | `<image>` (`<digest>` or no digest; built `<created>`), or `<image>` (built `<created>`, older than its tag: `tag_moved`), or `<image>` (not known: `tag_moved` null) | docker ps, docker images |
 | <app> | deployed `<sha>` | REVISION |
 | still running after an update | `<running_deleted_exe>`, or none (executables only, not libraries) | /proc |
 

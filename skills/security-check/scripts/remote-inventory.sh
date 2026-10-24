@@ -13,9 +13,10 @@
 #   safe fields (no env, labels, mounts or command), dd only reads (with
 #   iflag=nofollow,nonblock, no of=); nothing writes a file
 # - pm2, nvm, npm and systemctl are never run: they can start daemons or write files
-# - process facts come only from the /proc/<pid>/exe link: no process arguments,
-#   no process environment, no app config files. /proc/self/cwd is read too: the script's own
-#   folder (read_plain)
+# - process facts come only from the /proc/<pid>/exe link and the /proc/<pid>/ns/mnt link (which
+#   mount namespace: the host's, or a container's): no process arguments, no process
+#   environment, no app config files. /proc/self/cwd is read too: the script's own folder
+#   (read_plain)
 # - a file under a folder other users can write (nvm, pm2, deploys) is read only through
 #   read_plain: it goes into the folder and checks with the kernel that it is the folder named
 #   (no link on the way), then dd opens the file there once, with O_NOFOLLOW and O_NONBLOCK,
@@ -250,6 +251,9 @@ shaped os "$WORD_RE" "$os_code" || os_code=""
 
 kernel_running=$(uname -r 2>/dev/null)
 shaped os "$VER_RE" "$kernel_running" || kernel_running=""
+# The machine (x86_64, aarch64): an image is scanned for the server's platform, not the Mac's.
+machine=$(uname -m 2>/dev/null)
+shaped os "$WORD_RE" "$machine" || machine=""
 kernels=()
 for f in /boot/vmlinuz-*; do
   [ -e "$f" ] && kernels+=("${f#/boot/vmlinuz-}")
@@ -359,6 +363,17 @@ fi
 # The link of a process in a container names the path INSIDE the container. When the link's
 # target is not the host file at that path ("-ef" compares device and inode), the process is
 # counted as a container process, not as the host binary.
+# A binary replaced on disk ("<path> (deleted)") cannot be compared: its file is gone. It is the
+# host's only when the process is in the host's mount namespace (host_ns); else it is counted as
+# a container's too (a container, or a service with its own mounts: its version is not known).
+host_mnt=$(readlink /proc/1/ns/mnt 2>/dev/null)
+# host_ns <pid>: the process is in the mount namespace of PID 1, so a path in its exe link is the
+# host's path. A link that cannot be read (the process is gone, or no access) gives false.
+host_ns() {
+  local p=$1 ns
+  ns=$(readlink "/proc/$p/ns/mnt" 2>/dev/null)
+  [ -n "$host_mnt" ] && [ "$ns" = "$host_mnt" ]
+}
 declare -A running=() deleted=() in_container=()
 while IFS=$'\t' read -r dir exe; do
   [ -n "$exe" ] || continue
@@ -366,6 +381,10 @@ while IFS=$'\t' read -r dir exe; do
   [[ $pid =~ $PID_RE ]] || continue
   if [[ $exe == *' (deleted)' ]]; then
     exe=${exe% (deleted)}
+    if ! host_ns "$pid"; then
+      [ -d "/proc/$pid" ] && in_container[$exe]=$(( ${in_container[$exe]:-0} + 1 ))
+      continue
+    fi
     deleted[$exe]=1
   elif [ ! "/proc/$pid/exe" -ef "$exe" ]; then
     [ -d "/proc/$pid" ] && in_container[$exe]=$(( ${in_container[$exe]:-0} + 1 ))
@@ -374,9 +393,8 @@ while IFS=$'\t' read -r dir exe; do
   running[$exe]=$(( ${running[$exe]:-0} + 1 ))
 done < <(find /proc/[0-9]*/exe -maxdepth 0 -printf '%h\t%l\n' 2>/dev/null)
 
-# A binary replaced on disk but still running: the old code runs until a restart.
-# "named" wants a file at that path now (the update put a new one there): so the path is the
-# host's, not one inside a container or another mount namespace.
+# A binary replaced on disk but still running, in the host's mount namespace: the old code runs
+# until a restart. "named" wants a file at that path now (the update put a new one there).
 deleted_json=()
 bounded running_deleted_exe "${!deleted[@]}"
 while IFS= read -r p; do
@@ -453,13 +471,15 @@ for home in ${pm2_homes[@]+"${pm2_homes[@]}"}; do
   [ -n "$pid" ] && pidfile=true
   [[ $pid =~ $PID_RE ]] || pid=""
   # The pid file is the user's: it can name any process. Its binary is passed on only when it is
-  # the host file at that path (or, when replaced, a file is there now) and root named it.
+  # the host file at that path (or, when replaced, the process is in the host's mount namespace
+  # and a file is there now) and root named it.
   if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
     up=true
     host=true
     exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
     if [[ $exe == *' (deleted)' ]]; then
       exe=${exe% (deleted)}
+      host_ns "$pid" || host=false
     elif [ -n "$exe" ] && [ ! "/proc/$pid/exe" -ef "$exe" ]; then
       host=false
     fi
@@ -554,11 +574,13 @@ by_prefix() {
 }
 
 # read_images: reads "docker images -a" (at most MAX_IMG lines) into tag_id (repo:tag -> id),
+# tag_digest (repo:tag -> the repo digest of that image: "repo@digest" pulls exactly it),
 # digest_id (repo@digest -> id), made (id -> build date) and id_repo / id_digest (id -> one
 # repo@digest name, for an image whose tag moved on).
 read_images() {
   local repo tag digest id created n=0
   tag_id=()
+  tag_digest=()
   digest_id=()
   made=()
   id_repo=()
@@ -571,6 +593,7 @@ read_images() {
     [[ $repo =~ $IMAGE_RE ]] || continue
     if [ "$tag" != "<none>" ] && [ -n "$tag" ]; then tag_id[$repo:$tag]=$id; fi
     [[ $digest =~ $DIGEST_RE ]] || continue
+    if [ "$tag" != "<none>" ] && [ -n "$tag" ]; then tag_digest[$repo:$tag]=$digest; fi
     digest_id[$repo@$digest]=$id
     if [ -z "${id_repo[$id]:-}" ]; then id_repo[$id]=$repo; id_digest[$id]=$digest; fi
   done < <(timeout 20 docker images -a --no-trunc --digests --format '{{.Repository}}{{"\t"}}{{.Tag}}{{"\t"}}{{.Digest}}{{"\t"}}{{.ID}}{{"\t"}}{{.CreatedAt}}' 2>/dev/null)
@@ -578,7 +601,7 @@ read_images() {
 
 docker_json=null
 if command -v docker >/dev/null 2>&1; then
-  declare -A tag_id=() digest_id=() made=() id_repo=() id_digest=() tag_before=()
+  declare -A tag_id=() tag_digest=() digest_id=() made=() id_repo=() id_digest=() tag_before=()
   # 1. The tags before "docker ps".
   read_images
   for k in "${!tag_id[@]}"; do
@@ -603,7 +626,9 @@ if command -v docker >/dev/null 2>&1; then
     # 3. The images after "docker ps".
     read_images
     # Per running image: "image" (the short name; the image id when it has no repo@digest name),
-    # "digest" (the container was started by digest), "id" (the image the container runs),
+    # "digest" (the image's repo digest: the one the container was started by, else the one
+    # "docker images" lists for its tag or id; "<repo>@<digest>" pulls exactly this image; empty
+    # when it has none, as a local build), "id" (the image the container runs),
     # "created" (its build date) and "tag_moved": true when the name the container was started
     # with points to another image now, or to none. null: not known (then id is null too, unless
     # a digest names the image).
@@ -640,7 +665,12 @@ if command -v docker >/dev/null 2>&1; then
             id=""
           elif [ -z "$id" ] && [[ $ref =~ $HEX_RE ]]; then
             by_prefix "$ref"
-            [ -z "$id" ] || name=$id
+            if [ -n "$id" ]; then
+              name=${id_repo[$id]:-$id}
+              digest=${id_digest[$id]:-}
+            fi
+          else
+            digest=${tag_digest[$name]:-}
           fi
           [ -n "$id" ] || moved=null
         fi
@@ -678,7 +708,7 @@ done
 
 out="{\"collected_at\":$(js "$(date -u +%Y-%m-%dT%H:%M:%SZ)"),\"host\":null,"
 out+="\"os\":{\"id\":$(js "$os_id"),\"version_id\":$(js "$os_ver"),\"codename\":$(js "$os_code"),"
-out+="\"kernel_running\":$(js "$kernel_running"),\"kernel_newest_installed\":$(js "$kernel_newest"),"
+out+="\"machine\":$(js "$machine"),\"kernel_running\":$(js "$kernel_running"),\"kernel_newest_installed\":$(js "$kernel_newest"),"
 out+="\"reboot_required\":$reboot_required,\"reboot_required_pkgs\":$(jarr ${reboot_pkgs[@]+"${reboot_pkgs[@]}"})},"
 out+="\"apt\":{\"status\":$(js "$apt_state"),\"lists_age_hours\":${lists_age:-null},\"upgradable\":$upg_json},"
 out+="\"node\":$(jarr ${node_json[@]+"${node_json[@]}"}),"

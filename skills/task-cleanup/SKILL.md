@@ -1,6 +1,6 @@
 ---
 name: task-cleanup
-description: Wrap up a Jira task that was started with new-task, and leave a clean machine plus a better set of rules. Checks every PR (merged, CI, review, Deploy steps), updates the ticket and every related ticket, runs a short retro that turns what went wrong into one concrete change in CLAUDE.md, a skill or the docs, stops every process the task started (servers, specs, watchers, background jobs, containers, recorded remote screens and test databases), removes the worktree and branch, and at the very end closes the agterm session and the Claude session. Use whenever the user says "task cleanup", "/task-cleanup", "wrap up", "wrap up the task", "clean up this task", "close the task", "finish KAN-123", "retro this task", "we are done with this ticket", "close this session", or after a task's PR is merged and deployed — even if they do not say "Jira".
+description: Wrap up a Jira task that was started with new-task, and leave a clean machine plus a better set of rules. Checks every PR (merged, CI, review, Test plan and Deploy steps), rewrites the ticket's description to what was really decided and built, with test cases an outside tester can follow and an e2e spec named for each (gaps get a follow-up), updates the ticket and every related ticket, runs a short retro that turns what went wrong into one concrete change in CLAUDE.md, a skill or the docs, stops every process the task started (servers, specs, watchers, background jobs, containers, recorded remote screens and test databases), removes the worktree and branch, and at the very end closes the agterm session and the Claude session. Use whenever the user says "task cleanup", "/task-cleanup", "wrap up", "wrap up the task", "clean up this task", "close the task", "finish KAN-123", "retro this task", "we are done with this ticket", "close this session", or after a task's PR is merged and deployed — even if they do not say "Jira".
 ---
 
 # task-cleanup — wrap up a task completely
@@ -13,7 +13,10 @@ Everything about the task is in its registry: `~/.claude/task-briefs/<KEY>.env` 
 worktree, branch, Claude session id, agterm session id). Read it first.
 
 ```bash
-JIRA="python3 /Users/vnazarenko/code/Orthhank/.claude/skills/jira-tickets/scripts/jira.py"
+# A FUNCTION, not JIRA="python3 …": the Bash tool runs zsh here, and zsh does not split an
+# unquoted $JIRA into words — `$JIRA comment` fails with "no such file or directory".
+jira() { python3 ~/code/Orthhank/.claude/skills/jira-tickets/scripts/jira.py "$@"; }
+td() { python3 -I ~/.claude/skills/task-cleanup/scripts/ticket-doc.py "$@"; }   # the ticket's text, step 5
 S=~/.claude/skills/task-cleanup/scripts
 ```
 
@@ -37,12 +40,12 @@ Cleanup removes things, so check first. Report each failing gate in one line and
 | every PR is merged | `gh pr list --head $BRANCH --state all --json number,state,mergeCommit,url` | an OPEN PR → stop: the worktree is still in use |
 | merge is proven | for each merged PR: `git -C $REPO fetch -q origin && git -C $REPO merge-base --is-ancestor <mergeCommit.oid> origin/main` | do not delete the branch |
 | it is deployed | the PR's "After deploy" checks pass (run the read-only ones: `curl`, a status page) or the user says it is deployed | ask: Done, or `ready for deploy` and keep going |
-| session log | `git -C $REPO show origin/main:.claude/SESSIONS.md` has this session's line | say so in the report (it needs a new PR now) |
+| session log | `scripts/session-log-check.sh $REPO <session-id> $STARTED` says yes: a file `.claude/sessions/<date>-<id8>.md` is on the default branch (an old repo: a line in `.claude/SESSIONS.md`) | say so in the report (it needs a new PR now) |
 
 A CLOSED (not merged) PR is fine when the user confirms the work is dropped: then the Jira status
 is `closed`, not `Done`.
 
-Red CI on an already-merged PR and a PR body with no `Deploy steps` are **not** gates — they are
+Red CI on an already-merged PR and a PR body with no `Test plan` or `Deploy steps` are **not** gates — they are
 retro findings. Step 3 handles them.
 
 When the merge is proven, add `MERGE_PROVEN=1` to the registry, so the finisher may delete the
@@ -65,13 +68,14 @@ Read-only. It prints facts and judges nothing:
 | `PRS` | every PR for the branch, its state and merge commit |
 | `CI` | checks that were not green when it merged |
 | `REVIEW` | what a reviewer had to catch — each line is a candidate finding |
-| `PRBODY` | whether each PR body really carries `## Deploy steps` and `## After deploy` |
+| `PRBODY` | whether each PR body really carries `## Test plan`, `## Deploy steps` and `## After deploy` |
 | `COMMITS` | the branch's commits, and how many of them were rework ("fix the fix") |
 | `PLAN` | lines the plan marked ➕ (discovered) or ⚠️ (blocked), and boxes never ticked |
 | `JIRA` | status, and comments mentioning blocked / scope / wrong / again |
+| `TICKET` | the description's parts: Expected result, Decided during the work, How to test (cases, and each case's `e2e:` line) — step 5 |
 | `RELATED` | linked tickets, plus every key named in the commits or PR bodies |
 | `RETRO NOTES` | what the task session wrote down as it worked — the best evidence there is |
-| `SESSIONLOG` | whether this session's `SESSIONS.md` line reached `origin/main` |
+| `SESSIONLOG` | whether this session's `.claude/sessions/` file reached `origin/main` |
 
 ## 3. Retro — turn what went wrong into one rule change
 
@@ -112,7 +116,8 @@ happened. Then add what neither the notes nor the script caught, from this sessi
 - **Three lines maximum**, written as an instruction ("Edit only `investviews/infra/`"), not as a
   story.
 - Give it one line of evidence in the file's own style: `**Why this exists:** 2026-10-22, …` and
-  what actually happened.
+  what actually happened. For `~/.claude/CLAUDE.md` the evidence goes in
+  `~/.claude/CLAUDE-history.md` under the rule's section, not in CLAUDE.md (loaded in every session).
 - Project facts never go in the global file. Process rules never go in a project file.
 - Never add a rule that already exists elsewhere. If it existed and was still missed, that is a
   placement problem — fix the placement instead.
@@ -120,10 +125,11 @@ happened. Then add what neither the notes nor the script caught, from this sessi
 ### Make the change
 
 - `~/.claude/CLAUDE.md`, a skill under `~/.claude/skills/`, or a memory file: edit in place —
-  they only work from that path — then commit it:
+  they only work from that path. Then commit only the paths git already tracks:
   ```bash
-  git -C ~/.claude add -A <paths> && git -C ~/.claude commit -m "retro($KEY): <what changed>"
+  git -C ~/.claude add -u <paths> && git -C ~/.claude commit -m "retro($KEY): <what changed>"
   ```
+  ⚠️ `~/.claude` is a PUBLIC repo and `CLAUDE.md` is deliberately untracked. Never `git add` it.
 - A file inside a project repo: it needs its own worktree and PR, because the task's branch is
   merged and the main checkout is read-only.
   ```bash
@@ -133,7 +139,7 @@ happened. Then add what neither the notes nor the script caught, from this sessi
   That PR is the one thing cleanup leaves open. Name it in the report, and delete its worktree
   when it merges.
 
-Write the finding and the change into the Jira comment in step 5, in one line each. If there is
+Write the finding and the change into the Jira comment in step 6, in one line each. If there is
 nothing to change, say that too — it is a result.
 
 ## 4. Stop the processes
@@ -155,16 +161,76 @@ its stop command. **On a production host, show the user what you will stop and a
 Also stop what this session itself runs in the background: `TaskStop` every background task and
 Monitor you started, and `CronDelete` any cron you created.
 
-## 5. Jira — this ticket and every related one
+## 5. The ticket text — true, testable, covered by e2e (user rule, 2026-11-02)
 
-1. Post the final comment (`$JIRA comment $KEY --body-file …`), in plain English:
+The ticket goes to testing and acceptance on production after cleanup. The tester reads the
+ticket, not the PRs. So before the status moves to `ready for deploy` or `Done` (step 6), the
+description must say what was decided and built, and how to test it.
+
+Only for the ticket being cleaned up now. Never go back to tickets cleaned up before
+2026-11-02 (user, 2026-11-02: old tickets stay as they are).
+
+**Why this exists:** 2026-11-02, KAN-424's Expected result still said "in November, October is
+shown". The work found the monthly build runs on the 5th on purpose (the first days of a month
+are needed for the data to settle), and the user kept it. The ticket promised the wrong thing.
+
+Start from the evidence's `TICKET` section (`td check $KEY`). Then:
+
+1. **Make it true.** Compare the description (summary, Expected result, acceptance) with the
+   user's decisions in the Jira comments, the plan doc and the merged PRs' Test plans.
+   - Rewrite every line that is no longer true. The Expected result says what the product does now.
+   - Add `## Decided during the work (<date>)`: one line per decision — what the ticket said
+     first, what was decided instead. Scope moved to another ticket names that ticket.
+   - Never drop the user's original request silently. What the user reported stays, and each
+     changed expectation is named in the Decided list.
+   - Change the summary (title) only when it promises something wrong. A bug's symptom stays.
+2. **Make it testable.** Add `## How to test`, for a tester who knows nothing about the task.
+   Take the cases from the PRs' Test plans, and rewrite them for an outsider (full URLs, no
+   internal names). One case per changed behaviour, plus one regression case:
+   ```
+   ### 1. <what is checked, in a few words>
+   - Where: <full URL / screen / API endpoint>
+   - Account: <account or data needed>      (or one line above the cases, when all share it)
+   - Steps: <clicks in order, or the exact curl>
+   - Expected: <exact text, number or status code>
+   - e2e: <spec path> › "<test name>" (live|stubbed)
+          | none — <why>. Follow-up: <KEY>
+          | manual only — <why no e2e can check it>
+   ```
+   - A short Expected result may stay above. The cases are the test.
+   - More than ~8 cases, or a long setup: write them in `docs/test-plans/<KEY>.md` in the repo
+     (a `<KEY>-test-plan` worktree and PR, like the retro PR). The ticket keeps the Expected
+     result and the GitHub link to that file.
+3. **Check the e2e coverage of each case** in the repo's e2e folder on `origin/main`
+   (`git -C $REPO grep -n '<expected text>' origin/main -- <e2e dir>`), not from the PR text.
+   - A unit, component or request spec is not e2e.
+   - `manual only` is right only when no e2e can check it (a production schedule, a vendor
+     dashboard). Write why.
+   - A gap (an e2e could check it, none does): add the e2e now, in a `<KEY>-e2e` worktree and PR,
+     or file a follow-up ticket (`jira-tickets`, linked to this one) and name it in the case's
+     `e2e:` line. Never call a gap covered.
+4. **Show the new description to the user** (the manager may answer for them), then save it:
+   ```bash
+   td show $KEY > "$SCRATCHPAD/$KEY-description.md"     # edit this file
+   td set $KEY "$SCRATCHPAD/$KEY-description.md"         # saves the old text to
+                                                          # task-briefs/description-backups/ first
+   td check $KEY                                          # each case: Where, Steps, Expected, e2e
+   ```
+   `td restore $KEY <backup.json>` puts the old text back. `td set` keeps tables, lists and
+   headings; `jira create` / `comment` turn a table into one line.
+
+## 6. Jira — this ticket and every related one
+
+1. Post the final comment (`jira comment $KEY --body-file …`), in plain English:
    - what was done, in 1–3 lines;
    - the PR links with their merge commits;
    - the deploy state and the check that proves it;
    - the retro: the finding and the rule that changed, one line each, or "nothing to change";
+   - the ticket text (step 5): what changed in the description, the number of test cases, and
+     the e2e gaps with their follow-up keys;
    - anything left open, as a follow-up ticket key (create it with `jira-tickets`) or "nothing".
-2. Move the status: `$JIRA transition $KEY --to "Done"` (deployed), `"ready for deploy"`
-   (merged, not deployed), or `"closed"` (dropped).
+2. Move the status — only after step 5 is done: `jira transition $KEY --to "Done"` (deployed),
+   `"ready for deploy"` (merged, not deployed), or `"closed"` (dropped).
 3. Then every ticket from the evidence's `RELATED` section:
 
    | the related ticket | do this |
@@ -176,7 +242,7 @@ Monitor you started, and `CronDelete` any cron you created.
 
    Never move a related ticket to Done without naming the PR that did it.
 
-## 6. Report to the user — before the session closes
+## 7. Report to the user — before the session closes
 
 The user reads this message in the session just before it closes, so it is the last thing they see
 here. Keep it to the result table:
@@ -185,12 +251,13 @@ here. Keep it to the result table:
 |---|---|
 | PR | #N merged (`sha`) |
 | Jira | KAN-297 → Done; KAN-310 commented |
+| ticket text | Expected result rewritten (October after the 5th); 7 test cases; e2e 3 covered, 1 manual, 3 gaps → KAN-440 |
 | retro | `~/.claude/CLAUDE.md`: test command for parsalytics specs — or "nothing to change" |
 | left open | retro PR #N (doc change), or "nothing" |
 | processes | 3 stopped, 0 left |
 | worktree + branch | removed after the session closes |
 
-## 7. Close everything — the last step
+## 8. Close everything — the last step
 
 ```bash
 bash $S/finish-task.sh $KEY --detach

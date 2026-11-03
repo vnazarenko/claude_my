@@ -4,14 +4,16 @@
 #
 #   task-evidence.sh <KEY>
 #
-# Sections: REGISTRY, PRS, CI, REVIEW, PRBODY, COMMITS, PLAN, JIRA, RELATED, SESSIONLOG.
+# Sections: REGISTRY, PRS, CI, REVIEW, PRBODY, COMMITS, PLAN, JIRA, TICKET, RELATED, RETRO NOTES,
+# SESSIONLOG.
 # Every section is facts only. Reading them is the model's job, not the script's.
 set -uo pipefail
 
 key="${1:?Jira key required}"
 briefs="$HOME/.claude/task-briefs"
 reg="$briefs/$key.env"
-JIRA_PY="${JIRA_PY:-/Users/vnazarenko/code/Orthhank/.claude/skills/jira-tickets/scripts/jira.py}"
+JIRA_PY="${JIRA_PY:-$HOME/code/Orthhank/.claude/skills/jira-tickets/scripts/jira.py}"
+here="$(cd "$(dirname "$0")" && pwd -P)"   # before the cd to $REPO below
 
 if [ -f "$reg" ]; then . "$reg"; fi
 REPO="${REPO:-$(pwd)}"
@@ -35,6 +37,15 @@ if command -v gh >/dev/null 2>&1 && [ -n "$BRANCH" ]; then
      --template '{{range .}}#{{.number}} {{.state}} {{.title}}  {{.url}}  merge={{if .mergeCommit}}{{.mergeCommit.oid}}{{else}}-{{end}}
 {{end}}' 2>&1
   prs=$(gh pr list --head "$BRANCH" --state all --json number --jq '.[].number' 2>/dev/null)
+  # A task can land its work on OTHER branches (KAN-344 merged #382, #393 and a carry-over #414,
+  # none on $BRANCH), so also list every PR that names the key.
+  for n in $(gh pr list --state all --search "$KEY in:title,body" --limit 30 --json number --jq '.[].number' 2>/dev/null); do
+    case " $(echo $prs) " in *" $n "*) continue ;; esac
+    gh pr view "$n" --json number,state,title,url,mergeCommit \
+       --template '#{{.number}} {{.state}} {{.title}}  {{.url}}  merge={{if .mergeCommit}}{{.mergeCommit.oid}}{{else}}-{{end}}  (names {{"'"$KEY"'"}})
+' 2>&1
+    prs="$prs $n"
+  done
 else
   echo "(gh missing or no branch)"
 fi
@@ -62,13 +73,14 @@ done
 
 echo
 echo "== PRBODY =="
-echo "# every PR body must end with '## Deploy steps' and '## After deploy'"
+echo "# every PR body must end with '## Test plan', '## Deploy steps' and '## After deploy'"
 for n in $prs; do
   body=$(gh pr view "$n" --json body --jq .body 2>/dev/null)
-  d=MISSING; a=MISSING
+  t=MISSING; d=MISSING; a=MISSING
+  printf '%s' "$body" | grep -qi '^## *Test plan'     && t=ok
   printf '%s' "$body" | grep -qi '^## *Deploy steps'  && d=ok
   printf '%s' "$body" | grep -qi '^## *After deploy'  && a=ok
-  echo "#$n Deploy steps=$d  After deploy=$a"
+  echo "#$n Test plan=$t  Deploy steps=$d  After deploy=$a"
   mentions="$mentions $(printf '%s' "$body" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | sort -u | tr '\n' ' ')"
 done
 [ -z "$prs" ] && echo "(no PR)"
@@ -122,6 +134,11 @@ else
 fi
 
 echo
+echo "== TICKET =="
+echo "# the description itself (SKILL.md step 5): Expected result, Decided during the work, How to test, e2e per case"
+JIRA_PY="$JIRA_PY" python3 -I "$here/ticket-doc.py" check "$key" 2>&1
+
+echo
 echo "== RELATED =="
 if [ -f "$JIRA_PY" ]; then
   python3 "$JIRA_PY" jql "issue in linkedIssues(\"$key\")" --limit 20 --md 2>&1 | head -25
@@ -136,13 +153,6 @@ if [ -s "$briefs/$key.retro" ]; then cat "$briefs/$key.retro"; else echo "(none 
 
 echo
 echo "== SESSIONLOG =="
-sid="${CLAUDE_SESSION_ID:-}"
-if git -C "$REPO" show origin/main:.claude/SESSIONS.md >/dev/null 2>&1; then
-  if [ -n "$sid" ] && git -C "$REPO" show origin/main:.claude/SESSIONS.md | grep -q "${sid:0:8}"; then
-    echo "on origin/main: yes (${sid:0:8})"
-  else
-    echo "on origin/main: NO — this session has no line yet"
-  fi
-else
-  echo "(.claude/SESSIONS.md is not on origin/main)"
-fi
+# ⚠️ DEFAULTED, because `set -u` is on and a HAND-BUILT registry has no STARTED. Without the
+# default the expansion ABORTS the run. session-log-check.sh says when the date is unknown.
+"$here/session-log-check.sh" "$REPO" "${CLAUDE_SESSION_ID:-}" "${STARTED:-}"

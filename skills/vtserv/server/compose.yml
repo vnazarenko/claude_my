@@ -1,0 +1,154 @@
+# compose.yml — the containers of ONE `vt` run (KAN-387). vt-remote sets every variable; never
+# `up` this by hand.
+#
+# The database containers share the runner's network namespace (`network_mode: service:runner`).
+# Inside the run, Postgres is 127.0.0.1:5432, ClickHouse 127.0.0.1:8123/9000 and Redis
+# 127.0.0.1:6379 — the same addresses as on the Mac — and no other run can reach them. That is how
+# two runs never share a database, without renaming any database.
+#
+# Memory caps are per container and include the tmpfs data (tmpfs pages are charged to the
+# container that writes them). One run: 6 + 2 + 6 + 0.25 GB = 14.25 GB; three slots (42.75 GB) fit
+# vtserv's 47 GB. Measured peaks (2026-11-01): runner 2.3 GB in a 6-worker rspec-full and 3.1 GB in
+# the web e2e, ClickHouse 3.8 GB, Postgres 0.4 GB.
+name: ${VT_PROJECT:-vt-none}
+
+x-vt-labels: &vt-labels
+  vt.run: "${VT_RUN:-none}"
+  vt.slug: "${VT_SLUG:-none}"
+  vt.started: "${VT_STARTED:-0}"
+
+services:
+  runner:
+    image: ${VT_IMAGE:-vt-runner:none}
+    init: true
+    command: [sleep, infinity]
+    labels: *vt-labels
+    working_dir: /work/src
+    volumes:
+      - ${VT_SRC:-/nonexistent}:/work/src
+      - ${VT_PSRC:-/nonexistent}:/work/parsalytics
+      - ${VT_BIN:-/nonexistent}:/vt/bin:ro
+      - bundle:/cache/bundle
+      - pnpm:/cache/pnpm-store
+      - playwright:/cache/ms-playwright
+      - corepack:/cache/corepack
+    # Pinned so that no line in a synced .env can point a run at another server. dotenv-rails
+    # (`Dotenv::Railtie.load`) never overrides a variable that is already set. An EMPTY
+    # PUBLIC_API_REDIS_URL counts as absent (`redis.rb` uses `.presence`), so the metering Redis
+    # follows REDIS_URL's private server.
+    # ⚠️ *DATABASE_URL cannot be pinned the same way: ActiveRecord raises "Database URL cannot be
+    # empty" on an empty one. in-runner.sh refuses a run whose .env files set one instead.
+    # E2E_PG/CH/REDIS_* are what e2e-live.sh's preflight probes; E2E_SKIP_SETUP=1 would skip the
+    # schema load on databases that are always fresh here. SENTRY_DSN empty = Sentry off.
+    # AWS_EC2_METADATA_DISABLED: with no AWS keys (on the Mac ~/.aws has them) the AWS SDK asks the
+    # EC2 metadata address for credentials, and WebMock fails the spec that builds an S3 client.
+    environment:
+      VT_RUN: "${VT_RUN:-none}"
+      DATABASE_HOST: 127.0.0.1
+      DATABASE_PORT: "5432"
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: postgres
+      TEST_DB_USERNAME: postgres
+      TEST_DB_PASSWORD: postgres
+      CH_DATABASE_HOST: 127.0.0.1
+      CH_DATABASE_PORT: "8123"
+      CH_DATABASE_USERNAME: default
+      REDIS_URL: redis://127.0.0.1:6379/0
+      PUBLIC_API_REDIS_URL: ""
+      E2E_PG_HOST: 127.0.0.1
+      E2E_PG_PORT: "5432"
+      E2E_CH_HOST: 127.0.0.1
+      E2E_CH_PORT: "8123"
+      E2E_REDIS_HOST: 127.0.0.1
+      E2E_REDIS_PORT: "6379"
+      E2E_SKIP_SETUP: ""
+      SENTRY_DSN: ""
+      AWS_EC2_METADATA_DISABLED: "true"
+    mem_limit: 6g
+    memswap_limit: 6g
+    shm_size: 2g
+    cpus: 8
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+
+  postgres:
+    profiles: [db]
+    image: postgres:16
+    network_mode: service:runner
+    labels: *vt-labels
+    environment:
+      POSTGRES_PASSWORD: postgres
+    command:
+      - postgres
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - max_connections=300
+    tmpfs:
+      - /var/lib/postgresql/data:size=1536m
+    mem_limit: 2g
+    memswap_limit: 2g
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, postgres]
+      interval: 1s
+      timeout: 3s
+      retries: 90
+
+  clickhouse:
+    profiles: [db]
+    image: clickhouse/clickhouse-server:${VT_CH_TAG:-25.11}
+    network_mode: service:runner
+    labels: *vt-labels
+    environment:
+      # Keep the stock `default` user (no password), as on the Mac.
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    # ClickHouse sizes its own memory limit from the container cap, but does not count its tmpfs
+    # data, which is charged to the same cap. clickhouse-vt.xml keeps its own share at 55% (3.3 GB),
+    # so a full suite stays under the cap: at 3 GB with the stock 90% the kernel killed it
+    # mid-suite; at 5 GB × 45% (2.25 GB) a 6-worker suite hit "memory limit exceeded" (KAN-401).
+    volumes:
+      - ${VT_BIN:-/nonexistent}/clickhouse-vt.xml:/etc/clickhouse-server/config.d/vt.xml:ro
+    tmpfs:
+      - /var/lib/clickhouse:size=2048m
+    mem_limit: 6g
+    memswap_limit: 6g
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: [CMD, clickhouse-client, -q, "SELECT 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 90
+
+  redis:
+    profiles: [db]
+    image: redis:7.2
+    network_mode: service:runner
+    labels: *vt-labels
+    command: [redis-server, --save, "", --appendonly, "no"]
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+# Shared by every run and never removed by `down -v` (external). vt-remote creates them.
+volumes:
+  bundle:
+    external: true
+    name: vt-bundle-${VT_RUBY:-none}
+  pnpm:
+    external: true
+    name: vt-pnpm-store
+  playwright:
+    external: true
+    name: vt-ms-playwright
+  corepack:
+    external: true
+    name: vt-corepack

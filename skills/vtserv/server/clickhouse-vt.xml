@@ -1,0 +1,33 @@
+<!-- Mounted into the ClickHouse container of a `vt` run (compose.yml, KAN-387). ClickHouse's
+     memory limit is a share of the container cap; its tmpfs data is charged to the same cap and is
+     not in that share. 55% of 6 GB (3.3 GB), plus up to 2 GB of tmpfs data and the mapped binary,
+     stays under the cap. -->
+<clickhouse>
+    <max_server_memory_usage_to_ram_ratio>0.55</max_server_memory_usage_to_ram_ratio>
+
+    <!-- The server's own log file: warnings and errors only (KAN-437). At the image's default
+         level, trace, it wrote 798 MB in the first 7 minutes of a parsalytics full suite (1.16 M
+         Trace and 2.24 M Debug lines, 18 warnings or errors), into the container's writable layer,
+         which sits on vtserv's disk until the run ends. -->
+    <logger>
+        <level>warning</level>
+    </logger>
+
+    <!-- The system log tables that fill the tmpfs (KAN-437). ClickHouse's only disk in a run is the
+         2 GB tmpfs. In a parsalytics full suite (6 workers, 2026-11-02) it reached 1959 of 2048 MB;
+         these eight tables held about 1.2 GB of it (text_log 651 MB, processors_profile_log 235,
+         query_log 230, trace_log 50, metric_log 27, query_metric_log 16, part_log 15,
+         asynchronous_metric_log 7, active + inactive parts), every other table under 30 KB, the six
+         test databases about 2 MB. The full suites of parsalytics #441 and #443 had failed with
+         "Cannot reserve 1.00 MiB, not enough space (NOT_ENOUGH_SPACE)". No parsalytics code or
+         spec reads these tables. The other system
+         logs (crash_log, error_log, ...) stay: they are small and help diagnose a failure. -->
+    <text_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <query_log remove="1"/>
+    <trace_log remove="1"/>
+    <metric_log remove="1"/>
+    <query_metric_log remove="1"/>
+    <part_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+</clickhouse>

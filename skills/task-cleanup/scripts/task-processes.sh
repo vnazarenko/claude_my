@@ -76,6 +76,9 @@ for pid in $cands; do
   case "$protect" in *" $pid "*) continue ;; esac
   kill -0 "$pid" 2>/dev/null || continue
   [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$mypgid" ] && continue
+  # vt's shared ssh master (ControlPath …/vt-cm-%C): every session's vt runs go through it, so
+  # killing it cuts their runs (exit 255). It exits by itself (ControlPersist). KAN-434, 2026-11-03.
+  case "$(ps -o command= -p "$pid")" in ssh\ *ControlPath=*/vt-cm-*\ -fN\ *) continue ;; esac
   case " ${list[*]-} " in *" $pid "*) continue ;; esac
   list+=("$pid")
 done
@@ -117,7 +120,12 @@ fi
 
 show
 [ -n "$containers" ] && { echo "containers mounting the worktree:"; echo "$containers" | sed 's/^/  /'; } || echo "containers: none"
-if [ -s "$PROCS" ]; then
+# ⚠️ DEFAULTED for the same reason as SESSIONLOG's STARTED in task-evidence.sh: `set -u` is on and a
+# HAND-BUILT registry (any task not started with `new-task`) has no PROCS. Undefaulted it aborts the
+# script HERE — after the stop has already run but before the trailing output — and finish-task.sh
+# reads that truncated output, fails to find its `--- after stop ---` marker and reports "WARNING:
+# some task processes are still running" when none are.
+if [ -n "${PROCS:-}" ] && [ -s "${PROCS}" ]; then
   echo "recorded in $PROCS (check and stop these by hand):"
   sed 's/^/  /' "$PROCS"
 else

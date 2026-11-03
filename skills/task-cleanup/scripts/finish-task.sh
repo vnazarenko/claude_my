@@ -32,7 +32,7 @@ trap '' HUP
 cd /
 # shellcheck disable=SC1090
 . "$reg"
-JIRA_PY="${JIRA_PY:-/Users/vnazarenko/code/Orthhank/.claude/skills/jira-tickets/scripts/jira.py}"
+JIRA_PY="${JIRA_PY:-$HOME/code/Orthhank/.claude/skills/jira-tickets/scripts/jira.py}"
 here="$(cd "$(dirname "$0")" && pwd -P)"
 echo "=== $(date '+%F %T') finish $key"
 notes=()
@@ -73,9 +73,26 @@ if [ -d "$WORKTREE" ]; then
   if [ -n "$real" ]; then
     notes+=("WORKTREE KEPT: it has uncommitted work ($WORKTREE)")
     echo "REFUSING to remove worktree, real changes:"; echo "$real"
-  elif git -C "$REPO" worktree remove --force "$WORKTREE"; then
-    notes+=("worktree $WORKTREE removed"); echo "worktree removed"
   else
+    # Its copy on vtserv first (KAN-437): `vt` keeps one copy per checkout there (0.4-1.7 GB), and
+    # `vt clean` finds it from the checkout path, so it must run before the worktree is gone. Best
+    # effort: vtserv down (69) or a run still holding the copy (75) only leaves a note. Then only
+    # vt-reaper removes the copy: the old one on vtserv after 14 days without a run; after the
+    # KAN-437 play, after 24 h (plus the timer's delay), or sooner when the disk is low.
+    vt_bin="$(command -v vt 2>/dev/null || echo "$HOME/bin/vt")"
+    if [ -x "$vt_bin" ]; then
+      if (cd "$WORKTREE" && VT_CONNECT_TIMEOUT=8 "$vt_bin" clean) >/dev/null 2>&1; then
+        notes+=("vtserv copy of the worktree removed (vt clean)"); echo "vt clean done"
+      else
+        notes+=("vtserv copy NOT removed (vt clean exit $?: vtserv down, or a run still holds it); only vt-reaper will remove it")
+      fi
+    else
+      notes+=("vtserv copy NOT CLEANED: no vt command found; only vt-reaper will remove it")
+    fi
+  fi
+  if [ -z "$real" ] && git -C "$REPO" worktree remove --force "$WORKTREE"; then
+    notes+=("worktree $WORKTREE removed"); echo "worktree removed"
+  elif [ -z "$real" ]; then
     notes+=("WARNING: could not remove worktree $WORKTREE")
   fi
 fi

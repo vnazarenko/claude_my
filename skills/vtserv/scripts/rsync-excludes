@@ -1,0 +1,34 @@
+# What `vt` never copies to vtserv (rsync --exclude-from). Paths starting with / are relative to
+# the checkout root. Excluded paths are also never DELETED on vtserv, so the server keeps its own
+# node_modules, .next and tmp/ between runs.
+
+# git: a worktree's .git is a pointer into the main checkout; nothing a suite runs needs it.
+# Git-dependent commands (bin/rspec-changed) run on the Mac.
+.git
+/.claude/worktrees/
+
+# build output, caches, logs — rebuilt on vtserv for Linux
+node_modules/
+.next/
+.next-*/
+/tmp/
+/log/
+/coverage/
+test-results/
+playwright-report/
+.ruby-lsp/
+.DS_Store
+.vt-last-run
+
+# Secrets that never belong on a test box. `.env*` and config/master.key DO go (user decision,
+# 2026-10-29); these do not: infra/ansible/.vault unlocks the production vault.
+.vault
+*.vault
+.vault_pass*
+*.pem
+id_rsa*
+id_ed25519*
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# docker shim for `vt run --host` (KAN-387). First on PATH in host mode only.
+#
+# Host-mode scripts (infra/ansible/tools/*_e2e.sh) start their own containers. This adds the run's
+# labels to every `docker run` / `docker create`, so a cancelled run — or vt-reaper, after a lost
+# lease — finds and removes them even when the script's own cleanup never ran.
+set -euo pipefail
+
+shim_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PATH=":${PATH}:"
+PATH="${PATH//:${shim_dir}:/:}"
+PATH="${PATH#:}"
+PATH="${PATH%:}"
+real="$(command -v docker)"
+
+labels=(--label "vt.run=${VT_RUN:?}" --label "vt.started=${VT_STARTED:-0}")
+case "${1:-}" in
+  run | create)
+    sub="$1"
+    shift
+    exec "${real}" "${sub}" "${labels[@]}" "$@"
+    ;;
+  container)
+    if [[ "${2:-}" == run || "${2:-}" == create ]]; then
+      sub="$2"
+      shift 2
+      exec "${real}" container "${sub}" "${labels[@]}" "$@"
+    fi
+    ;;
+esac
+exec "${real}" "$@"

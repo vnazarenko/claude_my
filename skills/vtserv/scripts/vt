@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+# vt — run heavy work on build-host.local instead of this Mac (KAN-387). Read ../SKILL.md.
+#
+#   vt rspec-full [args]          parsalytics: bin/rspec-full
+#   vt rspec <spec files…>        parsalytics: fresh test DBs, then bundle exec rspec <files>
+#                                 (targeted: vt rspec $(bin/rspec-changed --list))
+#   vt e2e [playwright args]      investviews: pnpm test:e2e (stubbed)
+#   vt e2e-live [args]            investviews: web/scripts/e2e-live.sh with a parsalytics backend
+#   vt run [opts] -- <command…>   anything, in the same subdirectory as here
+#        --no-db       no Postgres/ClickHouse/Redis containers
+#        --no-prepare  skip bundle/pnpm install
+#        --host        run on the vtserv host itself (Docker-driving scripts), no container
+#        -e KEY=VAL    set a variable for the command (repeatable)
+#   VT_CLICKHOUSE=<tag> vt …      any run with databases: clickhouse/clickhouse-server:<tag> instead
+#                                 of 25.11 (e.g. latest, to test a ClickHouse upgrade)
+#   vt status | doctor | setup | clean | stop <run-id>
+#
+# Each run: take this checkout's lease on vtserv (a second run from the same checkout waits), rsync
+# the checkout (uncommitted changes and .env included), start a fresh set of containers, run, copy
+# e2e artifacts back, remove the containers. The exit code is the command's.
+# 64 usage · 69 vtserv unreachable · 70 vtserv-side setup failed.
+# macOS's /bin/bash is 3.2, which treats an empty array as unset under `set -u`. Use a newer bash.
+if ((BASH_VERSINFO[0] < 4)); then
+  for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -x "${b}" ]] && exec "${b}" "$0" "$@"
+  done
+  echo "vt: needs bash 4 or newer (brew install bash)" >&2
+  exit 64
+fi
+set -Eeuo pipefail
+
+VT_HOST="${VT_HOST:-vt@build-host.local}"
+VT_PW_WORKERS="${VT_PW_WORKERS:-4}"
+
+self="${BASH_SOURCE[0]}"
+while [[ -L "${self}" ]]; do
+  link="$(readlink "${self}")"
+  [[ "${link}" == /* ]] && self="${link}" || self="$(dirname "${self}")/${link}"
+done
+SKILL_DIR="$(cd "$(dirname "${self}")/.." && pwd)"
+
+say() { printf 'vt: %s\n' "$*" >&2; }
+die() {
+  local code="$1"
+  shift
+  say "$*"
+  exit "${code}"
+}
+
+CONTROL_PATH="${HOME}/.ssh/vt-cm-%C"
+# Keepalives: 12 × 5 s. A link that answers nothing for 60 s is dead; a shorter stall (a Wi-Fi
+# blip, a busy vtserv) must not end a 20-minute run. vtserv's heartbeat timeout is 60 s too.
+ALIVE=(-o ServerAliveInterval=5 -o ServerAliveCountMax=12)
+SSH=(ssh -o BatchMode=yes -o "ConnectTimeout=${VT_CONNECT_TIMEOUT:-8}" "${ALIVE[@]}"
+  -o ControlMaster=no -o "ControlPath=${CONTROL_PATH}")
+RSYNC_SSH="ssh -o BatchMode=yes -o ConnectTimeout=${VT_CONNECT_TIMEOUT:-8} ${ALIVE[*]} -o ControlMaster=no -o ControlPath=${CONTROL_PATH}"
+# rsync gives up on a connection that moves no data for this long (a dead master connection).
+RSYNC_TIMEOUT=(--timeout=90)
+
+remote() {
+  local q
+  q="$(printf '%q ' "$@")"
+  "${SSH[@]}" "${VT_HOST}" "${q}"
+}
+
+# One shared connection for every ssh and rsync of this run. Started on its own with stdio closed:
+# a ControlPersist master started inside $(…) keeps the substitution's pipe open.
+connect() {
+  local started
+  started="$(date +%s)"
+  # Keepalives belong on the MASTER: every later ssh and rsync rides on its connection, so a
+  # silently dropped link is noticed here (60 s) and all of them end.
+  if ! ssh -o BatchMode=yes -o "ConnectTimeout=${VT_CONNECT_TIMEOUT:-8}" -o ControlMaster=auto \
+    -o "ControlPath=${CONTROL_PATH}" -o ControlPersist=120 "${ALIVE[@]}" \
+    -fN "${VT_HOST}" </dev/null >/dev/null 2>&1; then
+    die 69 "vtserv is unreachable (${VT_HOST}, after $(($(date +%s) - started))s). Nothing was run.
+    Do NOT fall back to a heavy run on this Mac: tell the user vtserv is down and ask."
+  fi
+}
+
+# The server files go to vt/bin/<content hash>/, published once by an atomic rename and never
+# changed again: a session with another vt version never edits files a running run uses.
+BUNDLE="$(cd "${SKILL_DIR}/server" && find . -type f -print0 | LC_ALL=C sort -z |
+  xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-12)"
+VT_REMOTE="vt/bin/${BUNDLE}/vt-remote"
+push_server() {
+  local tmp="vt/bin/.tmp-${BUNDLE}-$$-${RANDOM}"
+  # Already published: nothing to copy. The touch records when the bundle was last used.
+  remote bash -c 'test -x "$1/vt-remote" && touch "$1"' _ "vt/bin/${BUNDLE}" && return 0
+  remote mkdir -p vt/bin
+  rsync -az "${RSYNC_TIMEOUT[@]}" -e "${RSYNC_SSH}" "${SKILL_DIR}/server/" "${VT_HOST}:${tmp}/" ||
+    die 69 "could not copy vt's server files to vtserv"
+  remote bash -c 'mv -T "$1" "$2" 2>/dev/null || rm -rf "$1"' _ "${tmp}" "vt/bin/${BUNDLE}"
+}
+
+# ── where am I ─────────────────────────────────────────────────────────────────────────────────
+
+slug_of() {   # <dir> → <repo>--<checkout>-<hash6>, lower case
+  local top="$1" common main repo checkout hash
+  if common="$(git -C "${top}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    main="${common%/.git}"
+    [[ "${main}" == "${common}" ]] && main="$(dirname "${common}")"
+    repo="$(basename "${main}")"
+    if [[ "$(cd "${main}" && pwd -P)" == "${top}" ]]; then checkout=main; else checkout="$(basename "${top}")"; fi
+  else
+    repo=dir
+    checkout="$(basename "${top}")"
+  fi
+  hash="$(printf '%s' "${top}" | shasum -a 1 | cut -c1-6)"
+  printf '%s--%s-%s' "${repo}" "${checkout}" "${hash}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '-'
+}
+
+TOP="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+TOP="$(cd "${TOP}" && pwd -P)"
+HERE="$(pwd -P)"
+REL="."
+[[ "${HERE}" == "${TOP}"/* ]] && REL="${HERE#"${TOP}"/}"
+SLUG="$(slug_of "${TOP}")"
+
+# The parsalytics checkout web/scripts/e2e-live.sh would use, found the same way it does.
+backend_dir() {
+  local candidate main
+  if [[ -n "${PARSALYTICS_DIR:-}" ]]; then
+    printf '%s' "${PARSALYTICS_DIR}"
+    return
+  fi
+  candidate="$(dirname "${TOP}")/parsalytics"
+  if [[ ! -d "${candidate}" && "${TOP}" == */.claude/worktrees/* ]]; then
+    main="${TOP%/.claude/worktrees/*}"
+    candidate="$(dirname "${main}")/parsalytics"
+  fi
+  printf '%s' "${candidate}"
+}
+
+# ── lease ──────────────────────────────────────────────────────────────────────────────────────
+
+LEASE_DIR=""
+LEASE_PID=""
+HB_PID=""
+RUN_PID=""
+SYNC_PID=""
+RUN_ID=""
+
+# Test hook for barrier tests: VT_TEST_PAUSE=<phase>:<seconds> reaches vt-remote.
+remote_env() { [[ -n "${VT_TEST_PAUSE:-}" ]] && printf 'VT_TEST_PAUSE=%q ' "${VT_TEST_PAUSE}"; return 0; }
+
+# A Mac that goes to idle sleep freezes this script: vtserv sees no heartbeat and stops the run, and
+# after the wake the client exits 255. So the Mac stays awake while a run is going. caffeinate
+# ends by itself when this script does (-w). Lid closed on battery still sleeps.
+keep_awake() {
+  command -v caffeinate >/dev/null 2>&1 || return 0
+  caffeinate -i -s -w "$$" </dev/null >/dev/null 2>&1 &
+}
+
+# The lease is an ssh process that holds this checkout's lock on vtserv. It is fed a heartbeat from
+# a FIFO written by a child of this script — never this script's stdin, which a background agent
+# task has closed. The writer checks every 5 s that this script is still alive, so killing only
+# this process (kill -9 included) ends the heartbeat, and vtserv then stops the run.
+lease_start() {
+  local me=$$
+  LEASE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vt.XXXXXX")"
+  mkfifo "${LEASE_DIR}/hb"
+  (
+    exec >"${LEASE_DIR}/hb"
+    while kill -0 "${me}" 2>/dev/null; do
+      echo hb || exit 0
+      sleep 5 >/dev/null 2>&1   # not on the FIFO: a killed writer must close it at once
+    done
+  ) 2>/dev/null &
+  HB_PID=$!
+  "${SSH[@]}" "${VT_HOST}" "$(remote_env)${VT_REMOTE} lease ${RUN_ID} ${SLUG}" \
+    <"${LEASE_DIR}/hb" >"${LEASE_DIR}/out" &
+  LEASE_PID=$!
+  until grep -qx LEASED "${LEASE_DIR}/out" 2>/dev/null; do
+    kill -0 "${LEASE_PID}" 2>/dev/null || die 70 "could not take the lease on vtserv"
+    sleep 0.2
+  done
+}
+
+# Called from traps and from the normal path: a process that already ended is no error here.
+lease_end() {
+  [[ -n "${HB_PID}" ]] && { kill "${HB_PID}" 2>/dev/null || true; }
+  HB_PID=""
+  if [[ -n "${LEASE_PID}" ]]; then
+    # EOF on the heartbeat ends the lease: vtserv closes the run, stops what is left, waits until
+    # its containers are gone and only then frees the checkout. Up to 30 s.
+    for _ in $(seq 1 120); do
+      kill -0 "${LEASE_PID}" 2>/dev/null || break
+      sleep 0.25
+    done
+    kill "${LEASE_PID}" 2>/dev/null || true
+    LEASE_PID=""
+  fi
+  [[ -n "${LEASE_DIR}" ]] && rm -rf "${LEASE_DIR}"
+  LEASE_DIR=""
+}
+
+on_signal() {
+  local code="$1"
+  set +e
+  trap - INT TERM HUP
+  say "cancelled — stopping run ${RUN_ID:-?} on vtserv"
+  [[ -n "${SYNC_PID}" ]] && kill "${SYNC_PID}" 2>/dev/null
+  [[ -n "${RUN_PID}" ]] && kill "${RUN_PID}" 2>/dev/null
+  lease_end
+  exit "${code}"
+}
+trap 'set +e; lease_end' EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+trap 'on_signal 129' HUP
+
+# ── one run ────────────────────────────────────────────────────────────────────────────────────
+
+# rsync's receiver on vtserv starts through `vt-remote sync-guard`, which registers it with the
+# run (and refuses once the run is closed), so a stop kills a sync still in flight.
+sync_dir() {   # <local dir> <remote slug>
+  local from="$1" to="$2" t0 code=0
+  t0="$(date +%s)"
+  rsync -az --delete "${RSYNC_TIMEOUT[@]}" --exclude-from="${SKILL_DIR}/scripts/rsync-excludes" -e "${RSYNC_SSH}" \
+    --rsync-path="${VT_REMOTE} sync-guard ${RUN_ID} rsync" \
+    "${from}/" "${VT_HOST}:vt/src/${to}/" &
+  SYNC_PID=$!
+  wait "${SYNC_PID}" || code=$?
+  SYNC_PID=""
+  ((code == 0)) || die 70 "rsync of ${from} failed (exit ${code})"
+  say "synced ${from} in $(($(date +%s) - t0))s"
+}
+
+fetch_artifacts() {
+  local d
+  for d in web/test-results web/playwright-report; do
+    if rsync -az --delete "${RSYNC_TIMEOUT[@]}" -e "${RSYNC_SSH}" "${VT_HOST}:vt/src/${SLUG}/${d}/" "${TOP}/${d}/" >/dev/null 2>&1; then
+      say "copied ${d}/ back from vtserv"
+    fi
+  done
+}
+
+# Only these travel from the Mac's environment, per mode. Everything that names a server is pinned
+# on vtserv (compose.yml) and may not be set with -e either.
+FORWARD_rspec_full="RSPEC_FULL_WORKERS"
+FORWARD_e2e_live="E2E_BOOT_TIMEOUT E2E_TEARDOWN_WAIT"
+PINNED_RE='^([A-Z_]*DATABASE_URL|DATABASE_[A-Z_]*|TEST_DB_[A-Z_]*|CH_[A-Z_]*|REDIS_URL|PUBLIC_API_REDIS_[A-Z_]*|E2E_(PG|CH|REDIS)_[A-Z_]*|E2E_SKIP_SETUP|E2E_API_URL|E2E_WEB_ORIGIN|PARSALYTICS_DIR|SENTRY_DSN|RAILS_ENV|VT_[A-Z_]*)$'
+
+forwarded_env() {   # <mode>
+  local list name
+  case "$1" in
+    rspec-full) list="${FORWARD_rspec_full}" ;;
+    e2e-live) list="${FORWARD_e2e_live}" ;;
+    *) list="" ;;
+  esac
+  for name in ${list}; do
+    [[ -n "${!name+x}" ]] && printf '%s\n' "-e" "${name}=${!name}"
+  done
+  return 0
+}
+
+check_env_opt() {   # KEY=VALUE from -e
+  local key="${1%%=*}"
+  [[ "$1" == *=* && "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die 64 "-e needs KEY=VALUE"
+  [[ ! "${key}" =~ ${PINNED_RE} ]] ||
+    die 64 "-e ${key}: this variable is pinned on vtserv so a run only reaches its own databases"
+}
+
+has_workers_arg() {
+  local a
+  for a in "$@"; do
+    case "${a}" in --workers | --workers=* | -j | -j*) return 0 ;; esac
+  done
+  return 1
+}
+
+run_remote() {   # <mode> <run options…> -- <command…>
+  local mode="$1" opts=() psrc="" t0 code=0 env_args=() line
+  shift
+  while (($#)) && [[ "$1" != "--" ]]; do opts+=("$1"); shift; done
+  shift
+  while IFS= read -r line; do env_args+=("${line}"); done < <(forwarded_env "${mode}")
+  if [[ -n "${VT_CLICKHOUSE:-}" ]]; then
+    [[ "${VT_CLICKHOUSE}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] ||
+      die 64 "VT_CLICKHOUSE=${VT_CLICKHOUSE}: not a Docker tag"
+    opts+=(--clickhouse "${VT_CLICKHOUSE}")
+  fi
+
+  t0="$(date +%s)"
+  RUN_ID="$(printf '%s-%s-%s' "${SLUG}" "$(date +%s)" "${RANDOM}" | tr 'A-Z' 'a-z')"
+  keep_awake
+  connect
+  push_server
+  lease_start
+  sync_dir "${TOP}" "${SLUG}"
+  if [[ "${mode}" == e2e-live ]]; then
+    local backend
+    backend="$(backend_dir)"
+    [[ -f "${backend}/config/database.yml" ]] ||
+      die 64 "no parsalytics checkout at ${backend} (set PARSALYTICS_DIR)"
+    backend="$(cd "${backend}" && pwd -P)"
+    psrc="${SLUG}.parsalytics"
+    say "backend: ${backend}"
+    sync_dir "${backend}" "${psrc}"
+    opts+=(--psrc "${psrc}")
+  fi
+
+  local q
+  q="$(remote_env)$(printf '%q ' "${VT_REMOTE}" run --id "${RUN_ID}" --slug "${SLUG}" --mode "${mode}" \
+    --rel "${REL}" "${opts[@]}" "${env_args[@]}" -- "$@")"
+  "${SSH[@]}" "${VT_HOST}" "${q}" </dev/null &
+  RUN_PID=$!
+  wait "${RUN_PID}" || code=$?
+  RUN_PID=""
+
+  if [[ "${mode}" == e2e || "${mode}" == e2e-live ]]; then fetch_artifacts; fi
+  lease_end
+  local secs=$(($(date +%s) - t0))
+  say "${mode} on vtserv: exit ${code} in $((secs / 60))m $((secs % 60))s (run ${RUN_ID})"
+  exit "${code}"
+}
+
+need_parsalytics() {
+  [[ -x "${TOP}/bin/rspec-full" ]] || die 64 "run this from a parsalytics checkout (no bin/rspec-full in ${TOP})"
+}
+need_web() {
+  [[ -f "${TOP}/web/package.json" ]] || die 64 "run this from an investviews checkout (no web/package.json in ${TOP})"
+}
+
+cmd="${1:-help}"
+(($#)) && shift
+case "${cmd}" in
+  rspec-full)
+    need_parsalytics
+    run_remote rspec-full -- bin/rspec-full "$@"
+    ;;
+  rspec)
+    need_parsalytics
+    (($#)) || die 64 "vt rspec <spec files…>  (targeted: vt rspec \$(bin/rspec-changed --list))"
+    # spec/full_run_guard.rb refuses more than 80 spec files that did not come through
+    # bin/rspec-full, and its message points at the Mac. A long list of files (a change to a common
+    # class maps to 100-200) runs through bin/rspec-full on vtserv instead: the same files, in
+    # workers. Only plain file paths, counted once each: bin/rspec-full sizes its paths as files,
+    # so an option or a `file:LINE` / `file[1:2]` selector keeps plain rspec (which counts a file
+    # once, however many selectors). For options: vt rspec-full <files> -- <options>.
+    if (($# > 80)); then
+      only_files=1
+      for a in "$@"; do
+        case "${a}" in -* | *:* | *\[*) only_files=0 ;; esac
+      done
+      if ((only_files)) && (($(printf '%s\n' "$@" | sort -u | wc -l) > 80)); then
+        say "$# spec files: more than the full-run guard's 80, so they run through bin/rspec-full"
+        run_remote rspec-full -- bin/rspec-full "$@"
+      fi
+    fi
+    run_remote rspec -- bundle exec rspec "$@"
+    ;;
+  e2e)
+    need_web
+    if has_workers_arg "$@"; then w=(); else w=("--workers=${VT_PW_WORKERS}"); fi
+    run_remote e2e --no-db -- pnpm test:e2e "${w[@]}" "$@"
+    ;;
+  e2e-live)
+    need_web
+    if has_workers_arg "$@"; then w=(); else w=("--workers=${VT_PW_WORKERS}"); fi
+    run_remote e2e-live -- bash scripts/e2e-live.sh "${w[@]}" "$@"
+    ;;
+  run)
+    opts=()
+    while (($#)) && [[ "$1" != "--" ]]; do
+      case "$1" in
+        --no-db | --no-prepare | --host) opts+=("$1"); shift ;;
+        -e) check_env_opt "${2:-}"; opts+=(-e "$2"); shift 2 ;;
+        *) die 64 "vt run: unknown option $1 (the command goes after --)" ;;
+      esac
+    done
+    [[ "${1:-}" == "--" ]] && shift
+    (($#)) || die 64 "vt run [--no-db] [--no-prepare] [--host] [-e K=V]… -- <command…>"
+    run_remote run "${opts[@]}" -- "$@"
+    ;;
+  status | doctor)
+    connect
+    push_server
+    remote "${VT_REMOTE}" "${cmd}"
+    ;;
+  setup)
+    connect
+    push_server
+    remote "${VT_REMOTE}" setup "$@"
+    ;;
+  clean)
+    connect
+    push_server
+    remote "${VT_REMOTE}" clean "${SLUG}"
+    ;;
+  stop)
+    (($#)) || die 64 "vt stop <run-id>  (vt status lists them)"
+    connect
+    push_server
+    remote "${VT_REMOTE}" stop "$1"
+    ;;
+  help | -h | --help)
+    sed -n '2,20p' "${self}" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    die 64 "unknown command '${cmd}' — vt help"
+    ;;
+esac

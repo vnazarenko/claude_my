@@ -1,0 +1,713 @@
+#!/usr/bin/env bash
+# vt-remote — the vtserv half of `vt` (KAN-387). Runs as the `vt` user on build-host.local.
+#
+# The Mac copies this directory to ~/vt/bin/<content hash>/ once per version and never changes it
+# afterwards, so two sessions with different `vt` versions never edit each other's files.
+#
+#   vt-remote lease <run-id> <slug>               hold the checkout lock while the Mac heartbeats
+#   vt-remote sync-guard <run-id> <rsync args…>   the --rsync-path wrapper: registers, then rsync
+#   vt-remote run --id … --slug … --mode … --rel … [--psrc <slug>] [--no-db] [--host]
+#                 [--no-prepare] [--clickhouse <tag>] [-e K=V]… -- <command…>
+#   vt-remote stop <run-id> | status | doctor | setup [ruby] [node] | clean <slug>
+#
+# Layout under ~/vt: bin/<hash>/ (this), src/<slug>/ (synced checkouts), locks/<slug> (checkout
+# flock), slots/<n> (slot flock), runs/<id>/ (one run's state), empty/ (a placeholder mount).
+#
+# ── One run's life ─────────────────────────────────────────────────────────────────────────────
+# runs/<id>/state is `open` from the lease's start and becomes `closed` exactly once. It changes,
+# and every piece of a run registers itself, only under runs/<id>/state.lock. So:
+#   - a piece registers (rsync receiver pid, run process group, "containers", "exec") only while
+#     the run is open, and refuses once it is closed;
+#   - stopping first closes the run, THEN stops what is registered — nothing can register after
+#     the stop has looked.
+# The lease closes the run when the Mac's heartbeat stops (Ctrl-C, a killed agent task, a dropped
+# connection) and releases the checkout lock only after every container of the run is gone.
+# vt-reaper (installed by Ansible) removes containers labelled vt.run=<id> whose lease is dead.
+set -Eeuo pipefail
+
+BUNDLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VT="${VT_HOME:-${HOME}/vt}"
+VT_SLOTS="${VT_SLOTS:-3}"
+# 60 s, as the Mac's ssh keepalives: a short stall (Wi-Fi, a busy host) must not end a run.
+HEARTBEAT_TIMEOUT="${VT_HEARTBEAT_TIMEOUT:-60}"
+# Free space on the disk under ${VT}: the synced checkouts and rootless Docker share it (KAN-437).
+# Below the floor a run is refused before it syncs or starts containers; doctor warns below WARN.
+# vt-reaper (Ansible, vt_runner_host) removes old checkouts toward 30 GB free, above both.
+DISK_FLOOR_GB="${VT_DISK_FLOOR_GB:-10}"
+DISK_WARN_GB="${VT_DISK_WARN_GB:-15}"
+DEFAULT_RUBY="${VT_DEFAULT_RUBY:-4.0.9}"
+DEFAULT_NODE="${VT_DEFAULT_NODE:-24.22.1}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DOCKER_HOST="${DOCKER_HOST:-unix://${XDG_RUNTIME_DIR}/docker.sock}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+
+say() { printf 'vt: %s\n' "$*" >&2; }
+die() {
+  local code="$1"
+  shift
+  say "$*"
+  exit "${code}"
+}
+
+valid_name() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die 64 "bad name: '$1'"
+}
+
+project_of() { printf 'vt-%s' "$1" | tr -c 'a-z0-9_-' '-'; }
+run_dir() { printf '%s/runs/%s' "${VT}" "$1"; }
+
+# Test hook: VT_TEST_PAUSE=<phase>:<seconds> sleeps at that phase (barrier tests only).
+pause_at() {
+  [[ "${VT_TEST_PAUSE:-}" == "$1":* ]] && sleep "${VT_TEST_PAUSE#*:}"
+  return 0
+}
+
+mkdir -p "${VT}"/{src,locks,slots,runs,empty}
+
+# Whole GB available on the disk under ${VT}; empty when df gives no number (unknown is never low).
+free_gb() { { df -Pk -- "${VT}" 2>/dev/null || true; } | awk 'NR == 2 && $4 ~ /^[0-9]+$/ {print int($4 / 1048576)}'; }
+
+FREE_GB=""
+below_floor() {   # 0 only when the disk is KNOWN to be below the floor; FREE_GB holds the reading
+  FREE_GB="$(free_gb)"
+  [[ -n "${FREE_GB}" ]] && ((FREE_GB < DISK_FLOOR_GB))
+}
+refuse_low_disk() {
+  die 70 "vtserv has only ${FREE_GB} GB free on its disk, below the ${DISK_FLOOR_GB} GB floor: this run was NOT started
+    (too little headroom: syncs, builds and logs risk ENOSPC). vt-reaper removes old checkouts on its timer.
+    Tell the user. Do NOT fall back to a heavy run on this Mac."
+}
+
+# ── run state ──────────────────────────────────────────────────────────────────────────────────
+
+# register <id> <key> <value>: appends value to runs/<id>/<key>, only while the run is open.
+register() {
+  local id="$1" key="$2" value="$3" dir fd rc=0
+  dir="$(run_dir "${id}")"
+  [[ -d "${dir}" ]] || return 1
+  exec {fd}>>"${dir}/state.lock"
+  flock "${fd}"
+  if [[ "$(cat "${dir}/state" 2>/dev/null)" == open ]]; then
+    printf '%s\n' "${value}" >>"${dir}/${key}"
+  else
+    rc=1
+  fi
+  exec {fd}>&-
+  return "${rc}"
+}
+
+close_run() {
+  local dir fd
+  dir="$(run_dir "$1")"
+  [[ -d "${dir}" ]] || return 0
+  exec {fd}>>"${dir}/state.lock"
+  flock "${fd}"
+  echo closed >"${dir}/state"
+  exec {fd}>&-
+}
+
+is_open() { [[ "$(cat "$(run_dir "$1")/state" 2>/dev/null)" == open ]]; }
+
+# A pid's start time (field 22 of /proc/<pid>/stat; the command name may hold spaces, so cut at
+# its closing parenthesis). Registered pids are stored as "<pid> <start time>" and only signalled
+# while both still match, so a reused pid is never hit.
+proc_start() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'; }
+
+signal_owned() {   # <signal> <pid> <start time>
+  [[ -n "$2" && -n "$3" && "$(proc_start "$2")" == "$3" ]] && kill "-$1" "$2" 2>/dev/null
+  return 0
+}
+
+owned_alive() { [[ -n "$1" && -n "$2" && "$(proc_start "$1")" == "$2" ]]; }
+
+# A process group is registered as "<pgid> <leader start time>", and it is the run's only while
+# that leader is alive with that start time. Members left after the leader are never trusted: the
+# number may have gone to another group whose own leader has exited too. That is safe because the
+# run's leader kills its whole group in its own cleanup before it exits (cmd_run's trap), so no
+# process of a run outlives its leader by design.
+group_owned() {   # <pgid> <leader start time>
+  [[ -n "$1" && -n "$2" && "$(proc_start "$1")" == "$2" ]]
+}
+signal_group() {   # <signal> <pgid> <leader start time>
+  group_owned "$2" "$3" && kill "-$1" -- "-$2" 2>/dev/null
+  return 0
+}
+
+lease_alive() {
+  local id="$1" pid
+  pid="$(cat "$(run_dir "${id}")/lease.pid" 2>/dev/null)" || return 1
+  [[ -n "${pid}" ]] && tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null | grep -q "vt-remote lease ${id} "
+}
+
+# Every container of a run carries vt.run=<id>: compose's, and host-mode scripts' (the docker shim).
+# Returns 0 only when docker ANSWERED that no container and no network of the run is left; a
+# failing docker is "unknown", not "none".
+# Every docker call has a time limit: a stalled daemon must not hold the run's cleanup (and its slot)
+# forever. A call that times out counts as unknown, so the lease keeps the checkout and retries.
+remove_containers() {   # <id> [attempts, default 40 × 0.5 s]
+  local id="$1" attempts="${2:-40}" dir project ids nets _
+  dir="$(run_dir "${id}")"
+  project="$(project_of "${id}")"
+  if [[ -f "${dir}/compose.env" && -f "${dir}/compose.yml" ]]; then
+    (
+      set -a
+      # shellcheck disable=SC1091
+      . "${dir}/compose.env"
+      timeout 120 docker compose -f "${dir}/compose.yml" --profile db down -v --remove-orphans -t 3
+    ) >/dev/null 2>&1 8>&- 9>&- || true
+  fi
+  for _ in $(seq 1 "${attempts}"); do
+    if ! ids="$(timeout 30 docker ps -aq --filter "label=vt.run=${id}" 2>/dev/null 8>&- 9>&-)"; then
+      sleep 0.5
+      continue
+    fi
+    if [[ -z "${ids}" ]]; then
+      # The run's networks must be confirmed gone too: a leaked one stays forever, and enough of
+      # them use up Docker's address pools, after which no run can start.
+      if ! nets="$(timeout 30 docker network ls -q --filter "label=com.docker.compose.project=${project}" 2>/dev/null 8>&- 9>&-)"; then
+        sleep 0.5
+        continue
+      fi
+      [[ -z "${nets}" ]] && return 0
+      # shellcheck disable=SC2086
+      timeout 30 docker network rm ${nets} >/dev/null 2>&1 8>&- 9>&- || true
+      sleep 0.5
+      continue
+    fi
+    # shellcheck disable=SC2086
+    timeout 60 docker rm -f -v ${ids} >/dev/null 2>&1 8>&- 9>&- || true
+    sleep 0.5
+  done
+  return 1
+}
+
+# Host-mode work runs in a per-run systemd user scope, vt-run-<id>.scope: a cgroup holds every
+# process of it, whatever pids or groups they make, and it survives the run leader being killed.
+# The unit name is unique per run, so stopping it can never reach another run's processes.
+scope_of() { printf 'vt-run-%s.scope' "$1"; }
+# The scope's ActiveState, or "unknown" when systemd could not be asked (a failed query is never
+# taken as "gone"). A unit that does not exist reads "inactive" with a successful query.
+scope_state() {
+  local out
+  if out="$(systemctl --user show -p ActiveState --value "$(scope_of "$1")" 2>/dev/null 8>&- 9>&-)" && [[ -n "${out}" ]]; then
+    printf '%s' "${out}"
+  else
+    printf 'unknown'
+  fi
+}
+scope_gone() { case "$(scope_state "$1")" in inactive | failed) return 0 ;; *) return 1 ;; esac; }
+stop_scope() {   # 0 only once systemd CONFIRMS the scope is gone
+  local unit _
+  unit="$(scope_of "$1")"
+  scope_gone "$1" && return 0
+  systemctl --user kill --signal=TERM "${unit}" >/dev/null 2>&1 8>&- 9>&-
+  for _ in $(seq 1 20); do scope_gone "$1" && return 0; sleep 0.25; done
+  systemctl --user kill --signal=KILL "${unit}" >/dev/null 2>&1 8>&- 9>&-
+  for _ in $(seq 1 20); do scope_gone "$1" && return 0; sleep 0.25; done
+  return 1
+}
+
+# Close the run, then stop everything it registered. Safe to call twice, from either side.
+# A process group cannot be reused while any member is alive (Linux never hands out a pid that is
+# still some group's id), so `kill -- -<pgid>` only ever reaches the run's own processes.
+stop_run() {   # <id> [container-removal attempts]
+  local id="$1" attempts="${2:-40}" dir pid start alive scope_ok=0 _
+  dir="$(run_dir "${id}")"
+  close_run "${id}"
+  each_owned() {   # <signal>: every registered group and sync pid still provably ours
+    while read -r pid start; do signal_group "$1" "${pid}" "${start}"; done < <(cat "${dir}/run.pgid" 2>/dev/null)
+    while read -r pid start; do signal_owned "$1" "${pid}" "${start}"; done < <(cat "${dir}/sync.pid" 2>/dev/null)
+  }
+  each_owned TERM
+  for _ in $(seq 1 40); do
+    alive=0
+    while read -r pid start; do group_owned "${pid}" "${start}" && alive=1; done < <(cat "${dir}/run.pgid" 2>/dev/null)
+    while read -r pid start; do owned_alive "${pid}" "${start}" && alive=1; done < <(cat "${dir}/sync.pid" 2>/dev/null)
+    ((alive)) || break
+    sleep 0.25
+  done
+  each_owned KILL
+  stop_scope "${id}" && scope_ok=1
+  remove_containers "${id}" "${attempts}" && ((scope_ok))
+}
+
+# ── lease ──────────────────────────────────────────────────────────────────────────────────────
+
+# What a run leaves in its copy that no later run reads (KAN-437): the Rails test logs grow with
+# every run (about 200 MB per parsalytics copy: test.log plus its rotated test.log.0), and coverage.
+# The e2e results (web/test-results, web/playwright-report) stay: a copy-back that failed or was
+# cancelled must not lose them, and they are small. Caches stay too (node_modules, .next, tmp/, the
+# gems): they make the next run fast, and vt-reaper removes whole copies by age and by free space.
+# Called with the checkout lock held and the run's containers confirmed gone, so nothing writes here
+# any more. Never through a symlink (a copy root or log/ that points elsewhere is skipped: the glob
+# would reach files outside this checkout). A failed delete must not keep the checkout locked.
+clean_outputs() {   # <slug>
+  local c
+  for c in "${VT}/src/$1" "${VT}/src/$1.parsalytics"; do
+    [[ -d "${c}" && ! -L "${c}" ]] || continue
+    if [[ -d "${c}/log" && ! -L "${c}/log" ]]; then
+      rm -f -- "${c}"/log/test*.log "${c}"/log/test*.log.[0-9]* 2>/dev/null || true
+    fi
+    rm -rf -- "${c}/coverage" 2>/dev/null || true   # a symlink here is removed itself, not followed
+  done
+}
+
+cmd_lease() {
+  local id="$1" slug="$2" dir rc last now announced=0
+  valid_name "${id}"
+  valid_name "${slug}"
+  # Before anything is created: a run that cannot have the disk leaves no trace.
+  if below_floor; then refuse_low_disk; fi
+  dir="$(run_dir "${id}")"
+  mkdir -p "${dir}"
+  echo open >"${dir}/state"
+  printf '%s\n' "$$" >"${dir}/lease.pid"
+  printf '%s\n' "${slug}" >"${dir}/slug"
+  printf '%s\n' "${BUNDLE_DIR}" >"${dir}/bundle"
+
+  exec 9>>"${VT}/locks/${slug}"
+  last="$(date +%s)"
+  # Keep reading heartbeats while queued, so a client that goes away gives its place up.
+  until flock -n 9; do
+    if ((!announced)); then
+      say "waiting: another vt run from this checkout holds it — $(cat "${VT}/locks/${slug}.owner" 2>/dev/null || echo '?')"
+      announced=1
+    fi
+    if IFS= read -r -t 2 _; then
+      last="$(date +%s)"
+    else
+      rc=$?
+      now="$(date +%s)"
+      if ((rc <= 128)) || ((now - last > HEARTBEAT_TIMEOUT)); then
+        rm -rf "${dir}"
+        exit 0
+      fi
+    fi
+  done
+  # An earlier run of this checkout whose lease was killed may still have work alive (its runner,
+  # a host command, an rsync receiver). Finish it before this run may touch the checkout.
+  local other oid waited=0
+  for other in "${VT}"/runs/*/slug; do
+    [[ -e "${other}" ]] || continue
+    oid="$(basename "$(dirname "${other}")")"
+    [[ "${oid}" != "${id}" && "$(cat "${other}" 2>/dev/null)" == "${slug}" ]] || continue
+    lease_alive "${oid}" && continue
+    say "finishing an earlier run of this checkout first (${oid}, its lease is gone)"
+    # Cleanup may block (a stalled docker or systemd call), so the client is watched separately:
+    # on EOF or silence past the deadline the monitor KILLs this lease (a trap would wait for the
+    # blocked call) and removes its record. The old run's record stays, for the next lease.
+    # `<&0` matters: without job control bash gives a background job /dev/null as stdin, so the
+    # monitor would read EOF at once and kill the lease the moment recovery starts.
+    (
+      exec 8>&- 9>&-
+      seen="$(date +%s)"
+      while :; do
+        if IFS= read -r -t 2 _; then
+          seen="$(date +%s)"
+        else
+          r=$?
+          if ((r <= 128)) || (($(date +%s) - seen > HEARTBEAT_TIMEOUT)); then
+            kill -KILL "$$" 2>/dev/null
+            rm -rf "${dir}"
+            exit 0
+          fi
+        fi
+      done
+    ) <&0 &
+    local monitor=$!
+    until stop_run "${oid}" 1; do
+      if ((waited++ == 0)); then say "${oid} is not confirmed stopped yet (containers or its scope); waiting"; fi
+      sleep 2
+    done
+    kill "${monitor}" 2>/dev/null || true
+    wait "${monitor}" 2>/dev/null || true
+    rm -rf "$(run_dir "${oid}")"
+  done
+  # Again after the wait for the checkout and the recovery: the disk may have filled meanwhile,
+  # and the sync comes next. Exiting frees the checkout lock.
+  if below_floor; then
+    rm -rf "${dir}"
+    refuse_low_disk
+  fi
+  printf '%s since %s\n' "${id}" "$(date '+%F %T')" >"${VT}/locks/${slug}.owner"
+  mkdir -p "${VT}/src/${slug}"
+  touch "${VT}/src/${slug}/.vt-last-run"
+  echo LEASED
+
+  last="$(date +%s)"
+  while :; do
+    if IFS= read -r -t 5 _; then
+      last="$(date +%s)"
+    else
+      rc=$?
+      ((rc <= 128)) && break                               # EOF: the Mac ended the lease
+      now="$(date +%s)"
+      if ((now - last > HEARTBEAT_TIMEOUT)); then
+        say "run ${id}: no heartbeat from the Mac for ${HEARTBEAT_TIMEOUT}s — stopping it"
+        break
+      fi
+    fi
+  done
+  # The checkout stays locked until docker confirms the run's containers are gone.
+  if ! stop_run "${id}"; then
+    echo pending >"${dir}/cleanup"
+    printf '%s since %s — CLEANUP PENDING (docker did not confirm removal)\n' "${id}" "$(date '+%F %T')" \
+      >"${VT}/locks/${slug}.owner"
+    say "run ${id}: docker did not confirm its containers are gone; keeping the checkout locked and retrying every 15 s"
+    until stop_run "${id}"; do sleep 15; done
+  fi
+  clean_outputs "${slug}"
+  rm -f "${VT}/locks/${slug}.owner"
+  rm -rf "${dir}"
+}
+
+# rsync's receiver, started through --rsync-path. It runs only while the run is open, and the
+# lease kills it on stop, so a cancelled client never leaves a receiver writing into a checkout
+# another run has taken.
+cmd_sync_guard() {
+  local id="$1"
+  shift
+  valid_name "${id}"
+  register "${id}" sync.pid "$$ $(proc_start $$)" || die 70 "run ${id} is closed; not syncing"
+  exec "$@"
+}
+
+# ── run ────────────────────────────────────────────────────────────────────────────────────────
+
+SLOT=""
+take_slot() {
+  local n announced=0
+  while :; do
+    for ((n = 1; n <= VT_SLOTS; n++)); do
+      exec 8>>"${VT}/slots/${n}"
+      if flock -n 8; then
+        SLOT="${n}"
+        printf '%s  %s  since %s\n' "${RUN_ID}" "${SLUG}" "$(date '+%F %T')" >"${VT}/slots/${n}.owner"
+        return 0
+      fi
+      exec 8>&-
+    done
+    if ((!announced)); then
+      say "all ${VT_SLOTS} slots are busy — waiting. Running now:"
+      cat "${VT}"/slots/*.owner 2>/dev/null | sed 's/^/vt:   /' >&2 || true
+      announced=1
+    fi
+    is_open "${RUN_ID}" || die 70 "run closed while queued"
+    sleep 3
+  done
+}
+
+version_of() {
+  local file
+  for file in "$@"; do
+    if [[ -s "${file}" ]]; then
+      head -n1 "${file}" | tr -d ' \r' | sed -e 's/^ruby-//' -e 's/^v//'
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_volumes() {
+  local v
+  for v in "vt-bundle-${RUBY}" vt-pnpm-store vt-ms-playwright vt-corepack; do
+    docker volume inspect "${v}" >/dev/null 2>&1 || docker volume create "${v}" >/dev/null
+  done
+}
+
+IMAGE=""
+ensure_image() {
+  local hash log fd
+  hash="$(sha256sum "${BUNDLE_DIR}/runner.Dockerfile" | cut -c1-8)"
+  IMAGE="vt-runner:r${RUBY}-n${NODE}-${hash}"
+  docker image inspect "${IMAGE}" >/dev/null 2>&1 && return 0
+  exec {fd}>>"${VT}/locks/build"
+  flock "${fd}"
+  if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+    log="${VT}/runs/build-${IMAGE#vt-runner:}.log"
+    say "building the runner image ${IMAGE} (once per Ruby/Node version, a few minutes); log: ${log}"
+    if ! docker build --progress=plain -t "${IMAGE}" \
+      --build-arg "RUBY_VERSION=${RUBY}" --build-arg "NODE_VERSION=${NODE}" \
+      -f "${BUNDLE_DIR}/runner.Dockerfile" "${VT}/empty" >"${log}" 2>&1 8>&- 9>&-; then
+      tail -n 40 "${log}" >&2
+      exec {fd}>&-
+      die 70 "runner image build failed"
+    fi
+  fi
+  exec {fd}>&-
+}
+
+cmd_run() {
+  local mode="" rel="." psrc_slug="" db=1 host=0 prepare=1 envs=() workdir ch_tag=25.11
+  RUN_ID=""
+  SLUG=""
+  while (($#)); do
+    case "$1" in
+      --id) RUN_ID="$2"; shift 2 ;;
+      --slug) SLUG="$2"; shift 2 ;;
+      --mode) mode="$2"; shift 2 ;;
+      --rel) rel="$2"; shift 2 ;;
+      --psrc) psrc_slug="$2"; shift 2 ;;
+      --no-db) db=0; shift ;;
+      --host) host=1; shift ;;
+      --no-prepare) prepare=0; shift ;;
+      --clickhouse) ch_tag="$2"; shift 2 ;;
+      -e) envs+=("$2"); shift 2 ;;
+      --) shift; break ;;
+      *) die 64 "run: unknown option $1" ;;
+    esac
+  done
+  valid_name "${RUN_ID}"
+  valid_name "${SLUG}"
+  [[ "${rel}" != /* && "${rel}" != *..* ]] || die 64 "bad --rel ${rel}"
+  [[ "${ch_tag}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die 64 "bad --clickhouse ${ch_tag}"
+  (($#)) || die 64 "run: no command"
+  lease_alive "${RUN_ID}" || die 70 "run ${RUN_ID} has no lease (the Mac side is gone?)"
+
+  local dir src psrc="${VT}/empty"
+  dir="$(run_dir "${RUN_ID}")"
+  src="${VT}/src/${SLUG}"
+  [[ -d "${src}" ]] || die 70 "nothing synced at ${src}"
+  if [[ -n "${psrc_slug}" ]]; then
+    valid_name "${psrc_slug}"
+    psrc="${VT}/src/${psrc_slug}"
+    [[ -d "${psrc}" ]] || die 70 "nothing synced at ${psrc}"
+  fi
+
+  pause_at before-register
+  RUN_PGID="$(ps -o pgid= -p $$ | tr -d ' ')"
+  register "${RUN_ID}" run.pgid "${RUN_PGID} $(proc_start "${RUN_PGID}")" || die 70 "run ${RUN_ID} was stopped before it started"
+  pause_at after-register
+
+  CHILD=""
+  WATCHER=""
+  # Runs on every exit. errexit is off here: a process that already ended must not stop the
+  # cleanup, and the command's exit code is what the run returns.
+  cleanup() {
+    local code=$?
+    set +e
+    trap - EXIT INT HUP
+    trap '' TERM
+    [[ -n "${WATCHER}" ]] && kill "${WATCHER}" 2>/dev/null
+    [[ -n "${CHILD}" ]] && kill -TERM "${CHILD}" 2>/dev/null
+    # Everything else this run started (a host-mode script's background processes included) is in
+    # its process group: stop it now, while this leader still proves the group is ours.
+    kill -TERM -- "-${RUN_PGID}" 2>/dev/null
+    sleep 1
+    # List first, then the builtin kill: a `| xargs kill` pipeline is in the group too, so it
+    # would KILL itself and bash would print a "Killed" job notice into the run's output.
+    local others=()
+    mapfile -t others < <(pgrep -g "${RUN_PGID}" 2>/dev/null | grep -vx "$$")
+    ((${#others[@]})) && kill -KILL "${others[@]}" 2>/dev/null
+    remove_containers "${RUN_ID}" ||
+      say "run ${RUN_ID}: containers not confirmed removed; its lease keeps retrying"
+    [[ -n "${SLOT}" ]] && rm -f "${VT}/slots/${SLOT}.owner"
+    exit "${code}"
+  }
+  trap cleanup EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+
+  take_slot
+  # A run may wait long for a slot: check the disk once more before any container starts. The
+  # cleanup trap frees the slot.
+  if below_floor; then refuse_low_disk; fi
+  # Ends the run within 5 s if it is closed by a stop that raced the checks above.
+  (
+    exec 8>&- 9>&-
+    while sleep 5; do
+      is_open "${RUN_ID}" || { kill -TERM $$ 2>/dev/null; exit 0; }
+    done
+  ) &
+  WATCHER=$!
+  if [[ -n "${VT_TEST_KILL_WATCHER:-}" ]]; then kill "${WATCHER}"; wait "${WATCHER}" 2>/dev/null || true; fi
+
+  local kv
+  if ((host)); then
+    say "running on the vtserv host (no containers), in ${src}/${rel}"
+    cd "${src}/${rel}"
+    for kv in "${envs[@]}"; do export "${kv?}"; done
+    # The shim labels every container a script starts, so a stop can find and remove it.
+    VT_STARTED="$(date +%s)"
+    export PATH="${BUNDLE_DIR}/shim:${PATH}" VT_RUN="${RUN_ID}" VT_STARTED
+    register "${RUN_ID}" phase exec || die 70 "run ${RUN_ID} was stopped"
+    if ! command -v systemd-run >/dev/null || ! systemctl --user show-environment >/dev/null 2>&1; then
+      die 70 "host mode needs the user's systemd manager (loginctl enable-linger $(id -un))"
+    fi
+    # --expand-environment=no: systemd-run otherwise expands $VAR and turns `$$` into `$` in the
+    # command, so `bash -c 'echo $$'` would run as `echo $`.
+    systemd-run --user --scope --quiet --collect --expand-environment=no --unit "$(scope_of "${RUN_ID}")" -- "$@" 8>&- &
+    CHILD=$!
+    local hcode=0
+    wait "${CHILD}" || hcode=$?
+    CHILD=""
+    exit "${hcode}"
+  fi
+
+  if [[ "${mode}" == e2e-live ]]; then
+    RUBY="$(version_of "${psrc}/.ruby-version" || echo "${DEFAULT_RUBY}")"
+  else
+    RUBY="$(version_of "${src}/.ruby-version" || echo "${DEFAULT_RUBY}")"
+  fi
+  NODE="$(version_of "${src}/web/.nvmrc" "${src}/.nvmrc" || echo "${DEFAULT_NODE}")"
+  ensure_volumes
+  ensure_image
+
+  case "${mode}" in
+    e2e | e2e-live) workdir=/work/src/web ;;
+    run) workdir="/work/src/${rel}" ;;
+    *) workdir=/work/src ;;
+  esac
+
+  # The run keeps its own copy of the compose file and its values, so its cleanup does not depend
+  # on a bundle another session might replace.
+  cp "${BUNDLE_DIR}/compose.yml" "${dir}/compose.yml"
+  cat >"${dir}/compose.env" <<EOF
+VT_PROJECT=$(project_of "${RUN_ID}")
+VT_RUN=${RUN_ID}
+VT_SLUG=${SLUG}
+VT_STARTED=$(date +%s)
+VT_IMAGE=${IMAGE}
+VT_SRC=${src}
+VT_PSRC=${psrc}
+VT_BIN=${BUNDLE_DIR}
+VT_RUBY=${RUBY}
+VT_CH_TAG=${ch_tag}
+EOF
+  local profile=()
+  ((db)) && profile=(--profile db)
+  pause_at before-up
+  register "${RUN_ID}" phase containers || die 70 "run ${RUN_ID} was stopped"
+  say "starting containers$( ((db)) && echo ": runner, postgres, clickhouse ${ch_tag}, redis" || echo ': runner')"
+  if ! (
+    set -a
+    # shellcheck disable=SC1091
+    . "${dir}/compose.env"
+    docker compose -f "${dir}/compose.yml" "${profile[@]}" up -d --wait --quiet-pull
+  ) >"${dir}/up.log" 2>&1 8>&- 9>&-; then
+    cat "${dir}/up.log" >&2
+    die 70 "containers did not start"
+  fi
+
+  register "${RUN_ID}" phase exec || die 70 "run ${RUN_ID} was stopped"
+  local exec_env=(-e "VT_PREPARE=${prepare}")
+  for kv in "${envs[@]}"; do exec_env+=(-e "${kv}"); done
+  (
+    set -a
+    # shellcheck disable=SC1091
+    . "${dir}/compose.env"
+    exec docker compose -f "${dir}/compose.yml" "${profile[@]}" exec -T "${exec_env[@]}" runner \
+      /vt/bin/in-runner.sh "${mode}" "${workdir}" -- "$@"
+  ) </dev/null 8>&- 9>&- &
+  CHILD=$!
+  local code=0
+  wait "${CHILD}" || code=$?
+  CHILD=""
+  exit "${code}"
+}
+
+# ── the rest ───────────────────────────────────────────────────────────────────────────────────
+
+cmd_stop() {
+  local id="$1" pid
+  valid_name "${id}"
+  pid="$(cat "$(run_dir "${id}")/lease.pid" 2>/dev/null || true)"
+  stop_run "${id}"
+  if [[ -n "${pid}" ]] && lease_alive "${id}"; then kill -TERM "${pid}" 2>/dev/null || true; fi
+  say "stopped ${id}"
+}
+
+cmd_status() {
+  local f id n any=0
+  echo "slots (${VT_SLOTS}):"
+  for ((n = 1; n <= VT_SLOTS; n++)); do
+    if [[ -e "${VT}/slots/${n}" ]] && ! flock -n "${VT}/slots/${n}" true; then
+      printf '  %s  %s\n' "${n}" "$(cat "${VT}/slots/${n}.owner" 2>/dev/null)"
+    else
+      printf '  %s  free\n' "${n}"
+    fi
+  done
+  echo "runs:"
+  for f in "${VT}"/runs/*/lease.pid; do
+    [[ -e "${f}" ]] || continue
+    id="$(basename "$(dirname "${f}")")"
+    any=1
+    printf '  %s  %s  %s  %s\n' "${id}" "$(cat "$(run_dir "${id}")/state" 2>/dev/null)" \
+      "$(tail -n1 "$(run_dir "${id}")/phase" 2>/dev/null || echo queued)" \
+      "$(lease_alive "${id}" && echo lease-alive || echo LEASE-DEAD)$([[ -e "$(run_dir "${id}")/cleanup" ]] && echo ' CLEANUP-PENDING')"
+  done
+  ((any)) || echo "  none"
+  echo "containers:"
+  docker ps --filter label=vt.run --format '  {{.Label "vt.run"}}  {{.Names}}  {{.Status}}' | sort
+}
+
+cmd_doctor() {
+  local ok=1 img
+  echo "host      $(hostname)  load $(cut -d' ' -f1-3 /proc/loadavg)  cpus $(nproc)"
+  echo "memory    $(free -g | awk '/^Mem/ {print $7 " GB available of " $2}')"
+  local free
+  free="$(free_gb)"
+  if [[ -z "${free}" ]]; then
+    echo "disk      unknown (df gave no number for ${VT})"
+  elif ((free < DISK_FLOOR_GB)); then
+    echo "disk      ${free} GB free — BELOW THE ${DISK_FLOOR_GB} GB FLOOR: vt refuses new runs; tell the user"
+    ok=0
+  elif ((free < DISK_WARN_GB)); then
+    echo "disk      ${free} GB free — LOW (warning below ${DISK_WARN_GB} GB; runs are refused below ${DISK_FLOOR_GB} GB); tell the user if it stays low"
+  else
+    echo "disk      ${free} GB free"
+  fi
+  if docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+    echo "docker    rootless, $(docker version --format '{{.Server.Version}}')"
+  else
+    echo "docker    NOT REACHABLE or not rootless"
+    ok=0
+  fi
+  for img in postgres:16 clickhouse/clickhouse-server:25.11 redis:7.2; do
+    if docker image inspect "${img}" >/dev/null 2>&1; then echo "image     ${img}"; else echo "image     ${img} MISSING"; ok=0; fi
+  done
+  docker images --format '{{.Repository}}:{{.Tag}}' | grep '^vt-runner:' | sed 's/^/runner    /' ||
+    echo "runner    none built yet (the first run builds one)"
+  if systemctl is-active --quiet vt-reaper.timer; then echo "reaper    timer active"; else echo "reaper    timer NOT active"; ok=0; fi
+  ((ok)) || exit 70
+}
+
+cmd_setup() {
+  local img
+  RUBY="${1:-${DEFAULT_RUBY}}"
+  NODE="${2:-${DEFAULT_NODE}}"
+  for img in postgres:16 clickhouse/clickhouse-server:25.11 redis:7.2; do
+    docker pull -q "${img}" >/dev/null
+  done
+  ensure_volumes
+  ensure_image
+  say "ready: ${IMAGE}"
+}
+
+cmd_clean() {
+  local slug="$1"
+  valid_name "${slug}"
+  exec 9>>"${VT}/locks/${slug}"
+  flock -n 9 || die 75 "${slug} is in use by a run; not removed"
+  # A run record that names the checkout is a run not cleaned up yet (KAN-437): its lease was
+  # killed, so the lock is free, but its containers or host scope may still use the copy. Same rule
+  # as vt-reaper; checked inside the lock.
+  if grep -qsxF -- "${slug}" "${VT}"/runs/*/slug; then
+    die 75 "${slug}: a run of this checkout is still being cleaned up (vt status); not removed"
+  fi
+  rm -rf -- "${VT}/src/${slug}" "${VT}/src/${slug}.parsalytics"
+  say "removed the vtserv copy of ${slug}"
+}
+
+case "${1:-}" in
+  lease) shift; cmd_lease "$@" ;;
+  sync-guard) shift; cmd_sync_guard "$@" ;;
+  run) shift; cmd_run "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  setup) shift; cmd_setup "$@" ;;
+  clean) shift; cmd_clean "$@" ;;
+  *) die 64 "usage: vt-remote lease|sync-guard|run|stop|status|doctor|setup|clean" ;;
+esac

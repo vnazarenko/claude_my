@@ -32,6 +32,11 @@ Still ask **one question per page**. Do not stack several questions into one pag
    ```
 
    It adds the template's head, CSS and script, and refuses to write a broken page.
+
+   **Open with the task.** `.kicker` names the task (`KAN-299 · events server move`); `.context`
+   says in two lines what the task is and why this question comes up now. The user arrives from
+   another session and has none of your context. **Why this exists:** 2026-10-23, KAN-299's first
+   page asked about magic_crm code with no task summary; the user could not answer it.
 2. Per option, write a `<section class="opt" data-id="…">` with:
    - a short title, and a `Recommended` badge on the first one when you recommend it;
    - one line on what it does;

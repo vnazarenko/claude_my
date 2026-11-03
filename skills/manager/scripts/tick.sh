@@ -22,6 +22,9 @@ counter="$briefs/manager-ticks"
 case "${1:-}" in
   done)  files_hash >"$briefs/.tick-files"; rmdir "$lock" 2>/dev/null; exit 0 ;;
   reset) echo 0 >"$counter"; rm -f "$briefs/.tick-screens"; rmdir "$lock" 2>/dev/null; exit 0 ;;
+  "")    ;;
+  # Any other argument (even --help) would take the lock and count a tick (2026-11-03).
+  *)     echo "usage: tick.sh [done|reset] — no other arguments" >&2; exit 2 ;;
 esac
 
 if ! mkdir "$lock" 2>/dev/null; then

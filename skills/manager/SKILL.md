@@ -46,6 +46,7 @@ One manager = one registry folder (`MANAGER_BRIEFS`): `~/.claude/task-briefs` (t
 | `CLAUDE_CONFIG_DIR`, `CLAUDE_CWD` | another Claude account for the tick calls (a relative config dir works only from `CLAUDE_CWD`) |
 | `MERGE_FOLLOWUP` | `task-cleanup` (default) or `post-merge-watch`: what a merged PR gets |
 | `DEPLOY_LIST` | `on` (default): a merged PR adds a line to `manager-deploys.md`; `off` |
+| `REPOS` | every repo of the project, space separated: searched for open PRs before a cleanup after a deploy |
 
 A session outside the Jira flow is registered with `KIND=watch` (`KEY`, `AGTERM_SESSION_ID`,
 `REPO`): it is pushed on like any other, never cleaned up or closed.
@@ -101,6 +102,9 @@ wins if it is at least 0.5.
   `python3 ~/.claude/skills/manager/scripts/status_ask.py` (Bash, run_in_background; `--mode limit
   --reason "<text>"` for a limit question). One line in the terminal: "Status is open in the overlay."
 - "Turn ticks off" = `touch <briefs>/.ticks-off` (the status overlay's OFF button does it for all).
+- **Editing the tick code:** first `touch` `.ticks-off` in every registry folder, edit, run
+  `autotick.py --dry` and a name check (pyflakes), then remove `.ticks-off`. launchd runs whatever is
+  on disk: a half-edited `autotick.py` once sent `/task-cleanup` to sessions with open work.
 - **Everything the manager knows lives in files.** A fresh manager (`/clear`, then `/manager`)
   loses nothing. When the user decides something, write it to `manager-decisions.md` at once,
   then send it to the session. When the manager's context passes ~150k tokens, ask the user to run
@@ -162,6 +166,22 @@ The manager session never merges itself. The project file says who merges:
 With `MERGE_FOLLOWUP=post-merge-watch`, each merged PR gets `/post-merge-watch <repo> <N>` in its own
 task session, once (`watch_sent` in `.auto-state.json`), also when the tick first sees a PR merged
 in the last 48 h. One watch per PR, in that PR's session, never one global watcher.
+
+## After a deploy
+
+The user deploys; the manager learns it from this Mac, never from the server:
+
+- **Capistrano:** the tick reads `<repo>/log/capistrano.log` (`Branch X (at SHA) deployed as release ...`).
+- **Any other tool, or by hand:** `bash ~/.claude/skills/manager/scripts/deployed.sh <repo> <sha> [source]`
+  appends to `~/.claude/manager-deploys.log` and starts a tick at once. When the user says "I
+  deployed X", run it with the sha they deployed (for Capistrano the log already has it).
+
+For each task session whose merged PRs are all inside the newest deployed sha (`git merge-base
+--is-ancestor`): if no PR naming the ticket is still open in any `REPOS` repo and it has no line on
+the needs list, the tick types `/task-cleanup deployed: ...` (cleanup runs the After deploy checks
+and closes the session) and drops its `manager-deploys.md` lines. Otherwise it tells the session the
+deploy happened, to run the After deploy checks (read-only) and restate what is left. Once per
+session per deployed sha (`deploy_checked`). Not in projects with `MERGE_FOLLOWUP=post-merge-watch`.
 
 ## What only the user decides
 
@@ -261,6 +281,7 @@ rollback. Nothing after it.
 | `scripts/autotick.py` | the tick: screens, GitHub events, Jev, colours; `--dry`, `--retint`, `--restate`, `--add-need KEY "text"` |
 | `scripts/run-tick.sh` | what launchd runs every 15 min, for every registry folder |
 | `scripts/keep_awake.py` | the rolling `caffeinate` while work runs |
+| `scripts/deployed.sh` | report a deploy (repo, sha); `~/.claude/manager-deploys.log` |
 | `scripts/status_ask.py` | the status / limit overlay |
 | `scripts/start-companion.sh`, `scripts/close-review.sh` | start a companion session; close a finished review |
 | `rules.md` | the one page Claude reads for an `ASK` line |

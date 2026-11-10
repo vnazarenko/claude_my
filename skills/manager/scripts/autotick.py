@@ -28,6 +28,7 @@ SCRIPTS = f'{HOME}/.claude/skills/manager/scripts'
 STATE = f'{BRIEFS}/.auto-state.json'
 # Per-manager project settings (<briefs>/tick.env): CLAUDE_CONFIG_DIR, CLAUDE_CWD, PROJECT_DIR,
 # MERGE_FOLLOWUP (task-cleanup | post-merge-watch), DEPLOY_LIST (on | off).
+# REPOS: every repo of the project (space separated), searched for open PRs before a cleanup.
 TE = {}
 LOCK = f'{BRIEFS}/.manager-tick.lock'
 ASKDIR = f'{BRIEFS}/.ask'
@@ -129,6 +130,13 @@ def colour_of(screen):
         return None
     c = max(a, key=a.get)
     return c if a[c] >= 0.5 else 'clear'
+
+
+RESTATE = ('Manager: the user will read this later, with no context. "There are open questions" is not enough. '
+           'Write your stop again, in this form. Done: what is finished, one or two lines. Then for each open '
+           'question: the problem in plain words, then options A (recommended), B, C, each with what it does and its '
+           'cost or risk. Number the questions so the user can answer "1A, 2B". Last line: what else you wait for. '
+           'Do not decide the questions yourself.')
 
 
 def maybe_restate(name, sid, st, a, acted):
@@ -295,6 +303,95 @@ def main():
             except OSError: pass
 
 
+DEPLOY_LOG = f'{HOME}/.claude/manager-deploys.log'  # written by scripts/deployed.sh
+
+
+def main_checkout(repo):
+    rc, out = sh(['git', '-C', repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'], timeout=20)
+    return os.path.dirname(out.strip()) if rc == 0 and out.strip() else repo
+
+
+def latest_deploys(tops):
+    """{repo main checkout: newest deployed sha}, from deployed.sh lines and <repo>/log/capistrano.log."""
+    ev = []  # (when, top, sha)
+    if os.path.exists(DEPLOY_LOG):
+        for l in open(DEPLOY_LOG):
+            f = [x.strip() for x in l.split('|')]
+            if len(f) >= 3:
+                ev.append((re.sub(r'\D', '', f[0])[:14], f[1], f[2]))
+    for top in tops:  # Capistrano logs every deploy on this Mac; reading it touches no server
+        c = f'{top}/log/capistrano.log'
+        if os.path.exists(c):
+            for m in re.finditer(r'Branch \S+ \(at ([0-9a-f]{40})\) deployed as release (\d{14})',
+                                 open(c, errors='replace').read()):
+                ev.append((m.group(2), top, m.group(1)))  # release id is UTC, close enough for "newest"
+    out = {}
+    for when, top, sha in sorted(ev):
+        if top in tops:
+            out[top] = sha
+    return out
+
+
+def handle_deploys(state, envs, watched, acted):
+    """A deploy that contains every merged PR of a waiting task session -> /task-cleanup there
+    (user rule 2026-11-10). Projects with MERGE_FOLLOWUP=post-merge-watch handle deploys their own way."""
+    if TE.get('MERGE_FOLLOWUP') == 'post-merge-watch':
+        return
+    sessions, sids = state.setdefault('sessions', {}), dict(watched)
+    tasks = {k: e for k, e in envs.items() if e.get('KIND', 'task') == 'task' and e.get('REPO')
+             and os.path.isdir(e['REPO']) and sids.get(k, '-') != '-'}
+    tops = {k: main_checkout(e['REPO']) for k, e in tasks.items()}
+    deployed = latest_deploys(set(tops.values()))
+    fetched = set()
+    for k, e in tasks.items():
+        top, st = tops[k], sessions.setdefault(k, {})
+        sha = deployed.get(top)
+        if not sha or st.get('deploy_checked') == sha or not all_merged(st):
+            continue
+        if top not in fetched:
+            sh(['git', '-C', top, 'fetch', '-q', 'origin'], timeout=60); fetched.add(top)
+        nums = [n for n, v in st.get('prs', {}).items() if not n.startswith('merged_at') and v.startswith('MERGED')]
+        inside = True
+        for n in nums:
+            rc, mc = sh(f'cd "{top}" && gh pr view {n} --json mergeCommit -q .mergeCommit.oid', timeout=40)
+            if rc != 0 or not mc.strip() or sh(['git', '-C', top, 'merge-base', '--is-ancestor', mc.strip(), sha])[0] != 0:
+                inside = False; break
+        if not inside:
+            st['deploy_checked'] = sha  # look again only after the next deploy
+            continue
+        # A task can have more PRs than its registry branch (other branches, other repos, drafts):
+        # any OPEN PR naming the ticket means the task is not finished.
+        jira = e.get('JIRA_KEY') or k
+        open_prs = []
+        for t in sorted(set(tops.values()) | set(filter(None, TE.get('REPOS', '').split()))):
+            rc, out = sh(f'cd "{t}" && gh pr list --state open --search "{jira} in:title" --json number -q ".[].number"', timeout=40)
+            open_prs += [f'{os.path.basename(t)}#{x}' for x in out.split()] if rc == 0 else ['?']
+        if not open_prs and open_needs(k):
+            open_prs = ['an open item on the needs list']
+        if open_prs:
+            # Its merged work is live, but something is still open: tell it, so it runs the After deploy
+            # checks and says what is left. No cleanup.
+            r = say(k, sids[k], f'Manager: {os.path.basename(top)} was deployed at {sha[:8]}; it contains your merged '
+                    f'PRs. Run their After deploy checks now (read-only; a production step stays the user\'s). Still open: '
+                    f'{", ".join(open_prs)}. Then restate what is left for the user.')
+            if r in ('sent', 'dry'):
+                st['deploy_checked'] = sha
+            acted.append(f'sent {k}: deployed in {sha[:8]}, still open ({", ".join(open_prs)}) -> after-deploy checks [{r}]')
+            log(k, f'auto: deployed ({sha[:8]}), open: {", ".join(open_prs)} -> after-deploy checks [{r}]')
+            continue
+        prs = ', '.join('#' + n for n in nums)
+        r = say(k, sids[k], f'/task-cleanup deployed: {os.path.basename(top)} {sha[:8]} contains {prs}. '
+                'Run the After deploy checks from the PR body first, then finish the cleanup.')
+        if r in ('sent', 'dry'):
+            st['deploy_checked'] = sha
+            if not DRY:
+                p = f'{BRIEFS}/manager-deploys.md'
+                if os.path.exists(p):
+                    keep = [l for l in open(p).read().splitlines() if not l.startswith(k + ' |')]
+                    open(p, 'w').write('\n'.join(keep) + ('\n' if keep else ''))
+        acted.append(f'sent {k}: deployed in {sha[:8]} -> /task-cleanup [{r}]'); log(k, f'auto: {prs} deployed ({sha[:8]}) -> /task-cleanup [{r}]')
+
+
 def run():
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
     sessions = state.setdefault('sessions', {})
@@ -398,6 +495,8 @@ def run():
         else:
             why = 'question, no user-only flag' if a['asks'] >= 0.5 else 'idle, not finished'
             asks.append((name, why, screen))
+    if not RETINT:
+        handle_deploys(state, envs, watched, acted)
     # holds: Claude starts held tasks; only ask when the file changed or once an hour
     hp = f'{BRIEFS}/manager-holds.md'
     # Lines that wait for the user ("needs user", "user decides") are not the manager's to start.

@@ -150,6 +150,101 @@ def maybe_restate(name, sid, st, a, acted):
     acted.append(f'sent {name}: open questions not clear -> restate them [{r}]'); log(name, f'auto: asked to restate open questions [{r}]')
 
 
+def agt_session(args, sid):
+    """Run `agtermctl session <args> --target sid` in whichever open window holds the session."""
+    _, out = sh(['agtermctl', 'window', 'list', '--json'])
+    try:
+        wins = [w['id'] for w in json.loads(out)['result']['windows'] if w.get('open')]
+    except Exception:
+        wins = []
+    for w in wins:
+        rc, _ = sh(['agtermctl', 'session', *args, '--target', sid, '--window', w])
+        if rc == 0:
+            return 0
+    return 1
+
+
+_NAMES = {}
+
+
+def agterm_names():
+    """agterm session id -> its current sidebar name (all open windows), read once per run."""
+    if not _NAMES:
+        _, out = sh(['agtermctl', 'window', 'list', '--json'])
+        try:
+            wins = [w['id'] for w in json.loads(out)['result']['windows'] if w.get('open')]
+        except Exception:
+            wins = []
+        for w in wins:
+            rc, t = sh(['agtermctl', 'tree', '--json', '--window', w])
+            if rc != 0:
+                continue
+            def walk(o):
+                if isinstance(o, dict):
+                    if o.get('cwd') is not None and o.get('id'):
+                        _NAMES[o['id']] = o.get('name') or ''
+                    for v in o.values():
+                        walk(v)
+                elif isinstance(o, list):
+                    for v in o:
+                        walk(v)
+            try:
+                walk(json.loads(t))
+            except Exception:
+                pass
+    return _NAMES
+
+
+# PR links on the screen also tag the session, for the GitHub owner in tick.env PR_LINK_OWNER (unset: off)
+
+
+def pr_label(name, sid, e, st, screen, acted):
+    """Put the session's PRs into its name: "KEY · api#8199 web#5550 · label" (user rule 2026-11-10).
+    Also restores a name that lost its ticket key (agterm or a resumed session can reset it, e.g. "[w]")."""
+    raw = agterm_names().get(sid, '')
+    mark = '[w] ' if raw.startswith('[w]') else ''  # post-merge-watch mark: keep it
+    live = raw.removeprefix('[w]').strip()
+    if not e.get('SESSION_NAME'):
+        # Hand-built registry with no name: keep the live one if it carries the key, else just the key.
+        e['SESSION_NAME'] = live if live.startswith(e['KEY']) else e['KEY']
+        path = f"{BRIEFS}/{e['KEY']}.env"
+        if not DRY and os.path.exists(path):
+            open(path, 'a').write(f'SESSION_NAME="{e["SESSION_NAME"]}"\n')
+    tags = set(st.get('pr_tags', []))
+    repo = os.path.basename(e.get('REPO', '') or '')
+    for n, v in st.get('prs', {}).items():
+        if n.isdigit() and repo:
+            (tags.discard if v.startswith('CLOSED') else tags.add)(f'{repo}#{n}')
+    owner = TE.get('PR_LINK_OWNER')
+    if owner:
+        for r, n in re.findall(rf'github\.com/{re.escape(owner)}/([A-Za-z0-9_.-]+)/pull/(\d+)', screen):
+            tags.add(f'{r}#{n}')
+    st['pr_tags'] = sorted(tags)
+    if not tags:
+        if not live.startswith(e['KEY']) and not DRY and agt_session(['rename', mark + e['SESSION_NAME']], sid) == 0:
+            acted.append(f"rename {name}: restored {e['SESSION_NAME']}"); log(name, f'auto: name restored (was "{live}")')
+        return
+    tag_s = ' '.join(sorted(tags, key=lambda t: (t.split('#')[0], int(t.split('#')[1])))[:4])
+    cur = e['SESSION_NAME']
+    rest = cur.split(' · ', 1)[1] if cur.startswith(f"{e['KEY']} · ") else cur
+    parts = rest.split(' · ', 1)
+    if len(parts) == 2 and all('#' in w for w in parts[0].split()):
+        rest = parts[1]  # drop the old PR tags
+    new = f"{e['KEY']} · {tag_s} · {rest}" if rest and rest != e['KEY'] else f"{e['KEY']} · {tag_s}"
+    if new == cur and live == new:
+        return
+    full = mark + new
+    if DRY:
+        acted.append(f'would rename {name}: {full}'); return
+    if agt_session(['rename', full], sid) == 0:
+        path = f"{BRIEFS}/{e['KEY']}.env"
+        txt = open(path).read()
+        txt = re.sub(r'^SESSION_NAME=.*$', lambda m: f'SESSION_NAME="{new}"', txt, flags=re.M)
+        open(path, 'w').write(txt)
+        e['SESSION_NAME'] = new
+        acted.append(f'rename {name}: {new}'); log(name, f'auto: renamed with PRs: {tag_s}')
+
+
 def set_tint(name, sid, st, c, acted):
     if c is None:  # Jev call failed: keep the colour
         return
@@ -226,7 +321,7 @@ def pr_events(e, prev):
     """Fixed messages for PR changes of this ticket's branch. Returns (messages, new pr state)."""
     repo, branch = e.get('REPO'), e.get('BRANCH')
     jira = e.get('JIRA_KEY') or ''
-    if not repo or not os.path.isdir(repo) or e.get('KIND') == 'review':
+    if not repo or not os.path.isdir(repo) or e.get('KIND') in ('review', 'executor'):
         return [], prev
     fields = '--json number,state,mergeable,headRefOid,mergedAt'
     if branch:
@@ -286,7 +381,7 @@ def open_needs(key):
 def main():
     if os.path.exists(f'{BRIEFS}/tick.env'):
         TE.update(envfile(f'{BRIEFS}/tick.env'))
-    if RUN_ASKS and os.path.exists(f'{BRIEFS}/.ticks-off'):
+    if RUN_ASKS and os.path.exists(f'{BRIEFS}/.ticks-off') and '--force' not in sys.argv:  # --force: one tick while off (a deploy)
         print('skip: ticks are off (.ticks-off)'); return 0
     if not DRY:
         try:
@@ -348,6 +443,8 @@ def handle_deploys(state, envs, watched, acted):
         sha = deployed.get(top)
         if not sha or st.get('deploy_checked') == sha or not all_merged(st):
             continue
+        if any(a.startswith(f'sent {k}:') and '/task-cleanup' in a for a in acted):
+            st['deploy_checked'] = sha; continue  # cleanup already sent this tick: no second one
         if top not in fetched:
             sh(['git', '-C', top, 'fetch', '-q', 'origin'], timeout=60); fetched.add(top)
         nums = [n for n, v in st.get('prs', {}).items() if not n.startswith('merged_at') and v.startswith('MERGED')]
@@ -434,6 +531,8 @@ def run():
                 r = say(name, sid, text); acted.append(f'sent {name}: {what} [{r}]'); log(name, f'auto: {what} [{r}]')
         # 1. screen
         screen = lib('screen_text', sid)
+        if name in envs:
+            pr_label(name, sid, e, st, screen, acted)
         tail = '\n'.join(screen.splitlines()[-22:])
         tok = lib('token_of', lib('session_status', tree, sid).strip(), tail).strip()
         if tok == 'working':
@@ -445,8 +544,14 @@ def run():
                 st['shell_tok'], st['shell_at'] = tok, time.time()
             if time.time() - st['shell_at'] < 3 * 3600:
                 busy += 1
+        if e.get('KIND') == 'executor':  # its coordinator (the task session) supervises it
+            continue
         if st.get('tint') in ('orange', 'blue'):  # retired colours (2026-11-10)
             set_tint(name, sid, st, 'clear', acted)
+        # A post-merge watch is running ("[w] " name mark from watch.py): merged, it only waits for
+        # the checkpoints -> green, also while it works (user rule 2026-11-10). Red stays red.
+        if agterm_names().get(sid, '').startswith('[w]') and st.get('tint') not in ('green', 'red'):
+            set_tint(name, sid, st, 'green', acted)
         if tok == 'working' or (tok == st.get('hash') and not RETINT):
             continue
         if RETINT:  # recolour only: no hash, needs, messages or asks

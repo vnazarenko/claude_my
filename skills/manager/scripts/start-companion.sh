@@ -9,6 +9,8 @@
 #   label     what the session is FOR, short: "Review #170 web"
 #   4th arg   the claude prompt file, or --resume=<id> to continue an existing Claude conversation
 #   cwd       defaults to the task's REPO
+# COMPANION_CLAUDE_ARGS: extra claude flags (start-executor.sh: --model, --effort). KEY X-<TASK> is an
+# executor (KIND=executor): its coordinator supervises it, the manager tick only counts it as busy.
 # Prints the new agterm session id. If the task session is gone, falls back to a plain session in
 # the manager's workspace and says so on stderr.
 set -euo pipefail
@@ -39,7 +41,7 @@ sleep 1
 case "$what" in
   --resume=*) cmd="command claude --resume ${what#--resume=}" ;;
   *) [ -f "$what" ] || { echo "no prompt file $what" >&2; exit 1; }
-     cmd="command claude \"\$(cat '$what')\"" ;;
+     cmd="command claude ${COMPANION_CLAUDE_ARGS:-} \"\$(cat '$what')\"" ;;
 esac
 # A project can run claude with its own config dir (CLAUDE_CONFIG_DIR). A relative dir only
 # resolves from the folder that holds it: start claude there, not in a repo cwd (a repo can hold a
@@ -53,7 +55,8 @@ fi
 agtermctl session type --target "$sid" --window "$win" "$cmd" >/dev/null
 agtermctl session type --target "$sid" --window "$win" $'\r' >/dev/null
 
-kind=task; case "$key" in R-*) kind=review ;; esac
+kind=task; wt="$repo/.claude/worktrees/review-${key#R-}"
+case "$key" in R-*) kind=review ;; X-*) kind=executor; wt="$cwd" ;; esac
 if [ -f "$B/$key.env" ]; then
   # Re-homing an existing session: keep its fields, point it at the new agterm session.
   sed -i '' -e "s/^AGTERM_SESSION_ID=.*/AGTERM_SESSION_ID=$sid/" -e '/^PARENT_KEY=/d' "$B/$key.env"
@@ -65,7 +68,7 @@ JIRA_KEY=$task
 KIND=$kind
 PARENT_KEY=$task
 REPO=$repo
-WORKTREE=$repo/.claude/worktrees/review-${key#R-}
+WORKTREE=$wt
 AGTERM_SESSION_ID=$sid
 SESSION_NAME="$name"
 STARTED="$(date '+%Y-%m-%d %H:%M:%S')"

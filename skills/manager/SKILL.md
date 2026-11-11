@@ -51,6 +51,14 @@ One manager = one registry folder (`MANAGER_BRIEFS`): `~/.claude/task-briefs` (t
 A session outside the Jira flow is registered with `KIND=watch` (`KEY`, `AGTERM_SESSION_ID`,
 `REPO`): it is pushed on like any other, never cleaned up or closed.
 
+## Session names carry their PRs (user rule, 2026-11-10)
+
+As soon as a session has a PR, `autotick.py` renames it to `<KEY> · <repo>#<N> [<repo>#<M>…] · <label>`
+(for example `ABC-775 · api#8206 api#8211 · Workers read feature flags as unknown`), so the sidebar
+shows which repos and PRs a task touches. PRs come from the registry REPO (branch, or `[JIRA_KEY]` in
+the title) and, when tick.env sets `PR_LINK_OWNER=<github owner>`, from
+`github.com/<owner>/<repo>/pull/<N>` links on the screen; they are kept in `pr_tags` in `.auto-state.json`, and `SESSION_NAME` in the .env follows.
+
 ## Session colours
 
 `autotick.py` tints each watched session's sidebar row (icon and name). Jev picks the colour: one
@@ -64,6 +72,8 @@ wins if it is at least 0.5.
 | red | stuck on a failure it cannot fix by itself |
 | none | waits for the user's decision, or none of the above |
 
+A session with the `[w] ` name mark (a `post-merge-watch` is running) is green without asking Jev,
+also while it works: it only waits for the checkpoints (user rule 2026-11-10). Red stays red.
 "Waits for the user" gets no colour on purpose: tried as orange, every working chat turned orange.
 `autotick.py --retint` recolours every idle session once (Jev only, no Claude call). By hand:
 `agtermctl session tint <red|green|yellow> --on icon,name --target <sid> --window <win>`
@@ -132,6 +142,10 @@ wins if it is at least 0.5.
 - Every piece of work goes through `new-task`: ticket, worktree, session. Never do it in this session.
 - Duo mode (Claude + Codex) is the default when the project allows it: `TASK_DUO=1`. Check
   `uptime` first; keep the load under ~30. Too high → put the task in the holds file.
+- **Coordinator + executor** (user rule, 2026-11-11): the task session (Opus, with Codex in duo) plans,
+  reviews and validates; it hands the implementation to an executor companion `X-<KEY>` on the
+  model Jev picks (new-task SKILL, "Coordinator and executor"). The tick skips executors; when a
+  task session waits on `executor-wait.sh`, it is working, not idle.
 - Do not run two tasks that change the same files at the same time: start one, hold the other.
 - Pass the first note through `TASK_BRIEF_EXTRA` (a file appended to the brief), not `say.sh`:
   `say.sh` refuses right after the start, because the seed prompt counts as the user's message.
@@ -169,7 +183,20 @@ in the last 48 h. One watch per PR, in that PR's session, never one global watch
 
 ## After a deploy
 
+**The post-deploy checklist** (`post-deploy` skill): one page in the agterm session "Post-deploy
+steps" with the Deploy steps and After deploy items of every merged and ready-to-merge PR, as
+checkboxes. `run-tick.sh` rebuilds it every 15 min (no tokens). To show it: `bash
+~/.claude/skills/post-deploy/scripts/open.sh`.
+
 The user deploys; the manager learns it from this Mac, never from the server:
+
+- **A deploy always gets one manager tick at once, also while ticks are off** (user rule,
+  2026-11-10). `deploy-watch.sh` sees a new `deployed as release` line (or a `deployed.sh` line) and
+  flags it; `run-tick.sh` then runs `autotick.py --force` for every manager that follows deploys
+  (`REPOS` set, `DEPLOY_LIST` not off), so colours, deploy notices and cleanups happen. Without the
+  watcher job it is caught by the next 15-minute run; `install-deploy-watch.sh` (the user runs it:
+  it adds a LaunchAgent) makes it start within ~30 s of the deploy.
+- `autotick.py --run-asks --force` is also how to run one tick by hand while ticks are off.
 
 - **Capistrano:** the tick reads `<repo>/log/capistrano.log` (`Branch X (at SHA) deployed as release ...`).
 - **Any other tool, or by hand:** `bash ~/.claude/skills/manager/scripts/deployed.sh <repo> <sha> [source]`

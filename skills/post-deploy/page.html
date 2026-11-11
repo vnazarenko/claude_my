@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Post-deploy steps</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #f6f5f1; --card: #ffffff; --ink: #1d1f22; --mute: #6b7076; --line: #e3e1da;
+    --code: #f0eee7; --accent: #2f6fed; --ok: #1f8a4c; --warn: #b7791f; --todo: #c2410c; --open: #7c3aed;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15171a; --card: #1d2024; --ink: #e7e5e0; --mute: #9aa0a6; --line: #2e3237;
+            --code: #262a2f; --accent: #6ea0ff; --ok: #4ade80; --warn: #f2b44c; --todo: #fb923c; --open: #b794f6; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif; }
+  header { position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line);
+           padding: 14px 28px 12px; display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; }
+  h1 { font-size: 19px; margin: 0; letter-spacing: -.01em; }
+  .stat { color: var(--mute); font-size: 13px; }
+  .stat b { color: var(--ink); }
+  .spacer { flex: 1; }
+  header label { color: var(--mute); font-size: 13px; cursor: pointer; user-select: none; }
+  #flash { color: var(--accent); font-size: 13px; opacity: 0; transition: opacity .4s; }
+  #flash.on { opacity: 1; }
+  main { padding: 8px 28px 60px; max-width: 1100px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--mute);
+       margin: 26px 0 10px; display: flex; gap: 8px; align-items: center; }
+  h2 .n { background: var(--line); color: var(--ink); border-radius: 9px; padding: 0 7px; font-size: 11px; }
+  .pr { background: var(--card); border: 1px solid var(--line); border-radius: 10px; margin: 0 0 12px;
+        border-left: 4px solid var(--line); }
+  .pr.deployed { border-left-color: var(--todo); }
+  .pr.waiting, .pr.unknown { border-left-color: var(--warn); }
+  .pr.open { border-left-color: var(--open); }
+  .pr.done { border-left-color: var(--ok); }
+  .pr > summary { list-style: none; cursor: pointer; padding: 11px 16px; display: flex; gap: 10px; align-items: baseline; }
+  .pr > summary::-webkit-details-marker { display: none; }
+  .pr > summary .num { font-weight: 600; white-space: nowrap; }
+  .pr > summary .num a { color: var(--accent); text-decoration: none; }
+  .pr > summary .t { flex: 1; }
+  .badge { font-size: 11.5px; padding: 1px 8px; border-radius: 9px; white-space: nowrap; border: 1px solid currentColor; }
+  .b-deployed { color: var(--todo); } .b-waiting, .b-unknown { color: var(--warn); }
+  .b-open { color: var(--open); } .b-done { color: var(--ok); }
+  .prog { font-variant-numeric: tabular-nums; color: var(--mute); font-size: 12.5px; white-space: nowrap; }
+  .body { padding: 0 16px 12px 16px; }
+  .depbox { margin: 0 0 6px; padding: 6px 10px; border-radius: 6px; background: var(--code); font-size: 13px; }
+  .sec { margin-top: 8px; }
+  .sec h3 { font-size: 12px; margin: 6px 0 4px; color: var(--mute); font-weight: 600; }
+  .it { display: flex; gap: 9px; align-items: flex-start; padding: 3px 0; }
+  .it.d1 { margin-left: 26px; }
+  .it input { margin-top: 3px; width: 16px; height: 16px; accent-color: var(--ok); flex: none; cursor: pointer; }
+  .it .tx { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .it.checked .tx { color: var(--mute); text-decoration: line-through; text-decoration-color: var(--line); }
+  .it .when { color: var(--mute); font-size: 11.5px; margin-left: 6px; text-decoration: none; display: inline-block; }
+  .it.note .tx, .it.none .tx { color: var(--mute); }
+  .it.ref .tx::before { content: "↩ "; }
+  .it.head .tx { font-weight: 600; }
+  .bullet { width: 16px; flex: none; text-align: center; color: var(--mute); }
+  code { background: var(--code); padding: 1px 5px; border-radius: 4px; font: 12.5px/1.45 ui-monospace, "SF Mono", Menlo, monospace;
+         cursor: copy; }
+  pre { background: var(--code); padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 4px 0 4px 25px;
+        font: 12.5px/1.45 ui-monospace, "SF Mono", Menlo, monospace; cursor: copy; position: relative; }
+  a { color: var(--accent); }
+  .small { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--mute); font-size: 13px; }
+  .small a { color: var(--mute); }
+  .err { color: var(--todo); font-size: 13px; }
+  #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg);
+           padding: 5px 12px; border-radius: 6px; font-size: 12.5px; opacity: 0; transition: opacity .25s; pointer-events: none; }
+  #toast.on { opacity: .92; }
+  .empty { color: var(--mute); padding: 30px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Post-deploy steps</h1>
+  <span class="stat" id="stat"></span>
+  <span id="flash"></span>
+  <span class="spacer"></span>
+  <label><input type="checkbox" id="hideDone" checked> hide finished</label>
+  <span class="stat" id="built"></span>
+</header>
+<main id="main"><div class="empty">Loading…</div></main>
+<div id="toast"></div>
+<script>
+const $ = s => document.querySelector(s);
+let D = null, lastSig = '', openState = {};
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function toast(t) { const e = $('#toast'); e.textContent = t; e.classList.add('on'); setTimeout(() => e.classList.remove('on'), 1200); }
+function copy(text) {
+  (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).then(
+    () => toast('Copied'),
+    () => { const t = document.createElement('textarea'); t.value = text; document.body.appendChild(t); t.select();
+            document.execCommand('copy'); t.remove(); toast('Copied'); });
+}
+
+function prInfo(p, checks) {
+  const tasks = [];
+  p.sections.forEach(s => s.blocks.forEach(b => { if (b.kind === 'task') tasks.push(b); }));
+  const isDone = b => b.auto || !!checks[b.id];
+  const done = tasks.filter(isDone).length;
+  let status = p.deploy.status;                      // deployed | waiting | unknown | not merged
+  if (status === 'unknown' && checks['dep:' + p.key]) status = 'deployed';
+  let group;
+  if (!tasks.length) group = 'none';
+  else if (done === tasks.length) group = 'done';
+  else if (p.state === 'open') group = 'open';
+  else if (status === 'deployed') group = 'deployed';
+  else group = 'waiting';
+  return { tasks: tasks.length, done, status, group };
+}
+
+function badge(p, info) {
+  if (info.group === 'done') return '<span class="badge b-done">all done</span>';
+  if (p.state === 'open') return '<span class="badge b-open">not merged yet</span>';
+  if (info.status === 'deployed') return '<span class="badge b-deployed">deployed — steps to do</span>';
+  if (info.status === 'waiting') return '<span class="badge b-waiting">waits for deploy</span>';
+  return '<span class="badge b-unknown">deploy not recorded</span>';
+}
+
+function renderPR(p, checks, info) {
+  const k = p.key, o = openState[k] !== undefined ? openState[k] : (info.group !== 'done');
+  let h = `<details class="pr ${info.group === 'done' ? 'done' : (p.state === 'open' ? 'open' : info.status)}" data-k="${esc(k)}"${o ? ' open' : ''}>`;
+  h += `<summary><span class="num"><a href="${esc(p.url)}" target="_blank">${esc(p.repo)} #${p.number}</a></span>`;
+  h += `<span class="t">${esc(p.title)}</span>${badge(p, info)}<span class="prog">${info.done}/${info.tasks}</span></summary><div class="body">`;
+  if (p.state === 'merged') {
+    const d = p.deploy, m = (p.mergedAt || '').slice(0, 16).replace('T', ' ');
+    let line = `Merged ${esc(m)} UTC. `;
+    if (d.status === 'deployed') line += `In the deploy of ${esc(d.when)} UTC (${esc(d.sha)}).`;
+    else if (d.status === 'waiting') line += `Not in the last deploy (${esc(d.last)} UTC, ${esc(d.sha)}).`;
+    else {
+      const on = !!checks['dep:' + k];
+      line += `No deploy record for this repo: <label><input type="checkbox" data-id="dep:${esc(k)}"${on ? ' checked' : ''}> I deployed it</label>`;
+    }
+    h += `<div class="depbox">${line}</div>`;
+  }
+  for (const s of p.sections) {
+    h += `<div class="sec"><h3>${esc(s.name)}</h3>`;
+    if (s.missing) h += `<div class="it note"><span class="bullet">!</span><span class="tx">Section missing in the PR body.</span></div>`;
+    for (const b of s.blocks) {
+      const d = b.depth ? ' d1' : '';
+      if (b.kind === 'task') {
+        const on = b.auto || !!checks[b.id];
+        const when = b.auto ? '<span class="when">auto: in the deploy</span>' : (checks[b.id] ? `<span class="when">${esc(checks[b.id])}</span>` : '');
+        h += `<label class="it${d}${on ? ' checked' : ''}"><input type="checkbox" data-id="${b.id}"${on ? ' checked' : ''}${b.auto ? ' disabled' : ''}><span class="tx">${b.html}${when}</span></label>`;
+      } else {
+        const mark = b.kind === 'head' ? '' : (b.kind === 'note' ? '' : '·');
+        h += `<div class="it ${b.kind}${d}"><span class="bullet">${mark}</span><span class="tx">${b.html}</span></div>`;
+      }
+      for (const c of b.code) h += `<pre title="click to copy">${esc(c)}</pre>`;
+    }
+    h += '</div>';
+  }
+  return h + '</div></details>';
+}
+
+function render() {
+  const checks = D.checks || {}, hide = $('#hideDone').checked;
+  const groups = { deployed: [], waiting: [], open: [], done: [], none: [] };
+  for (const p of D.prs) { const i = prInfo(p, checks); groups[i.group].push([p, i]); }
+  const left = [...groups.deployed, ...groups.waiting].reduce((n, [, i]) => n + i.tasks - i.done, 0);
+  $('#stat').innerHTML = `<b>${left}</b> steps left · <b>${groups.deployed.length}</b> deployed PRs to finish · ` +
+    `<b>${groups.waiting.length}</b> wait for deploy · <b>${groups.open.length}</b> not merged`;
+  $('#built').textContent = `since ${D.since} · data ${D.built || '-'}`;
+  let h = '';
+  if (D.errors && D.errors.length) h += `<div class="err">${D.errors.map(esc).join('<br>')}</div>`;
+  const sec = (title, list) => {
+    if (!list.length) return;
+    h += `<h2>${title} <span class="n">${list.length}</span></h2>`;
+    for (const [p, i] of list) h += renderPR(p, checks, i);
+  };
+  sec('Deployed — do these steps now', groups.deployed);
+  sec('Merged — do these after the next deploy', groups.waiting);
+  sec('Ready to merge — steps to come', groups.open);
+  if (!hide) sec('Finished', groups.done);
+  else if (groups.done.length) h += `<h2>Finished <span class="n">${groups.done.length}</span></h2><div class="small">` +
+    groups.done.map(([p]) => `<a href="${esc(p.url)}" target="_blank">${esc(p.repo)} #${p.number}</a>`).join('') + '</div>';
+  if (groups.none.length) h += `<h2>No steps needed <span class="n">${groups.none.length}</span></h2><div class="small">` +
+    groups.none.map(([p]) => `<a href="${esc(p.url)}" target="_blank" title="${esc(p.title)}">${esc(p.repo)} #${p.number}</a>`).join('') + '</div>';
+  if (!D.prs.length) h = '<div class="empty">No PRs with deploy steps.</div>';
+  const y = window.scrollY;
+  $('#main').innerHTML = h;
+  window.scrollTo(0, y);
+}
+
+async function load(first) {
+  try {
+    const r = await fetch('/data', { cache: 'no-store' });
+    const d = await r.json();
+    const sig = d.version + JSON.stringify(d.checks);
+    if (sig === lastSig) return;
+    const changed = D && D.version !== d.version;
+    D = d; lastSig = sig; render();
+    if (changed && !first) { const f = $('#flash'); f.textContent = 'Updated ' + (d.built || ''); f.classList.add('on'); setTimeout(() => f.classList.remove('on'), 8000); }
+  } catch (e) { $('#flash').textContent = 'server not reachable'; $('#flash').classList.add('on'); }
+}
+
+document.addEventListener('change', async e => {
+  const t = e.target;
+  if (t.id === 'hideDone') return render();
+  if (!t.dataset.id) return;
+  D.checks = D.checks || {};
+  if (t.checked) D.checks[t.dataset.id] = new Date().toISOString().slice(0, 16).replace('T', ' '); else delete D.checks[t.dataset.id];
+  lastSig = D.version + JSON.stringify(D.checks);
+  render();
+  await fetch('/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: t.dataset.id, on: t.checked }) });
+});
+document.addEventListener('click', e => {
+  const c = e.target.closest('code, pre');
+  if (c && !e.target.closest('a')) { e.preventDefault(); copy(c.textContent); }
+});
+document.addEventListener('toggle', e => { const d = e.target; if (d.dataset && d.dataset.k) openState[d.dataset.k] = d.open; }, true);
+load(true);
+setInterval(load, 15000);
+</script>
+</body>
+</html>

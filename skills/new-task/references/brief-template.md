@@ -21,7 +21,7 @@ When the plan file is written:
   use a worktree branch there);
 - post a Jira comment: the goal in one line, the task list (one line each), the plan file path.
 
-Then implement the plan (`/planning:exec`, or task by task). The user's global rules apply in
+Then have the plan implemented by an executor (section 1d; `self` = you do it yourself). The user's global rules apply in
 full: work only in this worktree, commit on this branch, open a PR, and end the PR body with
 "Test plan" (each row automated by a named e2e spec), "Deploy steps" and "After deploy".
 
@@ -83,8 +83,12 @@ What to do:
 3. **Behaviour list:** every difference between old and new (response, side effects), each with
    where it was agreed (ticket line, plan, user message). Anything not agreed: stop, set
    `Blocked`, ask the user.
-4. **A blocked measurement is not done.** If production reads are refused (auto mode, VPN), mark
-   the row UNVERIFIED, tell the user the exact command, and do not merge until it is measured.
+4. **A blocked measurement is not done.** Read-only measurements (logs, `EXPLAIN` in a READ ONLY
+   transaction) are not a deploy: as soon as the plan names them, ask the user once whether you may
+   run them yourself. If not, or production reads are refused (auto mode, VPN), mark the row
+   UNVERIFIED, tell the user the exact command, and do not merge until it is measured.
+   **Why this exists:** 2026-11-10, a task waited at merge for the measurement until the owner said
+   "run the read-only commands yourself"; it then took ten minutes.
 5. **Independent review.** Before `CodeReview` / merge, say `ready for review <branch> <sha>
    <worktree>` to the manager (or the user). A separate review session measures again; wait for
    its verdict.
@@ -97,6 +101,30 @@ If the ticket says "decide on X", "find out whether" or "if yes … if no …", 
 `docs/research/` with an Options table (what changes, files, effort, risk) and a recommendation.
 The user picks; until then the ticket waits in `Blocked`. Change no other doc before the pick.
 Every measured number names its method and carries the script that made it.
+
+## 1d. You are the coordinator: a cheaper executor writes the code (user rule, 2026-11-11)
+
+You run on the strong model. You plan, review and validate; the implementation goes to an executor
+session on the model Jev picks, to save tokens. Before you hand it over:
+- **Calculations are yours.** A task that computes data or statistics (medians, percentiles,
+  rates, aggregates, estimates, scores) gets its math settled in the plan: every formula, the exact
+  input rows and filters, units and rounding, minimum sample size, nulls / zeros / outliers / empty
+  periods, and a worked example with real numbers that becomes a test. The executor builds only that.
+- **Over-complication check:** when the plan is agreed, one short round (with Codex in duo mode,
+  else alone): is anything more complex than the ticket needs (unasked options, flags, tables,
+  generality, new code where existing code does it)? Cut it, note it in the plan's Decisions. Never
+  cut a requested outcome or a required test.
+
+Then (and after any design approval):
+1. `python3 ~/.claude/skills/new-task/scripts/pick-model.py <plan> [--scope "<part>"]` →
+   `self` (tiny: do it yourself) or `haiku` / `sonnet` / `opus`.
+2. `bash ~/.claude/skills/new-task/scripts/start-executor.sh {{KEY}} <model> <plan> "<scope>"`, then
+   `bash ~/.claude/skills/new-task/scripts/executor-wait.sh {{KEY}}` in the background. Do not edit
+   the worktree while it works.
+3. Review its handback and diff; send rework in one message with
+   `bash ~/.claude/skills/manager/scripts/say.sh X-{{KEY}} "Coordinator: rework: ..."` (two rounds at
+   most, then fix it yourself). Then close it and go on: review, tests, PR, as below.
+In duo mode, follow the duo skill's Phase 4, which is the same flow.
 
 ## 2. Keep Jira up to date while you work
 

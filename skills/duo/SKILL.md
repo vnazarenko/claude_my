@@ -16,7 +16,7 @@ prompt.
 
 | | Claude (this pane) | Codex (the other pane) |
 |---|---|---|
-| writes code, plans, tests, PR bodies | **only Claude** | never |
+| writes code, plans, tests, PR bodies | **only Claude** (code: through its executor, Phase 4) | never |
 | runs suites, servers, migrations, git writes | **only Claude** | never |
 | reads code, criticises, reviews, checks claims | yes | **its main job** |
 | asks the user | only for the cases in "When to ask the user" | never directly — tells Claude |
@@ -152,6 +152,13 @@ Write the plan at `<repo>/docs/plans/<YYYYMMDD>-<slug>.md` in your worktree and 
 - **Test plan after deploy** — the rows that will go into the PR's Test plan (see Phase 7).
 - **Rollout** — order of deploys, migrations, rollback.
 - **Decisions** — every choice made without the user, with the reason.
+- **Calculations** (every task that computes data or statistics: medians, percentiles, rates,
+  aggregates, estimates, scores — user rule, 2026-11-11). The math is decided HERE, by the
+  coordinator, never left to the executor: each formula written out; the exact input rows and filters
+  (which sources, which dates, which statuses, deduplication); units, currency, rounding; minimum
+  sample size and what is shown below it; nulls, zeros, outliers, empty periods; and a **worked
+  example with real numbers** (inputs → expected output) that becomes a test. Codex checks the math
+  against the data, not only the code. The executor then only builds what is written.
 
 Then the review rounds:
 
@@ -166,7 +173,14 @@ Then the review rounds:
    coverage without the user's explicit agreement. **At most two plan rounds** (user rule,
    2026-11-03): round 2 checks only what changed since round 1. Open points after round 2 go in
    **Decisions**; a disagreement that changes what users see goes to the user.
-5. A product decision with no safe default goes to the user; continue independent work while the
+5. **Over-complication check — one short round after the plan is agreed** (user rule, 2026-11-11).
+   Claude and Codex each answer, in a few lines: "Is this more complex than the ticket needs?" Look
+   for: abstractions, options, flags, config, tables or jobs nobody asked for; generality for cases
+   that do not exist yet; new code where existing code already does it; more PRs or steps than
+   needed. Each finding names what to cut and what it saves. Cut what both agree on, note the rest
+   in **Decisions**. One round only; it never adds scope, and it never cuts a requested outcome
+   (Outcome ledger) or a test the rules require.
+6. A product decision with no safe default goes to the user; continue independent work while the
    decision is pending. A conflicting PR alone does not require waiting: prepare the safe separate
    PR described above, then ask the user which direction to keep. Record the decision needed.
    Decide routine details, write them down, and move on.
@@ -182,13 +196,40 @@ Before building a requirement found mid-task (not in the ticket), run the intake
 
 If the task changes how anything looks or how the user moves through it, the negotiated plan ends
 with a DESIGN, not with code: Claude makes mockups with the `frontend-design` skill (2-3 options when
-the ticket is vague), Codex reviews them, and the user picks one (html-ask overlay, or an HTML file /
-Artifact link printed in the terminal; Jira comment + `Blocked` while waiting). While waiting, stop
+the ticket is vague), Codex reviews them, and the user picks one in an html-ask overlay — never a link
+printed in the terminal, even when a manager asks for terminal questions (user, 2026-11-03);
+Jira comment + `Blocked` while waiting. While waiting, stop
 completely: no building, no other parts, no recommended option. Iterate on the design
 until the user approves; only then go to Phase 4. Never build an unapproved design. A pure bug fix
 that restores the intended look skips this phase.
 
-## Phase 4 — Implement (Claude)
+## Phase 4 — Implement: the coordinator delegates to a cheaper executor (user rule, 2026-11-11)
+
+This session (Claude + Codex) is the **coordinator**: it planned the work and owns the result. To
+save tokens, the code itself is written by an **executor**, a companion session on the model Jev picks
+for the plan. Planning, review and validation stay here, on the strong model.
+
+1. After the plan is approved (and the design, Phase 3b): ask Jev for the level, per plan or per
+   independent part: `python3 ~/.claude/skills/new-task/scripts/pick-model.py <plan> [--scope "Tasks 2-5"]`.
+   - `self`: the change is tiny; a second session costs more. Implement it here yourself (rules below).
+   - `haiku` / `sonnet` / `opus`: start the executor. You may overrule Jev one level, with the
+     reason in the plan's Decisions (for example: it touches money logic → opus).
+2. `bash ~/.claude/skills/new-task/scripts/start-executor.sh <KEY> <model> <plan> "<scope>"`. It runs
+   in the same worktree and branch, as a companion under this session (`X-<KEY>`), with the
+   executor brief (`references/executor-brief.md`): implement, test, commit, push, hand back.
+3. Wait without tokens: `executor-wait.sh <KEY>` with Bash `run_in_background: true`. While it
+   works, **do not edit the worktree**; Codex may read along. Exit 3 (idle) or 4 (gone): read its
+   screen and help it on (`say.sh X-<KEY> "Coordinator: ..."`), or take over.
+4. On the handback: read it, `git log` / `git diff origin/<main>...HEAD`, and review the code with
+   Codex (Phase 5 rules). Findings go back to the executor in ONE message
+   (`say.sh X-<KEY> "Coordinator: rework: 1) ... 2) ..."`), then wait again. At most two rework
+   rounds: after that, fix it here yourself. Answer its questions here; a user-only question goes
+   to the user the usual way.
+5. When the code is accepted, close the executor (`agtermctl session close --target <its sid>`,
+   delete `~/.claude/task-briefs/X-<KEY>.env`), then go on with Phase 5 (revmux), 6 and 7 here.
+   Note the executor's model and rounds in the PR body ("Implemented by: sonnet executor, 1 rework round").
+
+The rules for whoever writes the code (executor, or you on `self`):
 
 - Test first where it is practical. Run targeted specs after each change, never a full suite while
   working.
@@ -241,8 +282,8 @@ against every original outcome and its coverage matrix.
   suites, both e2e suites, whole-project builds, typecheck and lint, Docker. Each run gets its own
   databases there, and `vt` queues by itself (one run per checkout, three slots), so there is no
   load check and no "is another live run going" check. Exit 69 means vtserv is down: ask the user;
-  never fall back to the Mac. A few e2e tests fail only on vtserv (BL-0010 in investviews'
-  backlog): compare against `main` on vtserv, not against a green Mac run.
+  never fall back to the Mac. To tell whether a failure came from the branch, run the same spec on
+  `main` on vtserv, not on the Mac.
 
 ## Phase 7 — Pull requests
 
